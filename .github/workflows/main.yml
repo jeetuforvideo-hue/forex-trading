@@ -2,7 +2,6 @@ name: Forex Pro Trading Bot 24x5
 
 on:
   schedule:
-    # सोमवार से शुक्रवार हर 6 घंटे में अपने आप चालू होगा (24 घंटे कवरेज)
     - cron: '0 */6 * * 1-5'
   workflow_dispatch:
 
@@ -20,10 +19,9 @@ jobs:
           python-version: '3.10'
 
       - name: Install Libraries
-        run: |
-          pip install yfinance pandas numpy requests
+        run: pip install yfinance pandas numpy requests
 
       - name: Run Forex Pro Bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-        run: forex_bot.py
+        run: python3 forex_bot.py
