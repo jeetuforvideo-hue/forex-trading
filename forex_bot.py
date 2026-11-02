@@ -7,15 +7,15 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 
 # =====================================================================
-# 1. आपकी पर्सनल और सिक्योर सेटिंग्स (FOREX PRO EDITION)
+# 1. आपकी पर्सनल और सिक्योर सेटिंग्स (SMART MONEY OPERATOR EDITION)
 # =====================================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "9153301687:AAEO3EFmMW6BhenVqk01NjwbJLHvyvN479o")
-CHAT_ID   = "5610520408"  # सिर्फ आपकी टेलीग्राम आईडी पर काम करेगा[span_0](start_span)[span_0](end_span)
+CHAT_ID   = "5610520408"  # सिर्फ आपकी टेलीग्राम आईडी पर काम करेगा
 
-TOTAL_CAPITAL_USD  = 1000   # $1,000 (लगभग ₹85,000) के हिसाब से स्टैंडर्ड रिस्क कैलकुलेशन
+TOTAL_CAPITAL_USD  = 1000   # $1,000 के हिसाब से स्टैंडर्ड रिस्क कैलकुलेशन
 RISK_PER_TRADE_PCT = 1.0    # प्रति ट्रेड 1% रिस्क ($10)
-MAX_TRADES_PER_DAY = 3      # 24 घंटे में सिर्फ 3 सबसे बेस्ट ट्रेड्स
-ADX_THRESHOLD      = 20     # साइडवेज मार्केट फिल्टर
+MAX_TRADES_PER_DAY = 3      # 24 घंटे में सिर्फ 3 सबसे बेस्ट ऑपरेटर ट्रेड्स
+ADX_THRESHOLD      = 18     # बेसिक वोलैटिलिटी फिल्टर
 MAX_HOLD_MINUTES   = 45     # 45 मिनट में मूव न आए तो साइडवेज एग्जिट
 
 # फॉरेक्स के 5 सबसे बेहतरीन और लिक्विड पेयर्स
@@ -85,8 +85,8 @@ def format_price(price, decimals):
 
 def get_trades_scoreboard():
     if not daily_trades_log:
-        return "📋 <b>आज (24h) के फॉरेक्स ट्रेड्स का हाल:</b>\n\n• अभी कोई ट्रेड नहीं लिया गया है।"
-    board = "📋 <b>आज के तीनों फॉरेक्स ट्रेड्स का रिजल्ट:</b>\n\n"
+        return "📋 <b>आज (24h) के ऑपरेटर ट्रेड्स का हाल:</b>\n\n• अभी कोई स्मार्ट मनी ट्रेड नहीं लिया गया है।"
+    board = "📋 <b>आज के तीनों ऑपरेटर ट्रेड्स का रिजल्ट:</b>\n\n"
     for t in daily_trades_log:
         board += f"👉 <b>Trade #{t['id']} ({t['pair']} - {t['direction']}):</b>\n   {t['status']}\n\n"
     return board.strip()
@@ -118,6 +118,7 @@ def check_telegram_commands():
         pass
 
 def calculate_indicators(df):
+    # इंस्टीट्यूशनल ट्रेंड और वोलेटिलिटी मापने के लिए बेसिक टूल्स
     df['EMA20']  = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA50']  = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
@@ -127,16 +128,6 @@ def calculate_indicators(df):
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
-
-    ema12 = df['Close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = ema12 - ema26
-    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-
-    df['BB_Mid']   = df['Close'].rolling(window=20).mean()
-    df['BB_Std']   = df['Close'].rolling(window=20).std()
-    df['BB_Upper'] = df['BB_Mid'] + (2 * df['BB_Std'])
-    df['BB_Lower'] = df['BB_Mid'] - (2 * df['BB_Std'])
 
     hl = df['High'] - df['Low']
     hc = np.abs(df['High'] - df['Close'].shift())
@@ -154,92 +145,133 @@ def calculate_indicators(df):
     minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(14).mean() / tr_smooth)
     dx = (np.abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
     df['ADX'] = dx.rolling(14).mean()
+
+    # ऑपरेटर कैंडल साइज और वॉल्यूम स्पाइक फिल्टर
+    df['Candle_Body']  = np.abs(df['Close'] - df['Open'])
+    df['Candle_Range'] = df['High'] - df['Low']
+    df['Vol_MA20']     = df['Volume'].rolling(20).mean()
     return df
 
-def is_strong_candle(latest, direction):
-    """फेक ब्रेकआउट (Stop-Hunt Wick) से बचने का नियम"""
-    high_p  = float(latest['High'])
-    low_p   = float(latest['Low'])
-    open_p  = float(latest['Open'])
-    close_p = float(latest['Close'])
-
-    total_range = high_p - low_p
-    if total_range <= 0:
-        return False
-
-    body = abs(close_p - open_p)
-    if (body / total_range) < 0.45:
-        return False
-
-    if direction == "BUY":
-        upper_wick = high_p - close_p
-        return close_p > open_p and (upper_wick / total_range) < 0.30
-    else:
-        lower_wick = close_p - low_p
-        return close_p < open_p and (lower_wick / total_range) < 0.30
-
-def evaluate_forex_strategies(df):
+def evaluate_operator_strategies(df):
+    """
+    रिटेल इंडिकेटर्स के बजाय 4 शुद्ध ऑपरेटर (Smart Money / SMC) स्ट्रैटेजी:
+    Returns: (signal_text, direction, strategy_name, custom_sl_level)
+    """
     latest = df.iloc[-1]
     prev   = df.iloc[-2]
 
     price    = float(latest['Close'])
+    open_p   = float(latest['Open'])
     high_p   = float(latest['High'])
     low_p    = float(latest['Low'])
-    ema20    = float(latest['EMA20'])
+    body     = float(latest['Candle_Body'])
+    c_range  = float(latest['Candle_Range'])
+    atr      = float(latest['ATR'])
     ema50    = float(latest['EMA50'])
     ema200   = float(latest['EMA200'])
     rsi      = float(latest['RSI'])
-    macd     = float(latest['MACD'])
-    macd_sig = float(latest['MACD_Signal'])
-    bb_upper = float(latest['BB_Upper'])
-    bb_lower = float(latest['BB_Lower'])
-    atr      = float(latest['ATR'])
 
-    if np.isnan(atr) or atr <= 0 or (high_p - low_p) < (atr * 0.5):
-        return None, None, None
+    if np.isnan(atr) or atr <= 0 or c_range <= 0:
+        return None, None, None, None
 
-    # पिछले 1 घंटे (12 कैंडल्स) का High और Low (Session Liquidity Breakout के लिए)
-    recent_12 = df.iloc[-13:-1]
-    box_high = float(recent_12['High'].max())
-    box_low  = float(recent_12['Low'].min())
+    # पिछले 15 कैंडल्स (1 घंटा 15 मिनट) और 30 कैंडल्स (2.5 घंटे) के लिक्विडिटी ज़ोन
+    lookback_15 = df.iloc[-16:-1]
+    swing_high_15 = float(lookback_15['High'].max())
+    swing_low_15  = float(lookback_15['Low'].min())
 
-    # 1. Institutional Triple EMA Trend + MACD
-    if price > ema20 and ema20 > ema50 and ema50 > ema200 and 55 < rsi < 72 and macd > macd_sig:
-        if is_strong_candle(latest, "BUY"):
-            return "BUY (LONG) 🟢", "BUY", "Institutional EMA 20/50/200 + MACD Trend"
-    if price < ema20 and ema20 < ema50 and ema50 < ema200 and 28 < rsi < 45 and macd < macd_sig:
-        if is_strong_candle(latest, "SELL"):
-            return "SELL (SHORT) 🔴", "SELL", "Institutional EMA 20/50/200 + MACD Downtrend"
+    lookback_30 = df.iloc[-31:-2]
+    major_high_30 = float(lookback_30['High'].max())
+    major_low_30  = float(lookback_30['Low'].min())
 
-    # 2. Session Liquidity Box Breakout (1-Hour High/Low Break)
-    if prev['Close'] <= box_high and price > box_high and price > ema50 and rsi > 58:
-        if is_strong_candle(latest, "BUY"):
-            return "BUY (LONG) 🟢", "BUY", "Session 1H Liquidity High Breakout"
-    if prev['Close'] >= box_low and price < box_low and price < ema50 and rsi < 42:
-        if is_strong_candle(latest, "SELL"):
-            return "SELL (SHORT) 🔴", "SELL", "Session 1H Liquidity Low Breakdown"
+    upper_wick = high_p - max(open_p, price)
+    lower_wick = min(open_p, price) - low_p
 
-    # 3. Bollinger Band Momentum Breakout
-    if prev['Close'] <= prev['BB_Upper'] and price > bb_upper and rsi > 60 and macd > macd_sig:
-        if is_strong_candle(latest, "BUY"):
-            return "BUY (LONG) 🟢", "BUY", "Bollinger Band Volatility Breakout"
-    if prev['Close'] >= prev['BB_Lower'] and price < bb_lower and rsi < 40 and macd < macd_sig:
-        if is_strong_candle(latest, "SELL"):
-            return "SELL (SHORT) 🔴", "SELL", "Bollinger Band Volatility Breakdown"
+    # =========================================================================
+    # 1. OPERATOR LIQUIDITY SWEEP & STOP-HUNT REVERSAL (रिटेल स्टॉप-लॉस हंटिंग)
+    # नियम: ऑपरेटर पहले स्विंग लो/हाई तोड़कर रिटेलर्स का SL खाते हैं और तुरंत कैंडल अंदर क्लोज करते हैं
+    # =========================================================================
+    # Bullish Stop-Hunt (नीचे के SL खाकर ऊपर खींचना)
+    if low_p < swing_low_15 and price > swing_low_15 and price > open_p:
+        if lower_wick >= (c_range * 0.40) and c_range >= (atr * 0.8):
+            sl_trap = low_p - (atr * 0.35) # विक के नीचे सुरक्षित SL
+            return "BUY (LONG) 🟢", "BUY", "Operator Stop-Hunt & Liquidity Sweep (Bullish)", sl_trap
 
-    # 4. 20 EMA + 50 EMA Golden Pullback Bounce
-    if ema20 > ema50 and ema50 > ema200 and low_p <= ema20 and price > ema20 and 50 < rsi < 66:
-        if is_strong_candle(latest, "BUY"):
-            return "BUY (LONG) 🟢", "BUY", "20 EMA Institutional Pullback Bounce"
-    if ema20 < ema50 and ema50 < ema200 and high_p >= ema20 and price < ema20 and 34 < rsi < 50:
-        if is_strong_candle(latest, "SELL"):
-            return "SELL (SHORT) 🔴", "SELL", "20 EMA Institutional Resistance Drop"
+    # Bearish Stop-Hunt (ऊपर के बायर्स को ट्रैप करके नीचे गिराना)
+    if high_p > swing_high_15 and price < swing_high_15 and price < open_p:
+        if upper_wick >= (c_range * 0.40) and c_range >= (atr * 0.8):
+            sl_trap = high_p + (atr * 0.35) # विक के ऊपर सुरक्षित SL
+            return "SELL (SHORT) 🔴", "SELL", "Operator Bull-Trap & Liquidity Sweep (Bearish)", sl_trap
 
-    return None, None, None
+    # =========================================================================
+    # 2. SMART MONEY FAIR VALUE GAP (FVG) + ORDER BLOCK MITIGATION
+    # नियम: जब ऑपरेटर बड़ी मूव देते हैं तो गैप (FVG) छूटता है। कीमत वापस उस ज़ोन में आने पर एंट्री
+    # =========================================================================
+    for i in range(3, 9):
+        c1 = df.iloc[-i-2]
+        c2 = df.iloc[-i-1] # बड़ी ऑपरेटर कैंडल
+        c3 = df.iloc[-i]
+
+        # Bullish FVG + Order Block Retest
+        if float(c3['Low']) > float(c1['High']) and float(c2['Close']) > float(c2['Open']) and float(c2['Candle_Body']) > (atr * 1.1):
+            fvg_top = float(c3['Low'])
+            fvg_bottom = float(c1['High'])
+            if price > ema200 and low_p <= fvg_top and price >= fvg_bottom and price > open_p and (body / c_range) >= 0.45:
+                sl_ob = min(low_p, fvg_bottom) - (atr * 0.4)
+                return "BUY (LONG) 🟢", "BUY", "Smart Money FVG + Order Block Mitigation", sl_ob
+
+        # Bearish FVG + Order Block Retest
+        if float(c3['High']) < float(c1['Low']) and float(c2['Close']) < float(c2['Open']) and float(c2['Candle_Body']) > (atr * 1.1):
+            fvg_bottom = float(c3['High'])
+            fvg_top = float(c1['Low'])
+            if price < ema200 and high_p >= fvg_bottom and price <= fvg_top and price < open_p and (body / c_range) >= 0.45:
+                sl_ob = max(high_p, fvg_top) + (atr * 0.4)
+                return "SELL (SHORT) 🔴", "SELL", "Smart Money Bearish FVG + Order Block Supply", sl_ob
+
+    # =========================================================================
+    # 3. INSTITUTIONAL DISPLACEMENT & VOLUME INJECTION (Break of Structure - BOS)
+    # नियम: बिना बड़ी विक के 1.6x ATR की विशाल ऑपरेटर कैंडल जो पिछले 15 कैंडल के स्ट्रक्चर को तोड़े
+    # =========================================================================
+    vol_now = float(latest['Volume'])
+    vol_avg = float(latest['Vol_MA20']) if not np.isnan(latest['Vol_MA20']) else 0
+    vol_surge = (vol_avg == 0) or (vol_now > vol_avg * 1.3)
+
+    if body >= (atr * 1.5) and (body / c_range) >= 0.72 and vol_surge:
+        # Bullish Institutional Displacement
+        if price > open_p and prev['Close'] <= swing_high_15 and price > swing_high_15 and price > ema50 and rsi < 76:
+            sl_disp = low_p - (atr * 0.3)
+            return "BUY (LONG) 🟢", "BUY", "Institutional Displacement & BOS (Heavy Buying)", sl_disp
+
+        # Bearish Institutional Displacement
+        if price < open_p and prev['Close'] >= swing_low_15 and price < swing_low_15 and price < ema50 and rsi > 24:
+            sl_disp = high_p + (atr * 0.3)
+            return "SELL (SHORT) 🔴", "SELL", "Institutional Displacement & BOS (Heavy Selling)", sl_disp
+
+    # =========================================================================
+    # 4. WYCKOFF SPRING / UPTHRUST TRAP (2-Candle False Breakout Reversal)
+    # नियम: पिछली कैंडल ने 2.5 घंटे का रेंज तोड़ा (रिटेलर्स ने ब्रेकआउट ट्रेड लिया), और अगली ही कैंडल ने पूरा पलट दिया
+    # =========================================================================
+    prev_open  = float(prev['Open'])
+    prev_close = float(prev['Close'])
+    prev_high  = float(prev['High'])
+    prev_low   = float(prev['Low'])
+
+    # Wyckoff Spring (झूठा ब्रेकडाउन करके तेजी से ऊपर भागना)
+    if (prev_low < major_low_30 or prev_close < major_low_30) and price > major_low_30:
+        if price > open_p and price > prev_high and body >= (atr * 0.7):
+            sl_spring = min(low_p, prev_low) - (atr * 0.35)
+            return "BUY (LONG) 🟢", "BUY", "Wyckoff Spring Accumulation (Bear Trap Reversal)", sl_spring
+
+    # Wyckoff Upthrust (झूठा ब्रेकआउट दिखाकर तेजी से नीचे गिराना)
+    if (prev_high > major_high_30 or prev_close > major_high_30) and price < major_high_30:
+        if price < open_p and price < prev_low and body >= (atr * 0.7):
+            sl_upthrust = max(high_p, prev_high) + (atr * 0.35)
+            return "SELL (SHORT) 🔴", "SELL", "Wyckoff Upthrust Distribution (Bull Trap Reversal)", sl_upthrust
+
+    return None, None, None, None
 
 def send_live_forex_summary():
-    market_state = "🟢 ग्लोबल फॉरेक्स मार्केट खुला है (24/5 LIVE)" if is_forex_market_open() else "🔴 वीकेंड: फॉरेक्स मार्केट अभी बंद है"
-    report = f"🌍 <b>FOREX & GOLD PRO STATUS REPORT</b> 🌍\n\n📢 <b>Status:</b> {market_state}\n\n"
+    market_state = "🟢 ग्लोबल फॉरेक्स मार्केट खुला है (24/5 OPERATOR MODE)" if is_forex_market_open() else "🔴 वीकेंड: फॉरेक्स मार्केट अभी बंद है"
+    report = f"🏦 <b>FOREX SMART MONEY (OPERATOR) REPORT</b> 🏦\n\n📢 <b>Status:</b> {market_state}\n\n"
 
     for name, info in FOREX_PAIRS.items():
         try:
@@ -251,10 +283,10 @@ def send_live_forex_summary():
             price = float(latest['Close'])
             rsi = float(latest['RSI'])
             adx = float(latest['ADX']) if not np.isnan(latest['ADX']) else 15.0
-            mood = "⚠️ साइडवेज (No Trade)" if adx < ADX_THRESHOLD else "🔥 ट्रेंडिंग (Active)"
+            mood = "🕸️ Accumulation (Sideways)" if adx < ADX_THRESHOLD else "🐋 Smart Money Active"
             p_str = format_price(price, info["decimals"])
 
-            report += f"🔹 <b>{name}:</b> {p_str}\n   • मूड: {mood} (RSI: {rsi:.0f})\n\n"
+            report += f"🔹 <b>{name}:</b> {p_str}\n   • ज़ोन: {mood} (RSI: {rsi:.0f})\n\n"
         except Exception:
             report += f"🔹 <b>{name}:</b> डेटा लोड हो रहा है...\n\n"
 
@@ -297,12 +329,12 @@ def manage_active_forex_trades(pair_name, candle_time, latest, decimals):
                 trade["is_open"] = False
                 trade["status"] = f"✅ TARGET HIT (+${trade['expected_profit']:.0f} प्रॉफिट)"
                 send_telegram_message(
-                    f"🎯 <b>FOREX TRADE #{trade['id']} : FULL TARGET HIT!</b> 🎯\n\n"
+                    f"🎯 <b>OPERATOR TRADE #{trade['id']} : FULL TARGET HIT!</b> 🎯\n\n"
                     f"🌍 <b>Pair:</b> {trade['pair']} ({trade['mt5_name']})\n\n"
                     f"⚡ <b>Direction:</b> {trade['action']}\n\n"
                     f"📍 <b>Entry:</b> {entry_str}  ➡️  <b>Target Hit:</b> {target_str}\n\n"
                     f"💰 <b>Result:</b> <b>✅ +${trade['expected_profit']:.0f} (लगभग +₹{trade['expected_profit']*85:.0f}) प्रॉफिट</b>\n\n"
-                    f"📢 <b>प्रो सलाह:</b> शानदार! अपना पूरा प्रॉफिट बुक कर लें।\n\n"
+                    f"📢 <b>ऑपरेटर सलाह:</b> शानदार! स्मार्ट मनी टारगेट पूरा हुआ, अपना प्रॉफिट बुक कर लें।\n\n"
                     f"────────────────────\n\n{get_trades_scoreboard()}"
                 )
                 continue
@@ -311,9 +343,9 @@ def manage_active_forex_trades(pair_name, candle_time, latest, decimals):
                 trade["is_open"] = False
                 trade["status"] = "🛡️ BREAKEVEN EXIT ($0 No Loss)"
                 send_telegram_message(
-                    f"🛡️ <b>FOREX TRADE #{trade['id']} : TRAILING SL HIT (NO LOSS)!</b> 🛡️\n\n"
+                    f"🛡️ <b>OPERATOR TRADE #{trade['id']} : TRAILING SL HIT (NO LOSS)!</b> 🛡️\n\n"
                     f"🌍 <b>Pair:</b> {trade['pair']}\n\n"
-                    f"📢 <b>प्रो अपडेट:</b> मार्केट वापस घूम गया, लेकिन स्टॉप-लॉस कॉस्ट (Breakeven) पर होने की वजह से <b>आपका $0 का नुकसान हुआ!</b>\n\n"
+                    f"📢 <b>अपडेट:</b> मार्केट वापस घूम गया, लेकिन स्टॉप-लॉस कॉस्ट (Breakeven) पर होने की वजह से <b>आपका $0 का नुकसान हुआ!</b>\n\n"
                     f"────────────────────\n\n{get_trades_scoreboard()}"
                 )
                 continue
@@ -322,16 +354,16 @@ def manage_active_forex_trades(pair_name, candle_time, latest, decimals):
                 trade["is_open"] = False
                 trade["status"] = f"🛑 STOP-LOSS HIT (-${trade['max_risk']:.0f} लॉस)"
                 send_telegram_message(
-                    f"🛑 <b>FOREX TRADE #{trade['id']} : STOP-LOSS HIT!</b> 🛑\n\n"
+                    f"🛑 <b>OPERATOR TRADE #{trade['id']} : STOP-LOSS HIT!</b> 🛑\n\n"
                     f"🌍 <b>Pair:</b> {trade['pair']}\n\n"
                     f"📍 <b>Entry:</b> {entry_str}  ➡️  <b>SL Hit:</b> {sl_str}\n\n"
                     f"⚠️ <b>Result:</b> <b>🛑 -${trade['max_risk']:.0f} लॉस</b>\n\n"
-                    f"📢 <b>प्रो सलाह:</b> स्टॉप-लॉस हिट हो गया है, ट्रेड से बाहर रहें और अगले सेटअप का इंतजार करें।\n\n"
+                    f"📢 <b>सलाह:</b> स्टॉप-लॉस हिट हो गया है, अगले स्मार्ट मनी सेटअप का इंतजार करें।\n\n"
                     f"────────────────────\n\n{get_trades_scoreboard()}"
                 )
                 continue
 
-            # 2. प्रो नियम: 1:1 (50% टारगेट) आने पर SL को Breakeven (Cost) पर लाना
+            # 2. प्रो नियम: 1:1 आने पर SL को Breakeven (Cost) पर लाना
             if not trade["trailed_to_cost"]:
                 half_reached = False
                 if trade["direction"] == "BUY" and current_high >= trade["half_target"]:
@@ -344,10 +376,10 @@ def manage_active_forex_trades(pair_name, candle_time, latest, decimals):
                     trade["sl"] = trade["entry"]
                     trade["status"] = "🔥 RUNNING (SL at Breakeven - Risk Free)"
                     send_telegram_message(
-                        f"🛡️ <b>PRO UPDATE (Trade #{trade['id']}) : MOVE SL TO BREAKEVEN!</b> 🛡️\n\n"
+                        f"🛡️ <b>SMART MONEY UPDATE (Trade #{trade['id']}) : MOVE SL TO BREAKEVEN!</b> 🛡️\n\n"
                         f"🌍 <b>Pair:</b> {trade['pair']}\n\n"
-                        f"✅ <b>50% टारगेट पूरा हो चुका है! (Current Price: {price_str})</b>\n\n"
-                        f"📢 <b>प्रो एक्शन:</b> अब अपने MT4/MT5 में स्टॉप-लॉस को उठाकर <b>Entry Price ({entry_str})</b> पर लगा लें और चाहें तो 50% लॉट बुक कर लें। अब यह ट्रेड 100% रिस्क-फ्री है!"
+                        f"✅ <b>1:1 टारगेट पूरा हो चुका है! (Current Price: {price_str})</b>\n\n"
+                        f"📢 <b>एक्शन:</b> अब अपने MT4/MT5 में स्टॉप-लॉस को उठाकर <b>Entry Price ({entry_str})</b> पर लगा लें और चाहें तो 50% लॉट बुक कर लें। अब यह ट्रेड 100% रिस्क-फ्री है!"
                     )
 
             # 3. प्रो नियम: 45 मिनट तक मार्केट साइडवेज अटक जाए तो एग्जिट
@@ -357,32 +389,32 @@ def manage_active_forex_trades(pair_name, candle_time, latest, decimals):
                     trade["is_open"] = False
                     trade["status"] = "⏳ SIDEWAYS CONSOLIDATION EXIT"
                     send_telegram_message(
-                        f"⏳ <b>PRO ALERT (Trade #{trade['id']}) : SIDEWAYS MARKET EXIT!</b> ⏳\n\n"
+                        f"⏳ <b>OPERATOR ALERT (Trade #{trade['id']}) : SIDEWAYS MARKET EXIT!</b> ⏳\n\n"
                         f"🌍 <b>Pair:</b> {trade['pair']}\n\n"
                         f"📍 <b>Entry:</b> {entry_str}  ➡️  <b>Current Price:</b> {price_str}\n\n"
-                        f"⚠️ <b>कारण:</b> ट्रेड लिए 45 मिनट हो चुके हैं और मार्केट बिना मोमेंटम के एक ही जगह अटका हुआ है।\n\n"
-                        f"📢 <b>प्रो सलाह:</b> फॉरेक्स में सुस्त मार्केट अचानक उल्टा स्पाइक मार सकता है। स्टॉप-लॉस का इंतजार न करें, <b>अभी तुरंत कॉस्ट या छोटे प्रॉफिट/लॉस पर ट्रेड क्लोज कर दें!</b>\n\n"
+                        f"⚠️ <b>कारण:</b> 45 मिनट हो चुके हैं और ऑपरेटर फॉलो-थ्रू वॉल्यूम नहीं आया है।\n\n"
+                        f"📢 <b>सलाह:</b> स्टॉप-लॉस का इंतजार न करें, <b>अभी तुरंत कॉस्ट या छोटे प्रॉफिट/लॉस पर ट्रेड क्लोज कर दें!</b>\n\n"
                         f"────────────────────\n\n{get_trades_scoreboard()}"
                     )
                     continue
 
-            # 4. प्रो नियम: अचानक ट्रेंड पलट जाए (EMA20 और EMA50 दोनों उलटे क्रॉस हो जाएं)
-            if hold_minutes >= 15:
+            # 4. प्रो नियम: अचानक ऑपरेटर स्ट्रक्चर पलट जाए
+            if hold_minutes >= 20:
                 trend_reversed = False
-                if trade["direction"] == "BUY" and price < ema20 and price < ema50:
+                if trade["direction"] == "BUY" and price < ema20 and price < ema50 and price < (trade["entry"] - trade["sl_dist"] * 0.6):
                     trend_reversed = True
-                elif trade["direction"] == "SELL" and price > ema20 and price > ema50:
+                elif trade["direction"] == "SELL" and price > ema20 and price > ema50 and price > (trade["entry"] + trade["sl_dist"] * 0.6):
                     trend_reversed = True
 
                 if trend_reversed:
                     trade["is_open"] = False
-                    trade["status"] = "🔄 TREND REVERSAL EXIT (जल्दी बचाव)"
+                    trade["status"] = "🔄 STRUCTURE SHIFT EXIT (जल्दी बचाव)"
                     send_telegram_message(
-                        f"🔄 <b>PRO ALERT (Trade #{trade['id']}) : TREND REVERSAL EXIT!</b> 🔄\n\n"
+                        f"🔄 <b>OPERATOR ALERT (Trade #{trade['id']}) : STRUCTURE SHIFT EXIT!</b> 🔄\n\n"
                         f"🌍 <b>Pair:</b> {trade['pair']}\n\n"
                         f"📍 <b>Entry:</b> {entry_str}  ➡️  <b>Current Price:</b> {price_str}\n\n"
-                        f"⚠️ <b>कारण:</b> इस पेयर का ट्रेंड अचानक पलट गया है (Price ने 20 EMA और 50 EMA दोनों को तोड़ दिया है)।\n\n"
-                        f"📢 <b>प्रो सलाह:</b> पूरा स्टॉप-लॉस देने से बेहतर है कि अभी तुरंत ट्रेड से बाहर निकल जाएं!\n\n"
+                        f"⚠️ <b>कारण:</b> ऑपरेटर फ्लो आपके ट्रेड के खिलाफ मुड़ गया है।\n\n"
+                        f"📢 <b>सलाह:</b> पूरा स्टॉप-लॉस देने से बेहतर है कि अभी तुरंत ट्रेड से बाहर निकल जाएं!\n\n"
                         f"────────────────────\n\n{get_trades_scoreboard()}"
                     )
                     continue
@@ -412,10 +444,9 @@ def scan_forex_market():
 
             price = float(latest['Close'])
             atr   = float(latest['ATR'])
-            adx   = float(latest['ADX']) if not np.isnan(latest['ADX']) else 15.0
             dec   = info["decimals"]
 
-            # 1. पहले चल रहे ट्रेड्स को प्रो ट्रेडर की तरह मैनेज करें
+            # 1. पहले चल रहे ट्रेड्स को मैनेज करें
             manage_active_forex_trades(name, candle_time, latest, dec)
 
             # 2. अगर इस पेयर में पहले से ट्रेड खुला है तो नया न लें
@@ -430,20 +461,22 @@ def scan_forex_market():
             if last_candle_traded[name] == candle_time:
                 continue
 
-            # 5. अगर मार्केट साइडवेज है (ADX < 20) तो ट्रेड न लें
-            if adx < ADX_THRESHOLD:
-                continue
+            signal, direction, strategy_used, custom_sl = evaluate_operator_strategies(df)
 
-            signal, direction, strategy_used = evaluate_forex_strategies(df)
+            if signal and custom_sl is not None:
+                # स्टॉप-लॉस की दूरी को लिक्विडिटी विक के हिसाब से सेट करना (कम से कम 1.2 ATR और अधिकतम 2.5 ATR)
+                raw_sl_dist = abs(price - custom_sl)
+                min_sl_dist = atr * 1.2
+                max_sl_dist = atr * 2.5
+                sl_dist = round(max(min_sl_dist, min(raw_sl_dist, max_sl_dist)), dec)
 
-            if signal:
+                if sl_dist <= 0:
+                    continue
+
                 last_candle_traded[name] = candle_time
                 trades_today += 1
 
-                sl_dist = round(atr * 1.5, dec)
-                if sl_dist <= 0:
-                    continue
-                rr_ratio = 2.2
+                rr_ratio = 2.5 # ऑपरेटर ट्रेड्स में 1:2.5 का बड़ा रिस्क-रिवॉर्ड
                 target_dist = round(sl_dist * rr_ratio, dec)
 
                 if direction == "BUY":
@@ -485,17 +518,17 @@ def scan_forex_market():
                 target_s = format_price(target_level, dec)
 
                 msg = (
-                    f"🚨 <b>FOREX PRO SIGNAL (Trade {trades_today} of {MAX_TRADES_PER_DAY})</b> 🚨\n\n"
+                    f"🏦 <b>SMART MONEY OPERATOR SIGNAL ({trades_today}/{MAX_TRADES_PER_DAY})</b> 🏦\n\n"
                     f"🌍 <b>Pair:</b> <b>{name}</b>\n\n"
-                    f"🧠 <b>Setup:</b> {strategy_used}\n\n"
+                    f"🧠 <b>Operator Setup:</b> {strategy_used}\n\n"
                     f"⚡ <b>Action:</b> <b>{signal}</b>\n\n"
                     f"🔍 <b>MT4/MT5 Symbol:</b> <code>{info['mt5_name']}</code>\n\n"
                     f"📍 <b>Entry Price:</b> {entry_s}\n\n"
-                    f"🛑 <b>Stop-Loss:</b> {sl_s}\n\n"
+                    f"🛑 <b>Liquidity Protected SL:</b> {sl_s}\n\n"
                     f"🛡️ <b>Breakeven Level (1:1):</b> {half_s}\n\n"
-                    f"🎯 <b>Full Target (1:2.2):</b> {target_s}\n\n"
+                    f"🎯 <b>Operator Target (1:2.5):</b> {target_s}\n\n"
                     f"💼 <b>Recommended Lot:</b> 0.01 - 0.02 Lot (Max Risk: ${max_risk_usd:.0f} / ~₹{max_risk_usd*85:.0f})\n\n"
-                    f"⏳ <b>Pro Guard:</b> 1:1 पर SL कॉस्ट पर आएगा, और 45 मिनट में मूव न आने या ट्रेंड पलटने पर बॉट खुद एग्जिट करा देगा!\n\n"
+                    f"⏳ <b>Pro Guard:</b> स्टॉप-लॉस को स्टॉप-हंट विक के पीछे रखा गया है। 1:1 आने पर SL कॉस्ट पर आ जाएगा!\n\n"
                     f"────────────────────\n\n"
                     f"{get_trades_scoreboard()}"
                 )
@@ -505,24 +538,23 @@ def scan_forex_market():
             print(f"Error scanning {name}: {e}")
 
 if __name__ == "__main__":
-    mkt_msg = "🟢 फॉरेक्स मार्केट खुला है (24/5 लाइव स्कैनिंग चालू है)।" if is_forex_market_open() else "🔴 अभी वीकेंड की वजह से ग्लोबल फॉरेक्स मार्केट बंद है। सोमवार सुबह से अपने आप ट्रेड आएंगे।"
+    mkt_msg = "🟢 फॉरेक्स मार्केट खुला है (24/5 स्मार्ट मनी स्कैनिंग चालू है)।" if is_forex_market_open() else "🔴 अभी वीकेंड की वजह से ग्लोबल फॉरेक्स मार्केट बंद है। सोमवार सुबह से अपने आप ट्रेड आएंगे।"
 
     send_telegram_message(
-        "🌍 <b>Forex & Gold PRO Bot Active! (24/5 Mode)</b>\n\n"
+        "🏦 <b>Forex Smart Money (Operator) Bot Active!</b>\n\n"
         f"📢 <b>Status:</b> {mkt_msg}\n\n"
         "💎 <b>Pairs Monitored:</b>\n"
         "• XAU/USD (Gold)\n"
         "• EUR/USD, GBP/USD, USD/JPY, GBP/JPY\n\n"
-        "✅ <b>Pro Rules Active:</b>\n"
-        "• Stop-Hunt Wick Filter\n"
-        "• 1:1 Breakeven Auto-Trail\n"
-        "• 45-Min Consolidation Exit\n"
-        "• Trend Reversal Early Exit"
+        "🐋 <b>4 Operator Strategies Active:</b>\n"
+        "1️⃣ Liquidity Sweep & Stop-Hunt Reversal\n"
+        "2️⃣ Fair Value Gap (FVG) + Order Block Fill\n"
+        "3️⃣ Institutional Displacement & BOS\n"
+        "4️⃣ Wyckoff Spring / Upthrust Trap"
     )
 
     start_run = time.time()
     last_scan_time = 0
-    # GitHub Actions में एक बार में लगभग 5 घंटे 50 मिनट (21000 सेकंड) तक लगातार चलेगा
     while time.time() - start_run < 21000:
         check_telegram_commands()
         if time.time() - last_scan_time >= 20:
