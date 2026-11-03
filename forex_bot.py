@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 # =====================================================================
 # 1. आपकी पर्सनल और सिक्योर सेटिंग्स (HTF 1H + 15M OPERATOR EDITION)
 # =====================================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "9153301687:AAEO3EFmMW6BhenVqk01NjwbJLHvyvN479o")
+BOT_TOKEN = os.getenv("BOT_TOKEN") 
 CHAT_ID   = "5610520408"  # सिर्फ आपकी टेलीग्राम आईडी पर काम करेगा
 
 TOTAL_CAPITAL_USD  = 1000   # $1,000 (लगभग ₹85,000) के हिसाब से स्टैंडर्ड रिस्क कैलकुलेशन
