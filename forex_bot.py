@@ -76,7 +76,6 @@ def get_current_session_info():
     """ऑपरेटर वोलैटिलिटी और लिक्विडिटी टाइमिंग की जांच (IST के अनुसार)"""
     now = get_ist_now()
     hr = now.hour + (now.minute / 60.0)
-    # सुबह 3:30 से 5:30 के बीच रोलओवर स्प्रेड हाई होता है, इसलिए उसे अवॉइड करें
     if 3.5 <= hr <= 5.5:
         return False, "Low Liquidity Rollover Zone (High Spread)"
     elif 5.5 < hr < 12.5:
@@ -149,7 +148,6 @@ def calculate_indicators(df):
     df['EMA50']  = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
 
-    # RSI Calculation (Wilder's Smoothing approximation)
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
@@ -157,14 +155,12 @@ def calculate_indicators(df):
     df['RSI'] = 100 - (100 / (1 + rs))
     df['RSI'] = df['RSI'].fillna(50.0)
 
-    # True Range & ATR (Volatility Engine)
     hl = df['High'] - df['Low']
     hc = np.abs(df['High'] - df['Close'].shift())
     lc = np.abs(df['Low'] - df['Close'].shift())
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(14).mean()
 
-    # ADX (Trend Strength Filter)
     up_move = df['High'] - df['High'].shift(1)
     down_move = df['Low'].shift(1) - df['Low']
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
@@ -176,16 +172,14 @@ def calculate_indicators(df):
     dx = (np.abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)) * 100
     df['ADX'] = dx.rolling(14).mean().fillna(15.0)
 
-    # सूक्ष्म कैंडल एनालिसिस (Micro Candle Anatomy)
     df['Candle_Body']  = np.abs(df['Close'] - df['Open'])
     df['Candle_Range'] = (df['High'] - df['Low']).replace(0, 1e-9)
     df['Body_Ratio']   = df['Candle_Body'] / df['Candle_Range']
     df['Upper_Wick']   = df['High'] - df[['Open', 'Close']].max(axis=1)
     df['Lower_Wick']   = df[['Open', 'Close']].min(axis=1) - df['Low']
-    df['Close_Pos']    = (df['Close'] - df['Low']) / df['Candle_Range'] # 0.0=Bottom, 1.0=Top
+    df['Close_Pos']    = (df['Close'] - df['Low']) / df['Candle_Range']
     df['Vol_MA20']     = df['Volume'].rolling(20).mean() if 'Volume' in df.columns else 0.0
 
-    # पिछले 40 कैंडल्स (15M पर 10 घंटे) का Premium / Discount Equilibrium (50% Level)
     df['Range_High_40'] = df['High'].rolling(40).max()
     df['Range_Low_40']  = df['Low'].rolling(40).min()
     df['Equilibrium']   = (df['Range_High_40'] + df['Range_Low_40']) / 2.0
@@ -193,12 +187,7 @@ def calculate_indicators(df):
     return df
 
 def analyze_htf_1h_structure(df_1h):
-    """
-    बड़े टाइमफ्रेम (1-Hour Chart) का डीप एनालिसिस:
-    • 1H का मुख्य इंस्टीट्यूशनल फ्लो (Bullish / Bearish)
-    • 1H के मेजर रेजिस्टेंस और सपोर्ट (ताकि हम ठीक दीवार के सामने ट्रेड न लें)
-    """
-    c_1h = df_1h.iloc[-2] # आखिरी पूरी तरह क्लोज हुई 1-घंटे की कैंडल
+    c_1h = df_1h.iloc[-2]
     p_1h = df_1h.iloc[-3]
 
     close_1h  = float(c_1h['Close'])
@@ -207,13 +196,11 @@ def analyze_htf_1h_structure(df_1h):
     ema200_1h = float(c_1h['EMA200'])
     atr_1h    = float(c_1h['ATR']) if not np.isnan(c_1h['ATR']) else 0.0
 
-    # पिछले 12 घंटे (12 कैंडल्स) का 1H स्ट्रक्चर हाई और लो
     recent_1h = df_1h.iloc[-14:-2]
     htf_res   = float(recent_1h['High'].max())
     htf_sup   = float(recent_1h['Low'].min())
     htf_mid   = (htf_res + htf_sup) / 2.0
 
-    # 1H ट्रेंड स्कोरिंग (बारीक जांच)
     bull_score = 0
     bear_score = 0
 
@@ -254,11 +241,6 @@ def analyze_htf_1h_structure(df_1h):
     }
 
 def evaluate_htf_operator_strategies(df_15m, df_1h):
-    """
-    4 बिल्कुल नई, खुद की बनाई हुई Multi-Timeframe (1H + 15M) ऑपरेटर स्ट्रैटेजी:
-    नोट: यहाँ df_15m.iloc[-2] (पूरी तरह बंद हो चुकी 15-मिनट की कैंडल) का उपयोग किया गया है,
-    ताकि अधूरी कैंडल के फेकआउट से कभी लॉस न हो!
-    """
     session_ok, _ = get_current_session_info()
     if not session_ok:
         return None, None, None, None
@@ -266,7 +248,6 @@ def evaluate_htf_operator_strategies(df_15m, df_1h):
     htf = analyze_htf_1h_structure(df_1h)
     htf_bias = htf["bias"]
 
-    # Confirmed Closed Candles on 15-Minute Chart (-2 is last closed, -3 is prior closed)
     curr = df_15m.iloc[-2]
     prev = df_15m.iloc[-3]
     prev2 = df_15m.iloc[-4]
@@ -293,11 +274,9 @@ def evaluate_htf_operator_strategies(df_15m, df_1h):
     if np.isnan(atr) or atr <= 0 or c_range <= 0:
         return None, None, None, None
 
-    # बारीक नियम 0: Overextended Exhaustion Check (अगर कैंडल पहले ही 2.8x ATR से बड़ी बन गई है, तो चेज न करें)
     if c_range > (atr * 2.8):
         return None, None, None, None
 
-    # पिछले 12 कैंडल्स (3 घंटे का 15M स्ट्रक्चर) और 24 कैंडल्स (6 घंटे का सेशन बॉक्स)
     struct_12     = df_15m.iloc[-14:-2]
     swing_high_12 = float(struct_12['High'].max())
     swing_low_12  = float(struct_12['Low'].min())
@@ -307,14 +286,7 @@ def evaluate_htf_operator_strategies(df_15m, df_1h):
     box_low_24    = float(box_24['Low'].min())
     box_width_24  = box_high_24 - box_low_24
 
-    # =========================================================================
     # STRATEGY 1: HTF (1H) ORDER FLOW + 15M JUDAS SWING LIQUIDITY SWEEP
-    # सूक्ष्म जांच:
-    # 1. 1H का ट्रेंड खिलाफ नहीं होना चाहिए + कीमत Discount (BUY) या Premium (SELL) ज़ोन में हो
-    # 2. पिछले 3 घंटे का स्विंग लो/हाई स्वीप हुआ हो (रिटेलर्स का SL कटा हो)
-    # 3. विक रिजेक्शन कम से कम 42% हो और कैंडल अपनी रेंज के टॉप 35% (BUY) या बॉटम 35% (SELL) में बंद हो
-    # =========================================================================
-    # Bullish Judas Swing Sweep
     swept_low = (low_p < swing_low_12 and price > swing_low_12) or (float(prev['Low']) < swing_low_12 and price > swing_low_12 and price > float(prev['High']))
     if swept_low and htf_bias != "BEARISH":
         in_discount = (price <= eq_level * 1.002) or (rsi < 52)
@@ -324,7 +296,6 @@ def evaluate_htf_operator_strategies(df_15m, df_1h):
             sl_level = lowest_point - (atr * 0.35)
             return "BUY (LONG) 🟢", "BUY", "1H+15M Judas Swing Liquidity Sweep (Discount Zone)", sl_level
 
-    # Bearish Judas Swing Sweep
     swept_high = (high_p > swing_high_12 and price < swing_high_12) or (float(prev['High']) > swing_high_12 and price < swing_high_12 and price < float(prev['Low']))
     if swept_high and htf_bias != "BULLISH":
         in_premium = (price >= eq_level * 0.998) or (rsi > 48)
@@ -334,22 +305,15 @@ def evaluate_htf_operator_strategies(df_15m, df_1h):
             sl_level = highest_point + (atr * 0.35)
             return "SELL (SHORT) 🔴", "SELL", "1H+15M Judas Swing Bull-Trap Sweep (Premium Zone)", sl_level
 
-    # =========================================================================
-    # STRATEGY 2: UNMITIGATED ORDER BLOCK + FVG + OTE (61.8% - 79%) REJECTION
-    # सूक्ष्म जांच:
-    # 1. पिछले 4 से 12 कैंडल्स (1 से 3 घंटे) के बीच एक विशाल ऑपरेटर कैंडल ने FVG बनाया हो
-    # 2. वह ज़ोन बीच की किसी भी कैंडल द्वारा पहले तोड़ा न गया हो (100% Unmitigated Check)
-    # 3. वर्तमान 15M क्लोज्ड कैंडल उस ज़ोन को टेस्ट करके मजबूत बॉडी के साथ वापस उछली हो
-    # =========================================================================
+    # STRATEGY 2: UNMITIGATED ORDER BLOCK + FVG + OTE REJECTION
     for i in range(4, 13):
-        c1 = df_15m.iloc[-i-2] # Base / Order Block Candle
-        c2 = df_15m.iloc[-i-1] # Institutional Impulse Candle
-        c3 = df_15m.iloc[-i]   # Confirmation Candle
+        c1 = df_15m.iloc[-i-2]
+        c2 = df_15m.iloc[-i-1]
+        c3 = df_15m.iloc[-i]
 
-        # Bullish Unmitigated OB + FVG
         if htf_bias == "BULLISH" and float(c3['Low']) > float(c1['High']) and float(c2['Close']) > float(c2['Open']) and float(c2['Candle_Body']) >= (atr * 1.15):
             zone_top    = float(c3['Low'])
-            zone_bottom = float(c1['Low']) # Order block base
+            zone_bottom = float(c1['Low'])
             intervening = df_15m.iloc[-i+1:-2]
             already_broken = (len(intervening) > 0) and (float(intervening['Low'].min()) < zone_bottom)
 
@@ -358,10 +322,9 @@ def evaluate_htf_operator_strategies(df_15m, df_1h):
                     sl_ob = min(low_p, zone_bottom) - (atr * 0.35)
                     return "BUY (LONG) 🟢", "BUY", "15M Unmitigated Order Block + FVG Mitigation (1H Aligned)", sl_ob
 
-        # Bearish Unmitigated OB + FVG
         if htf_bias == "BEARISH" and float(c3['High']) < float(c1['Low']) and float(c2['Close']) < float(c2['Open']) and float(c2['Candle_Body']) >= (atr * 1.15):
             zone_bottom = float(c3['High'])
-            zone_top    = float(c1['High']) # Order block top
+            zone_top    = float(c1['High'])
             intervening = df_15m.iloc[-i+1:-2]
             already_broken = (len(intervening) > 0) and (float(intervening['High'].max()) > zone_top)
 
@@ -370,43 +333,28 @@ def evaluate_htf_operator_strategies(df_15m, df_1h):
                     sl_ob = max(high_p, zone_top) + (atr * 0.35)
                     return "SELL (SHORT) 🔴", "SELL", "15M Unmitigated Bearish Order Block + FVG Supply (1H Aligned)", sl_ob
 
-    # =========================================================================
-    # STRATEGY 3: SESSION AMD (ACCUMULATION, MANIPULATION, DISTRIBUTION) TRAP
-    # सूक्ष्म जांच:
-    # 1. पिछले 6 घंटे (24 कैंडल्स) मार्केट एक टाइट एक्यूमुलेशन बॉक्स में रहा हो (Width < 4.8x ATR)
-    # 2. पिछली कैंडल ने बॉक्स तोड़ा (Manipulation / Retail Breakout Trap)
-    # 3. वर्तमान क्लोज्ड कैंडल ने तेजी से वापस बॉक्स के अंदर क्लोजिंग दी और पिछली कैंडल को Engulf कर लिया
-    # =========================================================================
+    # STRATEGY 3: SESSION AMD TRAP
     if box_width_24 <= (atr * 4.8):
         prev_low   = float(prev['Low'])
         prev_high  = float(prev['High'])
         prev_close = float(prev['Close'])
 
-        # Bullish AMD Manipulation Reversal (Spring)
         if (prev_low < box_low_24 or prev_close < box_low_24) and price > box_low_24:
             if price > open_p and price > float(prev['High']) and body >= (atr * 0.75) and close_pos >= 0.70 and htf_bias != "BEARISH":
                 sl_amd = min(low_p, prev_low) - (atr * 0.35)
                 return "BUY (LONG) 🟢", "BUY", "15M Session AMD Manipulation Trap (Wyckoff Spring)", sl_amd
 
-        # Bearish AMD Manipulation Reversal (Upthrust)
         if (prev_high > box_high_24 or prev_close > box_high_24) and price < box_high_24:
             if price < open_p and price < float(prev['Low']) and body >= (atr * 0.75) and close_pos <= 0.30 and htf_bias != "BULLISH":
                 sl_amd = max(high_p, prev_high) + (atr * 0.35)
                 return "SELL (SHORT) 🔴", "SELL", "15M Session AMD Manipulation Trap (Wyckoff Upthrust)", sl_amd
 
-    # =========================================================================
-    # STRATEGY 4: MULTI-TIMEFRAME INSTITUTIONAL DISPLACEMENT & CHoCH / BOS
-    # सूक्ष्म जांच:
-    # 1. 1H और 15M दोनों का ट्रेंड पूरी तरह एक दिशा में हो और ADX >= 20 हो
-    # 2. कैंडल बॉडी 1.35x ATR से बड़ी हो और बिना लंबी उलटी विक के (Body Ratio >= 68%) स्ट्रक्चर तोड़े
-    # 3. सामने 1-Hour की कोई मेजर रुकावट (Obstacle Wall) न हो (कम से कम 1.2x ATR का खुला रास्ता हो)
-    # =========================================================================
+    # STRATEGY 4: MULTI-TIMEFRAME INSTITUTIONAL DISPLACEMENT & BOS
     vol_now   = float(curr['Volume']) if 'Volume' in curr and not np.isnan(curr['Volume']) else 0
     vol_avg   = float(curr['Vol_MA20']) if 'Vol_MA20' in curr and not np.isnan(curr['Vol_MA20']) else 0
     vol_valid = (vol_avg == 0) or (vol_now >= vol_avg * 1.20)
 
     if body >= (atr * 1.35) and body_ratio >= 0.68 and adx >= ADX_THRESHOLD and vol_valid:
-        # Bullish MTF Institutional Break of Structure
         room_to_htf_res = (htf["htf_res"] - price) >= (atr * 1.2) or (price > htf["htf_res"])
         higher_lows = float(curr['Low']) > float(prev['Low']) >= float(prev2['Low'])
         if htf_bias == "BULLISH" and price > open_p and float(prev['Close']) <= swing_high_12 and price > swing_high_12:
@@ -414,7 +362,6 @@ def evaluate_htf_operator_strategies(df_15m, df_1h):
                 sl_bos = max(low_p - (atr * 0.30), price - (atr * 1.8))
                 return "BUY (LONG) 🟢", "BUY", "1H+15M Institutional Displacement & Structure Break (BOS)", sl_bos
 
-        # Bearish MTF Institutional Break of Structure
         room_to_htf_sup = (price - htf["htf_sup"]) >= (atr * 1.2) or (price < htf["htf_sup"])
         lower_highs = float(curr['High']) < float(prev['High']) <= float(prev2['High'])
         if htf_bias == "BEARISH" and price < open_p and float(prev['Close']) >= swing_low_12 and price < swing_low_12:
@@ -463,18 +410,27 @@ def send_live_forex_summary():
     report += get_trades_scoreboard()
     send_telegram_message(report)
 
-def manage_active_forex_trades(pair_name, candle_time, latest_live, closed_15m, decimals):
-    """लाइव टिक पर SL/Target चेक करेगा और क्लोज्ड 15M कैंडल पर स्ट्रक्चर रिवर्सल चेक करेगा"""
-    price        = float(latest_live['Close'])
-    current_high = float(latest_live['High'])
-    current_low  = float(latest_live['Low'])
-    ema20        = float(closed_15m['EMA20'])
-    ema50        = float(closed_15m['EMA50'])
-    adx          = float(closed_15m['ADX']) if not np.isnan(closed_15m['ADX']) else 15.0
+def manage_active_forex_trades(pair_name, candle_time, df_1m, latest_live_15m, closed_15m, decimals):
+    """
+    फिक्स किया गया स्मार्ट ट्रैकर:
+    • 1-Minute कैंडल्स का उपयोग करता है ताकि एक ही 15M कैंडल के पुराने High/Low से फेक Breakeven SL हिट न हो!
+    • Breakeven एक्टिवेट होने के समय (be_activated_time) के बाद के प्राइस एक्शन को ही चेक करता है।
+    """
+    ema20 = float(closed_15m['EMA20'])
+    ema50 = float(closed_15m['EMA50'])
+    adx   = float(closed_15m['ADX']) if not np.isnan(closed_15m['ADX']) else 15.0
+
+    # ताज़ा लाइव प्राइस (1m उपलब्ध हो तो वह, वरना 15m का क्लोज)
+    if df_1m is not None and not df_1m.empty:
+        price = float(df_1m.iloc[-1]['Close'])
+        now_time = df_1m.index[-1]
+    else:
+        price = float(latest_live_15m['Close'])
+        now_time = candle_time
 
     for trade in daily_trades_log:
         if trade["pair"] == pair_name and trade["is_open"]:
-            if candle_time <= trade["entry_candle_time"]:
+            if candle_time < trade["entry_candle_time"]:
                 continue
 
             entry_str  = format_price(trade["entry"], decimals)
@@ -482,7 +438,50 @@ def manage_active_forex_trades(pair_name, candle_time, latest_live, closed_15m, 
             sl_str     = format_price(trade["sl"], decimals)
             price_str  = format_price(price, decimals)
 
-            # 1. TARGET या STOP-LOSS चेक करें
+            # किस समय के बाद का High/Low चेक करना है?
+            # अगर ट्रेड Breakeven पर आ चुका है, तो सिर्फ Breakeven होने के बाद के मिनटों का High/Low देखें
+            check_since = trade.get("be_activated_time", trade["entry_exact_time"])
+
+            if df_1m is not None and not df_1m.empty:
+                recent_ticks = df_1m[df_1m.index > check_since]
+                if not recent_ticks.empty:
+                    current_high = float(recent_ticks['High'].max())
+                    current_low  = float(recent_ticks['Low'].min())
+                else:
+                    # अभी-अभी Breakeven सेट हुआ है, इसलिए सिर्फ लाइव टिक प्राइस चेक करें
+                    current_high = price
+                    current_low  = price
+            else:
+                current_high = price
+                current_low  = price
+
+            # 1. पहले 1:1 (Breakeven Trigger) चेक करें अगर अभी तक Breakeven नहीं हुआ है
+            if not trade["trailed_to_cost"]:
+                half_reached = False
+                if trade["direction"] == "BUY" and current_high >= trade["half_target"]:
+                    half_reached = True
+                elif trade["direction"] == "SELL" and current_low <= trade["half_target"]:
+                    half_reached = True
+
+                if half_reached:
+                    trade["trailed_to_cost"]   = True
+                    trade["sl"]                = trade["entry"]
+                    trade["be_activated_time"] = now_time
+                    half_prof                  = trade["max_risk"] * 0.5  # 50% लॉट पर 1:1 प्रॉफिट बुक
+                    trade["status"]            = (
+                        f"🔥 1:1 HIT (+${half_prof:.0f} Locked | SL at Entry {entry_str} - Waiting for Full Target)"
+                    )
+                    send_telegram_message(
+                        f"🛡️ <b>SMART MONEY UPDATE (Trade #{trade['id']}) : MOVE SL TO BREAKEVEN!</b> 🛡️\n\n"
+                        f"🌍 <b>Pair:</b> {trade['pair']}\n\n"
+                        f"✅ <b>1:1 टारगेट पूरा हो चुका है! (Current Price: {price_str})</b>\n\n"
+                        f"📢 <b>एक्शन:</b> अब अपने Exness / MT5 में स्टॉप-लॉस को उठाकर <b>Entry Price ({entry_str})</b> पर लगा लें और चाहें तो 50% लॉट बुक कर लें।\n\n"
+                        f"🔍 <b>आगे की ट्रैकिंग चालू है:</b> बॉट अब इस ट्रेड को <b>Full Target ({target_str})</b> या <b>Breakeven SL ({entry_str})</b> हिट होने तक लाइव ट्रैक करेगा और फाइनल रिजल्ट बताएगा!"
+                    )
+                    # इस स्कैन में तुरंत SL चेक न करें, अगले मिनट से नया मूवमेंट चेक करें
+                    continue
+
+            # 2. TARGET या STOP-LOSS (या Breakeven SL) चेक करें
             hit_type = None
             if trade["direction"] == "BUY":
                 if current_high >= trade["target"]:
@@ -497,25 +496,29 @@ def manage_active_forex_trades(pair_name, candle_time, latest_live, closed_15m, 
 
             if hit_type == "TARGET":
                 trade["is_open"] = False
-                trade["status"] = f"✅ TARGET HIT (+${trade['expected_profit']:.0f} प्रॉफिट)"
+                trade["status"] = f"✅ FULL TARGET HIT (+${trade['expected_profit']:.0f} प्रॉफिट)"
                 send_telegram_message(
-                    f"🎯 <b>OPERATOR TRADE #{trade['id']} : FULL TARGET HIT!</b> 🎯\n\n"
+                    f"🎯 <b>OPERATOR TRADE #{trade['id']} : FULL TARGET (1:2.4) HIT!</b> 🎯\n\n"
                     f"🌍 <b>Pair:</b> {trade['pair']} ({trade['mt5_name']})\n\n"
                     f"⚡ <b>Direction:</b> {trade['action']}\n\n"
                     f"📍 <b>Entry:</b> {entry_str}  ➡️  <b>Target Hit:</b> {target_str}\n\n"
-                    f"💰 <b>Result:</b> <b>✅ +${trade['expected_profit']:.0f} (लगभग +₹{trade['expected_profit']*85:.0f}) प्रॉफिट</b>\n\n"
-                    f"📢 <b>ऑपरेटर सलाह:</b> शानदार! बड़े टाइमफ्रेम (1H+15M) का टारगेट पूरा हुआ, अपना प्रॉफिट बुक कर लें।\n\n"
+                    f"💰 <b>Final Result:</b> <b>✅ +${trade['expected_profit']:.0f} (लगभग +₹{trade['expected_profit']*85:.0f}) पूरा प्रॉफिट!</b>\n\n"
+                    f"📢 <b>ऑपरेटर सलाह:</b> शानदार! Breakeven पर आने के बाद मार्केट ने सीधा हमारा फाइनल टारगेट (1:2.4) हिट कर दिया है। पूरा प्रॉफिट बुक कर लें!\n\n"
                     f"────────────────────\n\n{get_trades_scoreboard()}"
                 )
                 continue
 
             elif hit_type == "TRAILING_SL":
                 trade["is_open"] = False
-                trade["status"] = "🛡️ BREAKEVEN EXIT ($0 No Loss)"
+                half_prof = trade["max_risk"] * 0.5
+                trade["status"] = f"🛡️ BREAKEVEN SL HIT (1:1 के बाद कॉस्ट पर एग्जिट | +${half_prof:.0f} सेफ)"
                 send_telegram_message(
-                    f"🛡️ <b>OPERATOR TRADE #{trade['id']} : TRAILING SL HIT (NO LOSS)!</b> 🛡️\n\n"
+                    f"🛡️ <b>OPERATOR TRADE #{trade['id']} : BREAKEVEN SL HIT (FINAL RESULT)!</b> 🛡️\n\n"
                     f"🌍 <b>Pair:</b> {trade['pair']}\n\n"
-                    f"📢 <b>अपडेट:</b> मार्केट वापस घूम गया, लेकिन स्टॉप-लॉस कॉस्ट (Breakeven) पर होने की वजह से <b>आपका $0 का नुकसान हुआ!</b>\n\n"
+                    f"📍 <b>Entry & Trailing SL:</b> {entry_str}  |  <b>Current Price:</b> {price_str}\n\n"
+                    f"📢 <b>फाइनल रिजल्ट:</b> 1:1 टारगेट जाने के बाद मार्केट सच में वापस घूमकर आपके <b>Entry Price ({entry_str})</b> पर आ गया है।\n"
+                    f"• अगर आपने 50% लॉट बुक किया था: <b>+${half_prof:.0f} प्रॉफिट बचा!</b>\n"
+                    f"• बचे हुए ट्रेड पर: <b>$0 (No Loss) पर सुरक्षित एग्जिट!</b>\n\n"
                     f"────────────────────\n\n{get_trades_scoreboard()}"
                 )
                 continue
@@ -533,25 +536,6 @@ def manage_active_forex_trades(pair_name, candle_time, latest_live, closed_15m, 
                 )
                 continue
 
-            # 2. प्रो नियम: 1:1 आने पर SL को Breakeven (Cost) पर लाना
-            if not trade["trailed_to_cost"]:
-                half_reached = False
-                if trade["direction"] == "BUY" and current_high >= trade["half_target"]:
-                    half_reached = True
-                elif trade["direction"] == "SELL" and current_low <= trade["half_target"]:
-                    half_reached = True
-
-                if half_reached:
-                    trade["trailed_to_cost"] = True
-                    trade["sl"] = trade["entry"]
-                    trade["status"] = "🔥 RUNNING (SL at Breakeven - Risk Free)"
-                    send_telegram_message(
-                        f"🛡️ <b>SMART MONEY UPDATE (Trade #{trade['id']}) : MOVE SL TO BREAKEVEN!</b> 🛡️\n\n"
-                        f"🌍 <b>Pair:</b> {trade['pair']}\n\n"
-                        f"✅ <b>1:1 टारगेट पूरा हो चुका है! (Current Price: {price_str})</b>\n\n"
-                        f"📢 <b>एक्शन:</b> अब अपने Exness / MT5 में स्टॉप-लॉस को उठाकर <b>Entry Price ({entry_str})</b> पर लगा लें और चाहें तो 50% लॉट बुक कर लें। अब यह ट्रेड 100% रिस्क-फ्री है!"
-                    )
-
             # 3. प्रो नियम: बड़े टाइमफ्रेम (180 मिनट / 3 घंटे) तक मार्केट साइडवेज अटक जाए तो एग्जिट
             hold_minutes = (candle_time - trade["entry_candle_time"]).total_seconds() / 60.0
             if hold_minutes >= MAX_HOLD_MINUTES and not trade["trailed_to_cost"]:
@@ -568,8 +552,8 @@ def manage_active_forex_trades(pair_name, candle_time, latest_live, closed_15m, 
                     )
                     continue
 
-            # 4. प्रो नियम: अगर 15M की क्लोज्ड कैंडल दोनों EMA (20 और 50) के खिलाफ बंद हो जाए
-            if hold_minutes >= 45:
+            # 4. प्रो नियम: अगर 15M की क्लोज्ड कैंडल दोनों EMA (20 और 50) के खिलाफ बंद हो जाए (सिर्फ तब जब Breakeven न हुआ हो)
+            if hold_minutes >= 45 and not trade["trailed_to_cost"]:
                 closed_price = float(closed_15m['Close'])
                 trend_reversed = False
                 if trade["direction"] == "BUY" and closed_price < ema20 and closed_price < ema50 and closed_price < (trade["entry"] - trade["sl_dist"] * 0.65):
@@ -606,9 +590,10 @@ def scan_forex_market():
     for name, info in FOREX_PAIRS.items():
         try:
             ticker = yf.Ticker(info["symbol"])
-            # बड़े टाइमफ्रेम का डेटा: 15-Minute (एंट्री और स्ट्रक्चर) + 1-Hour (मेजर ऑपरेटर डायरेक्शन)
             df_15m = ticker.history(period="10d", interval="15m")
             df_1h  = ticker.history(period="1mo", interval="1h")
+            # सटीक लाइव SL/Target और Breakeven ट्रैकिंग के लिए 1-Minute डेटा
+            df_1m  = ticker.history(period="1d", interval="1m")
 
             if df_15m.empty or len(df_15m) < 100 or df_1h.empty or len(df_1h) < 50:
                 continue
@@ -616,16 +601,17 @@ def scan_forex_market():
             df_15m = calculate_indicators(df_15m)
             df_1h  = calculate_indicators(df_1h)
 
-            latest_live    = df_15m.iloc[-1] # चालू कैंडल (सिर्फ लाइव प्राइस और एक्टिव ट्रेड SL/Target ट्रैक करने के लिए)
-            closed_15m     = df_15m.iloc[-2] # आखिरी पूरी तरह बंद हो चुकी 15M कैंडल (सिग्नल कंफर्मेशन के लिए)
-            closed_time    = df_15m.index[-2]
+            latest_live_15m = df_15m.iloc[-1]
+            closed_15m      = df_15m.iloc[-2]
+            closed_time     = df_15m.index[-2]
 
-            price = float(latest_live['Close'])
+            price = float(df_1m.iloc[-1]['Close']) if (df_1m is not None and not df_1m.empty) else float(latest_live_15m['Close'])
+            exact_now_time = df_1m.index[-1] if (df_1m is not None and not df_1m.empty) else closed_time
             atr   = float(closed_15m['ATR'])
             dec   = info["decimals"]
 
-            # 1. पहले चल रहे ट्रेड्स को मैनेज करें
-            manage_active_forex_trades(name, closed_time, latest_live, closed_15m, dec)
+            # 1. पहले चल रहे ट्रेड्स को सटीक 1m डेटा से मैनेज करें
+            manage_active_forex_trades(name, closed_time, df_1m, latest_live_15m, closed_15m, dec)
 
             # 2. अगर इस पेयर में पहले से ट्रेड खुला है तो नया न लें
             if any(t["pair"] == name and t["is_open"] for t in daily_trades_log):
@@ -642,7 +628,6 @@ def scan_forex_market():
             signal, direction, strategy_used, custom_sl = evaluate_htf_operator_strategies(df_15m, df_1h)
 
             if signal and custom_sl is not None:
-                # 15M टाइमफ्रेम के हिसाब से सुरक्षित स्टॉप-लॉस (1.1x ATR से 2.2x ATR के बीच)
                 raw_sl_dist = abs(price - custom_sl)
                 min_sl_dist = atr * 1.1
                 max_sl_dist = atr * 2.2
@@ -654,7 +639,7 @@ def scan_forex_market():
                 last_candle_traded[name] = closed_time
                 trades_today += 1
 
-                rr_ratio = 2.4 # बड़े टाइमफ्रेम पर हाई-प्रोबेबिलिटी 1:2.4 रिस्क-रिवॉर्ड
+                rr_ratio = 2.4
                 target_dist = round(sl_dist * rr_ratio, dec)
 
                 if direction == "BUY":
@@ -666,7 +651,7 @@ def scan_forex_market():
                     half_target_level = round(price - sl_dist, dec)
                     target_level      = round(price - target_dist, dec)
 
-                max_risk_usd  = TOTAL_CAPITAL_USD * (RISK_PER_TRADE_PCT / 100.0) # $10 risk
+                max_risk_usd  = TOTAL_CAPITAL_USD * (RISK_PER_TRADE_PCT / 100.0)
                 expected_prof = max_risk_usd * rr_ratio
 
                 trade_id = trades_today
@@ -685,6 +670,8 @@ def scan_forex_market():
                     "max_risk": max_risk_usd,
                     "expected_profit": expected_prof,
                     "entry_candle_time": closed_time,
+                    "entry_exact_time": exact_now_time,
+                    "be_activated_time": exact_now_time,
                     "trailed_to_cost": False,
                     "is_open": True,
                     "status": "⏳ RUNNING (चल रहा है)"
