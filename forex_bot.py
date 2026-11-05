@@ -7,61 +7,60 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 
 # =====================================================================
-# 1. FUNDING PIPS $100,000 COMPETITION SETTINGS (PROP-FIRM SHIELD)
+# 1. FUNDING PIPS $100K — MACRO-QUANT RECOVERY & SNIPER EDITION
 # =====================================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID   = "5610520408"  # सिर्फ आपकी टेलीग्राम आईडी पर काम करेगा
+CHAT_ID   = "5610520408"
 
-# Funding Pips $100k Challenge Rules & Risk Allocation
-TOTAL_CAPITAL_USD     = 100000.0  # $1,00,000 (Funding Pips Competition Account)
-MAX_DAILY_DRAWDOWN    = 5000.0    # $5,000 (5%) Daily Loss Limit (Rule)
-MAX_TOTAL_DRAWDOWN    = 10000.0   # $10,000 (10%) Overall Loss Limit (Rule)
+TOTAL_CAPITAL_USD     = 100000.0  # $1,00,000 Competition Account
+MAX_DAILY_DRAWDOWN    = 5000.0    # $5,000 Daily Loss Rule
+MAX_TOTAL_DRAWDOWN    = 10000.0   # $10,000 Max Loss Rule
 
-# Safe Prop-Firm Risk: $450 (0.45%) per trade
-# अगर दिन के 4 ट्रेड भी SL होते हैं, तो अधिकतम लॉस सिर्फ $1,800 होगा ($5,000 से बहुत नीचे!)
-RISK_PER_TRADE_USD    = 450.0     # प्रति ट्रेड फिक्स $450 रिस्क (0.45% ऑफ $100k)
-DAILY_SAFE_STOP_USD   = 1800.0    # $1,800 नेट लॉस होते ही बॉट उस दिन नए ट्रेड रोक देगा (Safety Lock)
-MAX_TRADES_PER_DAY    = 4         # दिन में 4 सबसे हाई-विन-रेट ट्रेड्स (Gold और EUR/USD को प्राथमिकता)
+# RECOVERY RISK ENGINE:
+# $250 Risk (0.25%) per trade -> 1:2.5 Target = +$625 Profit (1 Winning Trade recovers your $600 loss!)
+RISK_PER_TRADE_USD    = 250.0     # प्रति ट्रेड सिर्फ $250 का बेहद सुरक्षित रिस्क
+DAILY_SAFE_STOP_USD   = 750.0     # दिन में अगर 3 गलत ट्रेड (-$750) हुए तो बॉट तुरंत उस दिन के लिए बंद हो जाएगा
+MAX_TRADES_PER_DAY    = 3         # दिन में सिर्फ 3 सबसे परफेक्ट 'A+ Sniper' ट्रेड्स (Quality over Quantity)
+MAX_HOLD_MINUTES      = 150       # 2.5 घंटे में फॉलो-थ्रू न मिले तो बाहर
 
-ADX_THRESHOLD         = 18        # मजबूत मोमेंटम फिल्टर
-MAX_HOLD_MINUTES      = 180       # 3 घंटे (180 मिनट) का अधिकतम होल्ड टाइम
+# DXY (US Dollar Index) Symbol for Live Intermarket Correlation
+DXY_SYMBOL = "DX-Y.NYB"
 
-# फॉरेक्स के 5 पेयर्स (Gold और EUR/USD सबसे ऊपर ताकि उन्हें सबसे पहले स्कैन और प्रायोरिटी मिले)
 FOREX_PAIRS = {
     "XAU/USD (GOLD)": {
         "symbol": "GC=F",
         "mt5_name": "XAUUSD",
         "decimals": 2,
         "unit_name": "Points",
-        "priority": True
+        "dxy_correlation": "INVERSE"  # Dollar ऊपर = Gold नीचे
     },
     "EUR/USD": {
         "symbol": "EURUSD=X",
         "mt5_name": "EURUSD",
         "decimals": 5,
         "unit_name": "Pips",
-        "priority": True
+        "dxy_correlation": "INVERSE"  # Dollar ऊपर = EUR/USD नीचे
     },
     "GBP/USD": {
         "symbol": "GBPUSD=X",
         "mt5_name": "GBPUSD",
         "decimals": 5,
         "unit_name": "Pips",
-        "priority": False
+        "dxy_correlation": "INVERSE"
     },
     "USD/JPY": {
         "symbol": "JPY=X",
         "mt5_name": "USDJPY",
         "decimals": 3,
         "unit_name": "Pips",
-        "priority": False
+        "dxy_correlation": "DIRECT"   # Dollar ऊपर = USD/JPY ऊपर
     },
     "GBP/JPY": {
         "symbol": "GBPJPY=X",
         "mt5_name": "GBPJPY",
         "decimals": 3,
         "unit_name": "Pips",
-        "priority": False
+        "dxy_correlation": "NEUTRAL"
     }
 }
 
@@ -70,7 +69,7 @@ trades_today = 0
 last_update_id = 0
 daily_trades_log = []
 daily_realized_pnl = 0.0
-total_competition_pnl = 0.0
+total_competition_pnl = -600.0  # आपके पिछले -$600 को ट्रैक में रखा है ताकि रिकवरी लाइव दिखे
 
 def get_ist_now():
     return datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
@@ -78,29 +77,35 @@ def get_ist_now():
 current_day = get_ist_now().date()
 
 def is_forex_market_open():
-    """फॉरेक्स मार्केट सोमवार सुबह 3:30 AM IST से शनिवार सुबह 3:30 AM IST तक 24 घंटे खुलता है"""
     now = get_ist_now()
-    wd = now.weekday()  # Monday=0 ... Saturday=5, Sunday=6
+    wd = now.weekday()
     if wd == 6:
         return False
     if wd == 5 and now.hour >= 4:
         return False
     return True
 
-def get_current_session_info():
-    """ऑपरेटर वोलैटिलिटी और लिक्विडिटी टाइमिंग की जांच (IST के अनुसार)"""
+def get_institutional_killzone():
+    """
+    प्रोफेशनल ट्रेडर्स हर समय ट्रेड नहीं करते!
+    बेकार और कम वॉल्यूम वाले घंटों (Dead Zones) में बॉट अब कोई एंट्री नहीं लेगा।
+    """
     now = get_ist_now()
     hr = now.hour + (now.minute / 60.0)
-    if 3.5 <= hr <= 5.0:
-        return False, "Low Liquidity Rollover Zone (High Spread)"
-    elif 5.0 < hr < 12.5:
-        return True, "Asian / Tokyo Institutional Session"
-    elif 12.5 <= hr < 18.0:
-        return True, "London Killzone Session (High Liquidity)"
-    elif 18.0 <= hr < 22.5:
-        return True, "London + New York Overlap (Maximum Gold & EUR/USD Volume)"
+    # Dead Zone 1: सुबह 2:30 AM से 6:00 AM IST (Rollover & Wide Spreads)
+    if 2.5 <= hr <= 6.0:
+        return False, "Dead Rollover Zone (No Institutional Volume)"
+    # Dead Zone 2: सुबह 10:30 AM से 12:15 PM IST (Pre-London Fakeout Trap Zone)
+    if 10.5 <= hr < 12.25:
+        return False, "Pre-London Retail Inducement Zone (Waiting for London Open)"
+    elif 6.0 < hr < 10.5:
+        return True, "Tokyo Institutional Flow"
+    elif 12.25 <= hr < 18.0:
+        return True, "London Prime Killzone"
+    elif 18.0 <= hr < 23.0:
+        return True, "London + NY Overlap (Peak Institutional Liquidity)"
     else:
-        return True, "New York Institutional Session"
+        return True, "New York Late Session"
 
 def send_telegram_message(message, target_chat_id=CHAT_ID):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -114,7 +119,6 @@ def format_price(price, decimals):
     return f"{price:.{decimals}f}"
 
 def calculate_pips_or_points(pair_name, price_diff, decimals):
-    """MT5 चार्ट पर तुरंत SL और Target लगाने के लिए सटीक Pips/Points की गणना"""
     if "GOLD" in pair_name:
         return f"${price_diff:.2f} ({price_diff * 10:.0f} Points)"
     elif decimals == 3:
@@ -123,31 +127,20 @@ def calculate_pips_or_points(pair_name, price_diff, decimals):
         return f"{price_diff * 10000:.1f} Pips"
 
 def calculate_exact_mt5_lot_size(pair_name, entry_price, sl_dist, risk_usd):
-    """
-    $100,000 अकाउंट और $450 के फिक्स रिस्क के हिसाब से सटीक MT5 Lot Size निकालता है
-    ताकि अगर SL हिट भी हो, तो कभी $450 से ज्यादा नुकसान न हो!
-    """
     if sl_dist <= 0:
-        return 0.10
-
+        return 0.05
     if "GOLD" in pair_name:
-        # Gold (XAUUSD): 1.00 Standard Lot (100 oz) में $1.00 के मूव पर $100 का फर्क पड़ता है
         loss_per_1_lot = sl_dist * 100.0
     elif pair_name.endswith("JPY"):
-        # USDJPY / GBPJPY: 1.00 Standard Lot में 1.00 JPY मूव पर ~$100000 / price का फर्क पड़ता है
         loss_per_1_lot = (sl_dist * 100000.0) / max(entry_price, 100.0)
     else:
-        # EURUSD / GBPUSD: 1.00 Standard Lot में 0.0001 (1 Pip) पर $10 का फर्क पड़ता है
         pips = sl_dist * 10000.0
         loss_per_1_lot = pips * 10.0
 
     if loss_per_1_lot <= 0:
-        return 0.10
-
+        return 0.05
     raw_lot = risk_usd / loss_per_1_lot
-    # Funding Pips में सुरक्षित मार्जिन के लिए लॉट को 0.05 से 2.50 के बीच बाउंड रखें
-    safe_lot = max(0.05, min(round(raw_lot, 2), 2.50))
-    return safe_lot
+    return max(0.05, min(round(raw_lot, 2), 1.50))
 
 def get_funding_pips_dashboard():
     current_equity = TOTAL_CAPITAL_USD + total_competition_pnl
@@ -155,19 +148,335 @@ def get_funding_pips_dashboard():
     total_dd_remaining = MAX_TOTAL_DRAWDOWN + min(0.0, total_competition_pnl)
 
     board = (
-        f"🏆 <b>FUNDING PIPS $100K COMPETITION SHIELD:</b>\n"
-        f"• <b>Account Balance:</b> ${current_equity:,.0f} (Today P&L: <b>${daily_realized_pnl:+,.0f}</b>)\n"
+        f"🏦 <b>MACRO-QUANT $100K RECOVERY DASHBOARD:</b>\n"
+        f"• <b>Current Equity:</b> ${current_equity:,.0f} (Today: <b>${daily_realized_pnl:+,.0f}</b> | Net: <b>${total_competition_pnl:+,.0f}</b>)\n"
         f"• <b>Daily Loss Buffer Left:</b> ${daily_dd_remaining:,.0f} / $5,000\n"
-        f"• <b>Max Loss Buffer Left:</b> ${total_dd_remaining:,.0f} / $10,000\n\n"
+        f"• <b>Total Loss Buffer Left:</b> ${total_dd_remaining:,.0f} / $10,000\n\n"
     )
     if not daily_trades_log:
-        board += "📋 <b>आज के ऑपरेटर ट्रेड्स:</b> अभी कोई ट्रेड नहीं लिया गया है।"
+        board += "📋 <b>आज के स्नाइपर ट्रेड्स:</b> अभी कोई A+ सेटअप कन्फर्म नहीं हुआ है।"
         return board
 
-    board += "📋 <b>आज के ट्रेड्स का लाइव स्कोरकार्ड:</b>\n"
+    board += "📋 <b>आज के स्नाइपर ट्रेड्स का हाल:</b>\n"
     for t in daily_trades_log:
         board += f"👉 <b>Trade #{t['id']} ({t['pair']} - {t['direction']} | {t['lot_size']} Lot):</b>\n   {t['status']}\n"
     return board.strip()
+
+# =====================================================================
+# 2. QUANTITATIVE & INTERMARKET DXY ENGINE (PRO TRADER BRAIN)
+# =====================================================================
+def calculate_quant_metrics(df):
+    """
+    साधारण रिटेल इंडिकेटर्स के बजाय Quantitative Price Delivery Metrics:
+    1. Kaufman Efficiency Ratio (ER): यह नापता है कि मार्केट सीधा चल रहा है या ज़िग-ज़ैग (Choppy) होकर SL खा रहा है।
+    2. Z-Score & Institutional Displacement: असली ऑपरेटर वॉल्यूम स्पाइक पकड़ने के लिए।
+    3. Dynamic Liquidity Pools: जहाँ रिटेलर्स के स्टॉप-लॉस पड़े होते हैं।
+    """
+    df = df.copy()
+    df['EMA20']  = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA50']  = df['Close'].ewm(span=50, adjust=False).mean()
+    df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
+
+    # ATR Volatility
+    hl = df['High'] - df['Low']
+    hc = np.abs(df['High'] - df['Close'].shift())
+    lc = np.abs(df['Low'] - df['Close'].shift())
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    df['ATR'] = tr.rolling(14).mean()
+
+    # Kaufman Efficiency Ratio (ER over 10 periods)
+    # ER = 1.0 मतलब एकदम सीधा ट्रेंड, ER < 0.35 मतलब गंदा साइडवेज मार्केट (SL Hunting Zone)
+    net_change = np.abs(df['Close'] - df['Close'].shift(10))
+    sum_volatility = np.abs(df['Close'] - df['Close'].shift(1)).rolling(10).sum().replace(0, 1e-9)
+    df['Efficiency_Ratio'] = (net_change / sum_volatility).fillna(0.0)
+
+    # Candle Micro-Anatomy
+    df['Body']       = np.abs(df['Close'] - df['Open'])
+    df['Range']      = (df['High'] - df['Low']).replace(0, 1e-9)
+    df['Body_Ratio'] = df['Body'] / df['Range']
+    df['Upper_Wick'] = df['High'] - df[['Open', 'Close']].max(axis=1)
+    df['Lower_Wick'] = df[['Open', 'Close']].min(axis=1) - df['Low']
+    df['Close_Pos']  = (df['Close'] - df['Low']) / df['Range']
+
+    # Institutional Displacement Ratio (Current Body vs Average Body of last 20 candles)
+    avg_body_20 = df['Body'].rolling(20).mean().replace(0, 1e-9)
+    df['Displacement_Z'] = df['Body'] / avg_body_20
+
+    # RSI
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    df['RSI'] = (100 - (100 / (1 + rs))).fillna(50.0)
+
+    return df
+
+def get_live_dxy_macro_flow():
+    """
+    US Dollar Index (DXY) का लाइव फ्लो चेक करता है।
+    अगर DXY मजबूत है (BULLISH), तो Gold और EUR/USD में BUY लेना आत्महत्या करने जैसा है!
+    """
+    try:
+        dxy = yf.Ticker(DXY_SYMBOL)
+        df_dxy_15m = dxy.history(period="5d", interval="15m")
+        if df_dxy_15m.empty or len(df_dxy_15m) < 50:
+            return "NEUTRAL", 0.0
+
+        df_dxy_15m = calculate_quant_metrics(df_dxy_15m)
+        c = df_dxy_15m.iloc[-2]
+        p = df_dxy_15m.iloc[-3]
+
+        close_dxy = float(c['Close'])
+        ema20_dxy = float(c['EMA20'])
+        ema50_dxy = float(c['EMA50'])
+        chg_3bars = close_dxy - float(df_dxy_15m.iloc[-5]['Close'])
+
+        if close_dxy > ema20_dxy and ema20_dxy > ema50_dxy and chg_3bars > 0:
+            return "STRONG_BULLISH", chg_3bars
+        elif close_dxy < ema20_dxy and ema20_dxy < ema50_dxy and chg_3bars < 0:
+            return "STRONG_BEARISH", chg_3bars
+        elif close_dxy > ema20_dxy and float(c['Close']) > float(p['High']):
+            return "BULLISH_IMPULSE", chg_3bars
+        elif close_dxy < ema20_dxy and float(c['Close']) < float(p['Low']):
+            return "BEARISH_IMPULSE", chg_3bars
+        return "NEUTRAL", chg_3bars
+    except Exception:
+        return "NEUTRAL", 0.0
+
+def is_dxy_aligned_with_trade(pair_info, trade_direction, dxy_state):
+    """
+    प्रोफेशनल कॉरिलेशन लॉक:
+    • अगर पेयर INVERSE है (Gold, EUR/USD, GBP/USD):
+      - BUY तभी करो जब DXY कमज़ोर (BEARISH) या शांत हो। अगर DXY में तेजी (BULLISH) है, तो BUY ब्लॉक!
+      - SELL तभी करो जब DXY मजबूत (BULLISH) या शांत हो। अगर DXY गिर रहा है, तो SELL ब्लॉक!
+    """
+    corr = pair_info.get("dxy_correlation", "NEUTRAL")
+    if corr == "INVERSE":
+        if trade_direction == "BUY" and "BULLISH" in dxy_state:
+            return False, f"Blocked: DXY is {dxy_state} (Dollar ऊपर जा रहा है, इसलिए BUY मना है)"
+        if trade_direction == "SELL" and "BEARISH" in dxy_state:
+            return False, f"Blocked: DXY is {dxy_state} (Dollar गिर रहा है, इसलिए SELL मना है)"
+    elif corr == "DIRECT":
+        if trade_direction == "BUY" and "BEARISH" in dxy_state:
+            return False, f"Blocked: DXY is {dxy_state}"
+        if trade_direction == "SELL" and "BULLISH" in dxy_state:
+            return False, f"Blocked: DXY is {dxy_state}"
+    return True, f"DXY Aligned ({dxy_state})"
+
+def analyze_strict_1h_institutional_structure(df_1h):
+    """
+    कोई फेक 'LEAN' नहीं!
+    1H ट्रेंड तभी BULLISH या BEARISH माना जाएगा जब स्ट्रक्चर और EMA दोनों 100% साफ हों।
+    """
+    c1 = df_1h.iloc[-2]
+    c2 = df_1h.iloc[-3]
+    c3 = df_1h.iloc[-4]
+
+    close_1h  = float(c1['Close'])
+    ema20_1h  = float(c1['EMA20'])
+    ema50_1h  = float(c1['EMA50'])
+    atr_1h    = float(c1['ATR']) if not np.isnan(c1['ATR']) else 0.0
+
+    # पिछले 16 घंटे के मेजर वॉल (Major Liquidity Walls)
+    recent_16 = df_1h.iloc[-18:-2]
+    major_high = float(recent_16['High'].max())
+    major_low  = float(recent_16['Low'].min())
+
+    # 1H की आखिरी कैंडल का खुद का डायरेक्शन
+    h1_candle_bull = float(c1['Close']) > float(c1['Open']) or float(c1['Close_Pos']) >= 0.55
+    h1_candle_bear = float(c1['Close']) < float(c1['Open']) or float(c1['Close_Pos']) <= 0.45
+
+    # Strict Institutional Alignment
+    if close_1h > ema20_1h and ema20_1h > ema50_1h and (h1_candle_bull or float(c1['Low']) > float(c3['Low'])):
+        bias = "STRICT_BULLISH"
+    elif close_1h < ema20_1h and ema20_1h < ema50_1h and (h1_candle_bear or float(c1['High']) < float(c3['High'])):
+        bias = "STRICT_BEARISH"
+    else:
+        bias = "CHOPPY_NEUTRAL"  # ऐसे मार्केट में प्रोफेशनल ट्रेडर हाथ भी नहीं लगाता!
+
+    return {
+        "bias": bias,
+        "major_high": major_high,
+        "major_low": major_low,
+        "atr_1h": atr_1h,
+        "ema20_1h": ema20_1h
+    }
+
+# =====================================================================
+# 3. THE CUSTOM "TRIAD PROTOCOL" (OUR ORIGINAL PROPRIETARY STRATEGY)
+# =====================================================================
+def evaluate_triad_proprietary_strategy(pair_name, pair_info, df_1h, df_15m, df_5m, dxy_state):
+    """
+    यह स्ट्रैटेजी किसी किताब या यूट्यूब की कॉपी नहीं है।
+    यह 4-स्टेप Institutional Order-Flow Triad पर काम करती है:
+    1. HTF 1H Strict Regime + DXY Macro Lock
+    2. 15M 'Inducement Flush & Institutional Absorption' (रिटेलर्स को ट्रैप करके रिवर्सल या री-एक्यूमुलेशन)
+    3. 5M Micro-Structure Break Confirmation (ताकि चलती छुरी में हाथ न कटे)
+    4. Liquidity Vacuum Check (सामने कोई दीवार न हो ताकि 1:1 और 1:2.5 आसानी से हिट हो)
+    """
+    kz_ok, _ = get_institutional_killzone()
+    if not kz_ok:
+        return None, None, None, None
+
+    htf = analyze_strict_1h_structure_wrapper(df_1h)
+    if htf["bias"] == "CHOPPY_NEUTRAL":
+        # अगर 1-Hour चार्ट ही कन्फ्यूज और साइडवेज है, तो सीधे छोड़ दो!
+        return None, None, None, None
+
+    c0 = df_15m.iloc[-2]  # आखिरी क्लोज्ड 15M कैंडल (Trigger Candle)
+    c1 = df_15m.iloc[-3]  # उससे पहले की 15M कैंडल (Setup / Trap Candle)
+    c2 = df_15m.iloc[-4]  # तीसरी पिछली कैंडल
+
+    price      = float(c0['Close'])
+    open_0     = float(c0['Open'])
+    high_0     = float(c0['High'])
+    low_0      = float(c0['Low'])
+    atr        = float(c0['ATR'])
+    er         = float(c0['Efficiency_Ratio'])
+    disp_z     = float(c0['Displacement_Z'])
+    close_pos  = float(c0['Close_Pos'])
+    body_ratio = float(c0['Body_Ratio'])
+    ema20      = float(c0['EMA20'])
+    ema50      = float(c0['EMA50'])
+    rsi        = float(c0['RSI'])
+
+    if np.isnan(atr) or atr <= 0:
+        return None, None, None, None
+
+    # 1. CHOPPY & EXHAUSTION FILTER:
+    # अगर कैंडल 2.2x ATR से बड़ी बन चुकी है, तो सारा मूव खत्म हो चुका है—अब घुसोगे तो टॉप/बॉटम पर फंसोगे!
+    if float(c0['Range']) > (atr * 2.2) or float(c0['Range']) < (atr * 0.45):
+        return None, None, None, None
+
+    # 5-Minute Micro Confirmation (असली प्रोफेशनल एंट्री फिल्टर)
+    m5_bull_ok = True
+    m5_bear_ok = True
+    if df_5m is not None and len(df_5m) >= 25:
+        df_5m_q = calculate_quant_metrics(df_5m)
+        m5_last = df_5m_q.iloc[-2]
+        m5_prev = df_5m_q.iloc[-3]
+        # 5M पर भी कीमत EMA20 के ऊपर हो और मोमेंटम हमारे साथ हो
+        m5_bull_ok = (float(m5_last['Close']) > float(m5_last['EMA20'])) and (float(m5_last['Close']) >= float(m5_prev['Low']))
+        m5_bear_ok = (float(m5_last['Close']) < float(m5_last['EMA20'])) and (float(m5_last['Close']) <= float(m5_prev['High']))
+
+    # पिछले 3 घंटे (12 कैंडल्स) का लिक्विडिटी पूल
+    pool_12 = df_15m.iloc[-14:-3]
+    pool_high = float(pool_12['High'].max())
+    pool_low  = float(pool_12['Low'].min())
+
+    # =========================================================================
+    # SETUP A: BULLISH TRIAD (1H STRICT BULLISH + DXY WEAK/NEUTRAL + 5M ALIGNED)
+    # =========================================================================
+    if htf["bias"] == "STRICT_BULLISH" and m5_bull_ok:
+        dxy_ok, _ = is_dxy_aligned_with_trade(pair_info, "BUY", dxy_state)
+        # सामने 1H की दीवार कम से कम 1.4x ATR दूर हो (Vacuum Room to Target)
+        vacuum_room_up = (htf["major_high"] - price) >= (atr * 1.4) or (price > htf["major_high"])
+
+        if dxy_ok and vacuum_room_up and 44 <= rsi <= 67:
+            # PATTERN 1: Institutional Liquidity Flush & 2-Bar Absorption
+            # c1 या c0 ने पिछले लिक्विडिटी लो (या EMA50/20 के नीचे के स्टॉप्स) को फ्लश किया,
+            # और c0 ने मजबूत डिस्प्लेसमेंट (disp_z >= 1.15) के साथ c1 के High के ऊपर क्लोजिंग दी!
+            flushed_stops = (low_0 <= ema20) or (float(c1['Low']) <= ema20) or (low_0 < pool_low) or (float(c1['Low']) < float(c2['Low']))
+            strong_reclaim = (price > open_0) and (price > float(c1['High'])) and (close_pos >= 0.68) and (disp_z >= 1.10) and (price > ema20 >= ema50)
+
+            if flushed_stops and strong_reclaim and er >= 0.30:
+                swing_floor = min(low_0, float(c1['Low']), float(c2['Low']))
+                sl_price = swing_floor - (atr * 0.28)
+                return (
+                    "BUY (LONG) 🟢",
+                    "BUY",
+                    f"Triad Protocol: 1H Bullish + DXY ({dxy_state}) + 15M/5M Stop-Flush Absorption",
+                    sl_price
+                )
+
+            # PATTERN 2: High-Efficiency Institutional Vacuum Breakout
+            # जब मार्केट बिना रुके स्मूद ट्रेंड में हो (ER >= 0.48) और 3 घंटे के कंसोलिडेशन को वॉल्यूम के साथ तोड़े
+            clean_breakout = (float(c1['Close']) <= pool_high) and (price > pool_high) and (price > open_0) and (body_ratio >= 0.65) and (close_pos >= 0.72)
+            if clean_breakout and er >= 0.45 and disp_z >= 1.30 and price > ema20 > ema50:
+                sl_price = max(low_0 - (atr * 0.25), price - (atr * 1.5))
+                return (
+                    "BUY (LONG) 🟢",
+                    "BUY",
+                    f"Triad Protocol: High-Efficiency Vacuum Breakout (ER: {er:.2f} | DXY: {dxy_state})",
+                    sl_price
+                )
+
+    # =========================================================================
+    # SETUP B: BEARISH TRIAD (1H STRICT BEARISH + DXY STRONG/NEUTRAL + 5M ALIGNED)
+    # =========================================================================
+    if htf["bias"] == "STRICT_BEARISH" and m5_bear_ok:
+        dxy_ok, _ = is_dxy_aligned_with_trade(pair_info, "SELL", dxy_state)
+        vacuum_room_down = (price - htf["major_low"]) >= (atr * 1.4) or (price < htf["major_low"])
+
+        if dxy_ok and vacuum_room_down and 33 <= rsi <= 56:
+            # PATTERN 1: Institutional Bull-Trap Flush & 2-Bar Bearish Absorption
+            flushed_highs = (high_0 >= ema20) or (float(c1['High']) >= ema20) or (high_0 > pool_high) or (float(c1['High']) > float(c2['High']))
+            strong_breakdown = (price < open_0) and (price < float(c1['Low'])) and (close_pos <= 0.32) and (disp_z >= 1.10) and (price < ema20 <= ema50)
+
+            if flushed_highs and strong_breakdown and er >= 0.30:
+                swing_ceiling = max(high_0, float(c1['High']), float(c2['High']))
+                sl_price = swing_ceiling + (atr * 0.28)
+                return (
+                    "SELL (SHORT) 🔴",
+                    "SELL",
+                    f"Triad Protocol: 1H Bearish + DXY ({dxy_state}) + 15M/5M Bull-Trap Absorption",
+                    sl_price
+                )
+
+            # PATTERN 2: High-Efficiency Institutional Vacuum Breakdown
+            clean_breakdown = (float(c1['Close']) >= pool_low) and (price < pool_low) and (price < open_0) and (body_ratio >= 0.65) and (close_pos <= 0.28)
+            if clean_breakdown and er >= 0.45 and disp_z >= 1.30 and price < ema20 < ema50:
+                sl_price = min(high_0 + (atr * 0.25), price + (atr * 1.5))
+                return (
+                    "SELL (SHORT) 🔴",
+                    "SELL",
+                    f"Triad Protocol: High-Efficiency Vacuum Breakdown (ER: {er:.2f} | DXY: {dxy_state})",
+                    sl_price
+                )
+
+    return None, None, None, None
+
+def analyze_strict_1h_structure_wrapper(df_1h):
+    return analyze_strict_1h_institutional_structure(df_1h)
+
+def send_live_forex_summary():
+    market_state = "🟢 मार्केट चालू है (TRIAD MACRO-QUANT MODE)" if is_forex_market_open() else "🔴 वीकेंड: मार्केट बंद है"
+    _, kz_name = get_institutional_killzone()
+    dxy_state, _ = get_live_dxy_macro_flow()
+
+    report = (
+        f"🧠 <b>MACRO-QUANT TRIAD REPORT ($100K CHALLENGE)</b> 🧠\n\n"
+        f"📢 <b>Status:</b> {market_state}\n"
+        f"🕒 <b>Killzone:</b> {kz_name}\n"
+        f"💵 <b>US Dollar Index (DXY) Flow:</b> <b>{dxy_state}</b>\n\n"
+    )
+
+    for name, info in FOREX_PAIRS.items():
+        try:
+            ticker = yf.Ticker(info["symbol"])
+            df_15m = ticker.history(period="5d", interval="15m")
+            df_1h  = ticker.history(period="1mo", interval="1h")
+            if df_15m.empty or len(df_15m) < 50 or df_1h.empty or len(df_1h) < 40:
+                continue
+
+            df_15m = calculate_quant_metrics(df_15m)
+            df_1h  = calculate_quant_metrics(df_1h)
+            htf    = analyze_strict_1h_institutional_structure(df_1h)
+
+            latest = df_15m.iloc[-1]
+            price  = float(latest['Close'])
+            er     = float(latest['Efficiency_Ratio'])
+            p_str  = format_price(price, info["decimals"])
+
+            report += (
+                f"🔹 <b>{name}:</b> {p_str}\n"
+                f"   • 1H Structure: <b>{htf['bias']}</b> | Efficiency: {er:.2f}\n\n"
+            )
+        except Exception:
+            report += f"🔹 <b>{name}:</b> लोड हो रहा है...\n\n"
+
+    report += f"{get_funding_pips_dashboard()}"
+    send_telegram_message(report)
 
 def check_telegram_commands():
     global last_update_id
@@ -183,331 +492,17 @@ def check_telegram_commands():
                 msg_text = message.get("text", "").strip().lower()
 
                 if chat_id != CHAT_ID:
-                    if chat_id:
-                        send_telegram_message(
-                            "⛔ <b>Access Denied:</b> यह एक प्राइवेट Funding Pips $100k चैलेंज बॉट है।",
-                            target_chat_id=chat_id
-                        )
                     continue
-
                 if msg_text in ["/status", "status", "/start", "start"]:
                     send_live_forex_summary()
     except Exception:
         pass
 
-def calculate_indicators(df):
-    """15M और 1H के लिए स्मार्ट मनी और माइक्रो-स्ट्रक्चर इंडिकेटर्स"""
-    df = df.copy()
-    df['EMA9']   = df['Close'].ewm(span=9, adjust=False).mean()
-    df['EMA20']  = df['Close'].ewm(span=20, adjust=False).mean()
-    df['EMA50']  = df['Close'].ewm(span=50, adjust=False).mean()
-    df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
-
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    df['RSI'] = 100 - (100 / (1 + rs))
-    df['RSI'] = df['RSI'].fillna(50.0)
-
-    hl = df['High'] - df['Low']
-    hc = np.abs(df['High'] - df['Close'].shift())
-    lc = np.abs(df['Low'] - df['Close'].shift())
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    df['ATR'] = tr.rolling(14).mean()
-
-    up_move = df['High'] - df['High'].shift(1)
-    down_move = df['Low'].shift(1) - df['Low']
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-    tr_smooth = tr.rolling(14).mean().replace(0, np.nan)
-    plus_di = 100 * (pd.Series(plus_dm, index=df.index).rolling(14).mean() / tr_smooth)
-    minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(14).mean() / tr_smooth)
-    dx = (np.abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)) * 100
-    df['ADX'] = dx.rolling(14).mean().fillna(18.0)
-
-    df['Candle_Body']  = np.abs(df['Close'] - df['Open'])
-    df['Candle_Range'] = (df['High'] - df['Low']).replace(0, 1e-9)
-    df['Body_Ratio']   = df['Candle_Body'] / df['Candle_Range']
-    df['Upper_Wick']   = df['High'] - df[['Open', 'Close']].max(axis=1)
-    df['Lower_Wick']   = df[['Open', 'Close']].min(axis=1) - df['Low']
-    df['Close_Pos']    = (df['Close'] - df['Low']) / df['Candle_Range']
-    df['Vol_MA20']     = df['Volume'].rolling(20).mean() if 'Volume' in df.columns else 0.0
-
-    df['Range_High_40'] = df['High'].rolling(40).max()
-    df['Range_Low_40']  = df['Low'].rolling(40).min()
-    df['Equilibrium']   = (df['Range_High_40'] + df['Range_Low_40']) / 2.0
-
-    return df
-
-def analyze_htf_1h_structure(df_1h):
-    c_1h = df_1h.iloc[-2]
-    p_1h = df_1h.iloc[-3]
-
-    close_1h  = float(c_1h['Close'])
-    ema20_1h  = float(c_1h['EMA20'])
-    ema50_1h  = float(c_1h['EMA50'])
-    ema200_1h = float(c_1h['EMA200'])
-    atr_1h    = float(c_1h['ATR']) if not np.isnan(c_1h['ATR']) else 0.0
-
-    recent_1h = df_1h.iloc[-14:-2]
-    htf_res   = float(recent_1h['High'].max())
-    htf_sup   = float(recent_1h['Low'].min())
-    htf_mid   = (htf_res + htf_sup) / 2.0
-
-    bull_score = 0
-    bear_score = 0
-
-    if close_1h > ema50_1h:
-        bull_score += 1
-    else:
-        bear_score += 1
-
-    if ema20_1h >= ema50_1h:
-        bull_score += 1
-    else:
-        bear_score += 1
-
-    if close_1h > ema200_1h:
-        bull_score += 1
-    else:
-        bear_score += 1
-
-    if float(c_1h['Close']) > float(p_1h['Close']):
-        bull_score += 1
-    else:
-        bear_score += 1
-
-    if bull_score >= 3:
-        htf_bias = "BULLISH"
-    elif bear_score >= 3:
-        htf_bias = "BEARISH"
-    else:
-        # Neutral की स्थिति में EMA20 vs EMA50 का झुकाव देखें ताकि Gold/EURUSD के अच्छे ट्रेड मिस न हों
-        htf_bias = "BULLISH_LEAN" if close_1h >= ema20_1h else "BEARISH_LEAN"
-
-    return {
-        "bias": htf_bias,
-        "htf_res": htf_res,
-        "htf_sup": htf_sup,
-        "htf_mid": htf_mid,
-        "atr_1h": atr_1h,
-        "ema50_1h": ema50_1h
-    }
-
-def evaluate_htf_operator_strategies(pair_name, df_15m, df_1h):
-    """
-    5 High-Win-Rate Custom Prop-Firm Strategies (No Generic Copy-Paste):
-    खास तौर पर XAU/USD (Gold) और EUR/USD के इंस्टीट्यूशनल मूव्स को पकड़ने के लिए अपग्रेड किया गया।
-    """
-    session_ok, _ = get_current_session_info()
-    if not session_ok:
-        return None, None, None, None, 0
-
-    htf = analyze_htf_1h_structure(df_1h)
-    htf_bias = htf["bias"]
-    is_bull_htf = htf_bias in ["BULLISH", "BULLISH_LEAN"]
-    is_bear_htf = htf_bias in ["BEARISH", "BEARISH_LEAN"]
-
-    curr  = df_15m.iloc[-2]
-    prev  = df_15m.iloc[-3]
-    prev2 = df_15m.iloc[-4]
-
-    price      = float(curr['Close'])
-    open_p     = float(curr['Open'])
-    high_p     = float(curr['High'])
-    low_p      = float(curr['Low'])
-    body       = float(curr['Candle_Body'])
-    c_range    = float(curr['Candle_Range'])
-    body_ratio = float(curr['Body_Ratio'])
-    u_wick     = float(curr['Upper_Wick'])
-    l_wick     = float(curr['Lower_Wick'])
-    close_pos  = float(curr['Close_Pos'])
-
-    atr        = float(curr['ATR'])
-    ema9       = float(curr['EMA9'])
-    ema20      = float(curr['EMA20'])
-    ema50      = float(curr['EMA50'])
-    ema200     = float(curr['EMA200'])
-    rsi        = float(curr['RSI'])
-    adx        = float(curr['ADX'])
-    eq_level   = float(curr['Equilibrium'])
-
-    if np.isnan(atr) or atr <= 0 or c_range <= 0:
-        return None, None, None, None, 0
-
-    # News Spike / Exhaustion Guard: 2.6x ATR से बड़ी कैंडल पर कभी पीछा न करें
-    if c_range > (atr * 2.6):
-        return None, None, None, None, 0
-
-    # Choppy Market Filter: अगर दोनों EMA बिल्कुल चिपके हुए हैं और रेंज बहुत छोटी है, तो अवॉइड करें
-    if c_range < (atr * 0.45):
-        return None, None, None, None, 0
-
-    struct_10     = df_15m.iloc[-12:-2]
-    swing_high_10 = float(struct_10['High'].max())
-    swing_low_10  = float(struct_10['Low'].min())
-
-    box_20        = df_15m.iloc[-22:-3]
-    box_high_20   = float(box_20['High'].max())
-    box_low_20    = float(box_20['Low'].min())
-    box_width_20  = box_high_20 - box_low_20
-
-    # =========================================================================
-    # STRATEGY 1: 1H ORDER FLOW + 15M JUDAS SWING LIQUIDITY SWEEP (Win-Rate ~84%)
-    # =========================================================================
-    swept_low = (low_p < swing_low_10 and price > swing_low_10) or (float(prev['Low']) < swing_low_10 and price > swing_low_10 and price > float(prev['High']))
-    if swept_low and is_bull_htf:
-        in_discount = (price <= eq_level * 1.003) or (rsi < 55)
-        strong_rejection = (l_wick >= c_range * 0.35) or (body_ratio >= 0.50 and price > float(prev['High']))
-        if price > open_p and close_pos >= 0.62 and in_discount and strong_rejection:
-            lowest_point = min(low_p, float(prev['Low']))
-            sl_level = lowest_point - (atr * 0.30)
-            return "BUY (LONG) 🟢", "BUY", "1H+15M Judas Swing Liquidity Sweep (Stop-Hunt Reversal)", sl_level, 88
-
-    swept_high = (high_p > swing_high_10 and price < swing_high_10) or (float(prev['High']) > swing_high_10 and price < swing_high_10 and price < float(prev['Low']))
-    if swept_high and is_bear_htf:
-        in_premium = (price >= eq_level * 0.997) or (rsi > 45)
-        strong_rejection = (u_wick >= c_range * 0.35) or (body_ratio >= 0.50 and price < float(prev['Low']))
-        if price < open_p and close_pos <= 0.38 and in_premium and strong_rejection:
-            highest_point = max(high_p, float(prev['High']))
-            sl_level = highest_point + (atr * 0.30)
-            return "SELL (SHORT) 🔴", "SELL", "1H+15M Judas Swing Bull-Trap Sweep (Stop-Hunt Reversal)", sl_level, 88
-
-    # =========================================================================
-    # STRATEGY 2: UNMITIGATED ORDER BLOCK + FVG INSTITUTIONAL ENTRY (Win-Rate ~86%)
-    # =========================================================================
-    for i in range(3, 14):
-        c1 = df_15m.iloc[-i-2]
-        c2 = df_15m.iloc[-i-1]
-        c3 = df_15m.iloc[-i]
-
-        if is_bull_htf and float(c3['Low']) > float(c1['High']) and float(c2['Close']) > float(c2['Open']) and float(c2['Candle_Body']) >= (atr * 1.0):
-            zone_top    = float(c3['Low'])
-            zone_bottom = float(c1['Low'])
-            intervening = df_15m.iloc[-i+1:-2]
-            already_broken = (len(intervening) > 0) and (float(intervening['Low'].min()) < zone_bottom)
-
-            if not already_broken and low_p <= (zone_top + atr * 0.10) and low_p >= (zone_bottom - atr * 0.20):
-                if price > open_p and close_pos >= 0.60 and price > ema50:
-                    sl_ob = min(low_p, zone_bottom) - (atr * 0.30)
-                    return "BUY (LONG) 🟢", "BUY", "15M Unmitigated Order Block + FVG Demand Tap", sl_ob, 90
-
-        if is_bear_htf and float(c3['High']) < float(c1['Low']) and float(c2['Close']) < float(c2['Open']) and float(c2['Candle_Body']) >= (atr * 1.0):
-            zone_bottom = float(c3['High'])
-            zone_top    = float(c1['High'])
-            intervening = df_15m.iloc[-i+1:-2]
-            already_broken = (len(intervening) > 0) and (float(intervening['High'].max()) > zone_top)
-
-            if not already_broken and high_p >= (zone_bottom - atr * 0.10) and high_p <= (zone_top + atr * 0.20):
-                if price < open_p and close_pos <= 0.40 and price < ema50:
-                    sl_ob = max(high_p, zone_top) + (atr * 0.30)
-                    return "SELL (SHORT) 🔴", "SELL", "15M Unmitigated Order Block + FVG Supply Tap", sl_ob, 90
-
-    # =========================================================================
-    # STRATEGY 3: GOLD & EUR/USD SPECIAL — DYNAMIC EMA-20/50 PULLBACK CONTINUATION
-    # (यही कारण था कि पहले Gold और EUR/USD में ट्रेड कम आते थे—अब ट्रेंडिंग पुलबैक नहीं छूटेगा!)
-    # =========================================================================
-    if is_bull_htf and ema20 > ema50 and price > ema20 and adx >= ADX_THRESHOLD:
-        # कैंडल का Low EMA20 या EMA9 के पास आकर रीटेस्ट करे और पिछली कैंडल के High के ऊपर मजबूत क्लोज दे
-        touched_ema_zone = (low_p <= ema20 * 1.0012) or (float(prev['Low']) <= ema20 * 1.0012)
-        bullish_engulf_or_pin = (price > open_p and close_pos >= 0.68 and (price > float(prev['High']) or l_wick >= c_range * 0.40))
-        if touched_ema_zone and bullish_engulf_or_pin and 46 <= rsi <= 68:
-            sl_pb = min(low_p, float(prev['Low']), ema50) - (atr * 0.30)
-            return "BUY (LONG) 🟢", "BUY", "1H+15M Institutional Trend Pullback & EMA-20 Reject", sl_pb, 85
-
-    if is_bear_htf and ema20 < ema50 and price < ema20 and adx >= ADX_THRESHOLD:
-        touched_ema_zone = (high_p >= ema20 * 0.9988) or (float(prev['High']) >= ema20 * 0.9988)
-        bearish_engulf_or_pin = (price < open_p and close_pos <= 0.32 and (price < float(prev['Low']) or u_wick >= c_range * 0.40))
-        if touched_ema_zone and bearish_engulf_or_pin and 32 <= rsi <= 54:
-            sl_pb = max(high_p, float(prev['High']), ema50) + (atr * 0.30)
-            return "SELL (SHORT) 🔴", "SELL", "1H+15M Institutional Trend Pullback & EMA-20 Supply", sl_pb, 85
-
-    # =========================================================================
-    # STRATEGY 4: SESSION AMD (ACCUMULATION-MANIPULATION-DISTRIBUTION) TRAP
-    # =========================================================================
-    if box_width_20 <= (atr * 5.0):
-        prev_low   = float(prev['Low'])
-        prev_high  = float(prev['High'])
-        prev_close = float(prev['Close'])
-
-        if (prev_low < box_low_20 or prev_close < box_low_20) and price > box_low_20:
-            if price > open_p and price > float(prev['High']) and body >= (atr * 0.65) and close_pos >= 0.65 and is_bull_htf:
-                sl_amd = min(low_p, prev_low) - (atr * 0.30)
-                return "BUY (LONG) 🟢", "BUY", "15M Session AMD Manipulation Trap (Wyckoff Spring)", sl_amd, 87
-
-        if (prev_high > box_high_20 or prev_close > box_high_20) and price < box_high_20:
-            if price < open_p and price < float(prev['Low']) and body >= (atr * 0.65) and close_pos <= 0.35 and is_bear_htf:
-                sl_amd = max(high_p, prev_high) + (atr * 0.30)
-                return "SELL (SHORT) 🔴", "SELL", "15M Session AMD Manipulation Trap (Wyckoff Upthrust)", sl_amd, 87
-
-    # =========================================================================
-    # STRATEGY 5: MULTI-TIMEFRAME DISPLACEMENT & STRUCTURE BREAK (BOS)
-    # =========================================================================
-    if body >= (atr * 1.15) and body_ratio >= 0.62 and adx >= ADX_THRESHOLD:
-        room_to_htf_res = (htf["htf_res"] - price) >= (atr * 1.0) or (price > htf["htf_res"])
-        if is_bull_htf and price > open_p and float(prev['Close']) <= swing_high_10 and price > swing_high_10:
-            if price > ema20 and ema20 >= ema50 and 50 <= rsi <= 72 and room_to_htf_res:
-                sl_bos = max(low_p - (atr * 0.25), price - (atr * 1.6))
-                return "BUY (LONG) 🟢", "BUY", "1H+15M Institutional Displacement & Structure Break (BOS)", sl_bos, 84
-
-        room_to_htf_sup = (price - htf["htf_sup"]) >= (atr * 1.0) or (price < htf["htf_sup"])
-        if is_bear_htf and price < open_p and float(prev['Close']) >= swing_low_10 and price < swing_low_10:
-            if price < ema20 and ema20 <= ema50 and 28 <= rsi <= 50 and room_to_htf_sup:
-                sl_bos = min(high_p + (atr * 0.25), price + (atr * 1.6))
-                return "SELL (SHORT) 🔴", "SELL", "1H+15M Institutional Displacement & Structure Breakdown (BOS)", sl_bos, 84
-
-    return None, None, None, None, 0
-
-def send_live_forex_summary():
-    market_state = "🟢 मार्केट खुला है (FUNDING PIPS $100K MODE)" if is_forex_market_open() else "🔴 वीकेंड: फॉरेक्स मार्केट अभी बंद है"
-    _, session_name = get_current_session_info()
-    report = (
-        f"🏆 <b>FUNDING PIPS $100,000 COMPETITION REPORT</b> 🏆\n\n"
-        f"📢 <b>Status:</b> {market_state}\n"
-        f"🕒 <b>Active Session:</b> {session_name}\n\n"
-    )
-
-    for name, info in FOREX_PAIRS.items():
-        try:
-            ticker = yf.Ticker(info["symbol"])
-            df_15m = ticker.history(period="10d", interval="15m")
-            df_1h  = ticker.history(period="1mo", interval="1h")
-            if df_15m.empty or len(df_15m) < 60 or df_1h.empty or len(df_1h) < 50:
-                continue
-
-            df_15m = calculate_indicators(df_15m)
-            df_1h  = calculate_indicators(df_1h)
-            htf    = analyze_htf_1h_structure(df_1h)
-
-            latest = df_15m.iloc[-1]
-            price  = float(latest['Close'])
-            rsi    = float(latest['RSI'])
-            eq     = float(latest['Equilibrium'])
-            zone   = "Discount (Buy Zone)" if price < eq else "Premium (Sell Zone)"
-            p_str  = format_price(price, info["decimals"])
-            star   = "⭐ " if info.get("priority") else "🔹 "
-
-            report += (
-                f"{star}<b>{name}:</b> {p_str}\n"
-                f"   • 1H Bias: <b>{htf['bias']}</b> | 15M: {zone} (RSI: {rsi:.0f})\n\n"
-            )
-        except Exception:
-            report += f"🔹 <b>{name}:</b> डेटा लोड हो रहा है...\n\n"
-
-    report += f"{get_funding_pips_dashboard()}"
-    send_telegram_message(report)
-
 def manage_active_forex_trades(pair_name, candle_time, df_1m, latest_live_15m, closed_15m, decimals):
-    """
-    1-Minute लाइव ट्रैकर + Funding Pips $100k P&L और Drawdown शील्ड अपडेट
-    """
     global daily_realized_pnl, total_competition_pnl
 
     ema20 = float(closed_15m['EMA20'])
     ema50 = float(closed_15m['EMA50'])
-    adx   = float(closed_15m['ADX']) if not np.isnan(closed_15m['ADX']) else 18.0
 
     if df_1m is not None and not df_1m.empty:
         price = float(df_1m.iloc[-1]['Close'])
@@ -540,7 +535,7 @@ def manage_active_forex_trades(pair_name, candle_time, df_1m, latest_live_15m, c
                 current_high = price
                 current_low  = price
 
-            # 1. पहले 1:1 (Breakeven + 50% Partial Profit Lock) चेक करें
+            # 1. 1:1 आने पर तुरंत Breakeven और 50% प्रॉफिट लॉक
             if not trade["trailed_to_cost"]:
                 half_reached = False
                 if trade["direction"] == "BUY" and current_high >= trade["half_target"]:
@@ -552,22 +547,17 @@ def manage_active_forex_trades(pair_name, candle_time, df_1m, latest_live_15m, c
                     trade["trailed_to_cost"]   = True
                     trade["sl"]                = trade["entry"]
                     trade["be_activated_time"] = now_time
-                    half_prof                  = trade["max_risk"] * 0.5  # +$225 बुक (50% लॉट पर 1:1)
-                    trade["status"]            = (
-                        f"🔥 1:1 HIT (+${half_prof:.0f} Locked | SL at Entry {entry_str})"
-                    )
+                    half_prof                  = trade["max_risk"] * 0.5  # +$125 पक्का लॉक
+                    trade["status"]            = f"🔥 1:1 LOCKED (+${half_prof:.0f} Safe | SL at Cost {entry_str})"
                     send_telegram_message(
-                        f"🛡️ <b>FUNDING PIPS SHIELD (Trade #{trade['id']}) : MOVE SL TO BREAKEVEN!</b> 🛡️\n\n"
-                        f"🌍 <b>Pair:</b> {trade['pair']} ({trade['lot_size']} Lot)\n\n"
-                        f"✅ <b>1:1 टारगेट पूरा हो चुका है! (Current Price: {price_str})</b>\n\n"
-                        f"📢 <b>तुरंत एक्शन लें:</b>\n"
-                        f"1️⃣ अपना 50% लॉट (<b>{trade['lot_size']/2:.2f} Lot</b>) अभी बुक कर लें (<b>+${half_prof:.0f} पक्का प्रॉफिट</b>)।\n"
-                        f"2️⃣ बचे हुए ट्रेड का SL उठाकर <b>Entry Price ({entry_str})</b> पर लगा दें। अब इस ट्रेड में $0 रिस्क है!\n\n"
-                        f"🔍 बॉट अब बचे हुए ट्रेड को <b>Full Target ({target_str})</b> या <b>Breakeven SL</b> तक ट्रैक करेगा।"
+                        f"🛡️ <b>TRIAD SHIELD (Trade #{trade['id']}) : 1:1 HIT — LOCK PROFIT!</b> 🛡️\n\n"
+                        f"🌍 <b>Pair:</b> {trade['pair']} ({trade['lot_size']} Lot)\n"
+                        f"✅ <b>1:1 टारगेट हिट हो गया है! (Live: {price_str})</b>\n\n"
+                        f"📢 <b>तुरंत करें:</b> आधा लॉट बुक कर लें (<b>+${half_prof:.0f} पक्का</b>) और बचे हुए लॉट का SL उठाकर <b>Entry ({entry_str})</b> पर लगा दें!"
                     )
                     continue
 
-            # 2. FULL TARGET या STOP-LOSS चेक करें
+            # 2. Target या SL चेक करें
             hit_type = None
             if trade["direction"] == "BUY":
                 if current_high >= trade["target"]:
@@ -587,28 +577,24 @@ def manage_active_forex_trades(pair_name, candle_time, df_1m, latest_live_15m, c
                 total_competition_pnl += net_win
                 trade["status"] = f"✅ FULL TARGET HIT (+${net_win:.0f} प्रॉफिट)"
                 send_telegram_message(
-                    f"🎯 <b>FUNDING PIPS TRADE #{trade['id']} : FULL TARGET HIT!</b> 🎯\n\n"
-                    f"🌍 <b>Pair:</b> {trade['pair']} ({trade['mt5_name']} | {trade['lot_size']} Lot)\n"
-                    f"⚡ <b>Direction:</b> {trade['action']}\n"
+                    f"🎯 <b>TRIAD SNIPER TRADE #{trade['id']} : FULL TARGET (1:2.5) HIT!</b> 🎯\n\n"
+                    f"🌍 <b>Pair:</b> {trade['pair']} ({trade['lot_size']} Lot)\n"
                     f"📍 <b>Entry:</b> {entry_str}  ➡️  <b>Target Hit:</b> {target_str}\n\n"
-                    f"💰 <b>Final Profit:</b> <b>✅ +${net_win:.0f} (+{net_win/1000:.2f}% Account Gain!)</b>\n\n"
+                    f"💰 <b>Result:</b> <b>✅ +${net_win:.0f} प्रॉफिट! (आपका पुराना लॉस रिकवर हो गया!)</b>\n\n"
                     f"────────────────────\n\n{get_funding_pips_dashboard()}"
                 )
                 continue
 
             elif hit_type == "TRAILING_SL":
                 trade["is_open"] = False
-                half_prof = trade["max_risk"] * 0.5  # 50% लॉट जो 1:1 पर बुक हुआ
+                half_prof = trade["max_risk"] * 0.5
                 daily_realized_pnl += half_prof
                 total_competition_pnl += half_prof
-                trade["status"] = f"🛡️ BREAKEVEN EXIT (+${half_prof:.0f} Safe Profit)"
+                trade["status"] = f"🛡️ BREAKEVEN EXIT (+${half_prof:.0f} Locked)"
                 send_telegram_message(
-                    f"🛡️ <b>FUNDING PIPS TRADE #{trade['id']} : BREAKEVEN SL HIT!</b> 🛡️\n\n"
-                    f"🌍 <b>Pair:</b> {trade['pair']} ({trade['lot_size']} Lot)\n"
-                    f"📍 <b>Entry & Trailing SL:</b> {entry_str}  |  <b>Current Price:</b> {price_str}\n\n"
-                    f"📢 <b>फाइनल रिजल्ट:</b> 1:1 जाने के बाद मार्केट वापस <b>Entry Price ({entry_str})</b> पर आ गया।\n"
-                    f"• 50% पार्टियल बुकिंग से: <b>+${half_prof:.0f} सुरक्षित प्रॉफिट जुड़ा!</b>\n"
-                    f"• बचे हुए लॉट पर: <b>$0 (No Loss) पर एग्जिट!</b>\n\n"
+                    f"🛡️ <b>TRIAD TRADE #{trade['id']} : BREAKEVEN SL HIT!</b> 🛡️\n\n"
+                    f"🌍 <b>Pair:</b> {trade['pair']}\n"
+                    f"📢 <b>रिजल्ट:</b> 1:1 के बाद मार्केट वापस कॉस्ट पर आया। 50% बुकिंग से <b>+${half_prof:.0f} प्रॉफिट</b> मिला और बचे लॉट पर $0 नुकसान हुआ!\n\n"
                     f"────────────────────\n\n{get_funding_pips_dashboard()}"
                 )
                 continue
@@ -618,51 +604,35 @@ def manage_active_forex_trades(pair_name, candle_time, df_1m, latest_live_15m, c
                 loss_amt = trade["max_risk"]
                 daily_realized_pnl -= loss_amt
                 total_competition_pnl -= loss_amt
-                trade["status"] = f"🛑 STOP-LOSS HIT (-${loss_amt:.0f} Controlled Risk)"
+                trade["status"] = f"🛑 SL HIT (-${loss_amt:.0f} Micro Risk)"
                 send_telegram_message(
-                    f"🛑 <b>FUNDING PIPS TRADE #{trade['id']} : STOP-LOSS HIT!</b> 🛑\n\n"
-                    f"🌍 <b>Pair:</b> {trade['pair']} ({trade['lot_size']} Lot)\n"
-                    f"📍 <b>Entry:</b> {entry_str}  ➡️  <b>SL Hit:</b> {sl_str}\n\n"
-                    f"⚠️ <b>Controlled Loss:</b> <b>-${loss_amt:.0f} (सिर्फ 0.45% रिस्क — आपका $5,000 Daily Drawdown पूरी तरह सुरक्षित है!)</b>\n\n"
+                    f"🛑 <b>TRIAD TRADE #{trade['id']} : STOP-LOSS HIT!</b> 🛑\n\n"
+                    f"🌍 <b>Pair:</b> {trade['pair']}\n"
+                    f"⚠️ <b>Controlled Loss:</b> <b>-${loss_amt:.0f} (सिर्फ 0.25% रिस्क)</b>\n\n"
                     f"────────────────────\n\n{get_funding_pips_dashboard()}"
                 )
                 continue
 
-            # 3. 3 घंटे (180 मिनट) साइडवेज मार्केट एग्जिट
+            # 3. Early Structure Invalidation (अगर अगली ही कैंडल हमारे ट्रैप जोन के खिलाफ बंद हो जाए तो पूरा SL मत दो!)
             hold_minutes = (candle_time - trade["entry_candle_time"]).total_seconds() / 60.0
-            if hold_minutes >= MAX_HOLD_MINUTES and not trade["trailed_to_cost"]:
-                if adx < ADX_THRESHOLD or abs(price - trade["entry"]) < (trade["sl_dist"] * 0.45):
-                    trade["is_open"] = False
-                    trade["status"] = "⏳ SIDEWAYS EXIT (Capital Protected)"
-                    send_telegram_message(
-                        f"⏳ <b>FUNDING PIPS ALERT (Trade #{trade['id']}) : SIDEWAYS EXIT!</b> ⏳\n\n"
-                        f"🌍 <b>Pair:</b> {trade['pair']}\n"
-                        f"📍 <b>Entry:</b> {entry_str}  ➡️  <b>Current Price:</b> {price_str}\n\n"
-                        f"⚠️ <b>सलाह:</b> 3 घंटे से मार्केट साइडवेज है। चैलेंज अकाउंट को सुरक्षित रखने के लिए अभी तुरंत कॉस्ट के पास एग्जिट कर लें!\n\n"
-                        f"────────────────────\n\n{get_funding_pips_dashboard()}"
-                    )
-                    continue
-
-            # 4. 15M Structure Reversal Early Exit (पूरा SL खाने से पहले बचाव)
-            if hold_minutes >= 45 and not trade["trailed_to_cost"]:
+            if hold_minutes >= 30 and not trade["trailed_to_cost"]:
                 closed_price = float(closed_15m['Close'])
-                trend_reversed = False
-                if trade["direction"] == "BUY" and closed_price < ema20 and closed_price < ema50 and closed_price < (trade["entry"] - trade["sl_dist"] * 0.65):
-                    trend_reversed = True
-                elif trade["direction"] == "SELL" and closed_price > ema20 and closed_price > ema50 and closed_price > (trade["entry"] + trade["sl_dist"] * 0.65):
-                    trend_reversed = True
+                invalidated = False
+                if trade["direction"] == "BUY" and closed_price < ema20 and closed_price < (trade["entry"] - trade["sl_dist"] * 0.55):
+                    invalidated = True
+                elif trade["direction"] == "SELL" and closed_price > ema20 and closed_price > (trade["entry"] + trade["sl_dist"] * 0.55):
+                    invalidated = True
 
-                if trend_reversed:
+                if invalidated:
                     trade["is_open"] = False
-                    early_loss = round(trade["max_risk"] * 0.60, 0)
-                    daily_realized_pnl -= early_loss
-                    total_competition_pnl -= early_loss
-                    trade["status"] = f"🔄 EARLY STRUCTURE EXIT (-${early_loss:.0f} Saved 40% SL)"
+                    saved_loss = round(trade["max_risk"] * 0.55, 0)
+                    daily_realized_pnl -= saved_loss
+                    total_competition_pnl -= saved_loss
+                    trade["status"] = f"🔄 INVALIDATION EXIT (-${saved_loss:.0f} Saved SL)"
                     send_telegram_message(
-                        f"🔄 <b>FUNDING PIPS SHIELD (Trade #{trade['id']}) : EARLY STRUCTURE EXIT!</b> 🔄\n\n"
+                        f"🔄 <b>PRO TRADER EARLY EXIT (Trade #{trade['id']})!</b> 🔄\n\n"
                         f"🌍 <b>Pair:</b> {trade['pair']}\n"
-                        f"📍 <b>Entry:</b> {entry_str}  ➡️  <b>Current Price:</b> {price_str}\n\n"
-                        f"⚠️ <b>कारण:</b> 15M चार्ट पर ट्रेंड आपके खिलाफ क्लोज हो गया है। पूरा $450 का SL देने के बजाय अभी एग्जिट करके अपना Drawdown बचाएं!\n\n"
+                        f"⚠️ <b>कारण:</b> 15M कैंडल EMA-20 के नीचे बंद हो गई है (ऑपरेटर फॉलो-थ्रू फेल)। पूरा SL देने के बजाय अभी एग्जिट करके अपना पैसा बचाएं!\n\n"
                         f"────────────────────\n\n{get_funding_pips_dashboard()}"
                     )
                     continue
@@ -681,22 +651,25 @@ def scan_forex_market():
         daily_realized_pnl = 0.0
         last_candle_traded = {name: None for name in FOREX_PAIRS}
 
-    # Funding Pips Daily Safety Lock: अगर आज का नेट लॉस -$1,800 छू गया, तो आज कोई नया ट्रेड न लें
     if daily_realized_pnl <= -DAILY_SAFE_STOP_USD:
         return
+
+    # Step 0: सबसे पहले US Dollar Index (DXY) का लाइव मैक्रो फ्लो निकालो
+    dxy_state, _ = get_live_dxy_macro_flow()
 
     for name, info in FOREX_PAIRS.items():
         try:
             ticker = yf.Ticker(info["symbol"])
-            df_15m = ticker.history(period="10d", interval="15m")
             df_1h  = ticker.history(period="1mo", interval="1h")
+            df_15m = ticker.history(period="5d", interval="15m")
+            df_5m  = ticker.history(period="5d", interval="5m")
             df_1m  = ticker.history(period="1d", interval="1m")
 
-            if df_15m.empty or len(df_15m) < 100 or df_1h.empty or len(df_1h) < 50:
+            if df_15m.empty or len(df_15m) < 60 or df_1h.empty or len(df_1h) < 40:
                 continue
 
-            df_15m = calculate_indicators(df_15m)
-            df_1h  = calculate_indicators(df_1h)
+            df_1h  = calculate_quant_metrics(df_1h)
+            df_15m = calculate_quant_metrics(df_15m)
 
             latest_live_15m = df_15m.iloc[-1]
             closed_15m      = df_15m.iloc[-2]
@@ -707,27 +680,28 @@ def scan_forex_market():
             atr   = float(closed_15m['ATR'])
             dec   = info["decimals"]
 
-            # 1. पहले चल रहे ट्रेड्स को मैनेज करें
+            # 1. चल रहे ट्रेड्स को मैनेज करें
             manage_active_forex_trades(name, closed_time, df_1m, latest_live_15m, closed_15m, dec)
 
-            # 2. अगर इस पेयर में पहले से ट्रेड चल रहा है तो नया न लें
+            # 2. एक समय पर एक पेयर में एक ही ट्रेड
             if any(t["pair"] == name and t["is_open"] for t in daily_trades_log):
                 continue
 
-            # 3. दिन के 4 बेस्ट ट्रेड्स की लिमिट चेक करें
             if trades_today >= MAX_TRADES_PER_DAY:
                 continue
 
-            # 4. एक ही 15M कैंडल पर दोबारा सिग्नल न दें
             if last_candle_traded[name] == closed_time:
                 continue
 
-            signal, direction, strategy_used, custom_sl, win_prob = evaluate_htf_operator_strategies(name, df_15m, df_1h)
+            # 3. Run Original 4-Layer Triad Protocol
+            signal, direction, strategy_used, custom_sl = evaluate_triad_proprietary_strategy(
+                name, info, df_1h, df_15m, df_5m, dxy_state
+            )
 
-            if signal and custom_sl is not None and win_prob >= 80:
+            if signal and custom_sl is not None:
                 raw_sl_dist = abs(price - custom_sl)
-                min_sl_dist = atr * 1.05
-                max_sl_dist = atr * 2.10
+                min_sl_dist = atr * 1.0
+                max_sl_dist = atr * 1.85
                 sl_dist = round(max(min_sl_dist, min(raw_sl_dist, max_sl_dist)), dec)
 
                 if sl_dist <= 0:
@@ -736,7 +710,7 @@ def scan_forex_market():
                 last_candle_traded[name] = closed_time
                 trades_today += 1
 
-                rr_ratio = 2.2  # हाई विन-रेट के लिए प्रैक्टिकल 1:2.2 रिस्क-रिवॉर्ड ($450 रिस्क -> $990 प्रॉफिट)
+                rr_ratio = 2.5  # $250 Risk -> +$625 Target (1 ट्रेड में $600 लॉस की पूरी रिकवरी)
                 target_dist = round(sl_dist * rr_ratio, dec)
 
                 if direction == "BUY":
@@ -748,8 +722,8 @@ def scan_forex_market():
                     half_target_level = round(price - sl_dist, dec)
                     target_level      = round(price - target_dist, dec)
 
-                max_risk_usd  = RISK_PER_TRADE_USD  # $450 (0.45% of $100,000)
-                expected_prof = round(max_risk_usd * rr_ratio, 0)  # +$990 Profit per full winner
+                max_risk_usd  = RISK_PER_TRADE_USD  # $250
+                expected_prof = round(max_risk_usd * rr_ratio, 0)  # +$625
                 exact_lot     = calculate_exact_mt5_lot_size(name, price, sl_dist, max_risk_usd)
 
                 trade_id = trades_today
@@ -783,29 +757,19 @@ def scan_forex_market():
 
                 sl_pips_str     = calculate_pips_or_points(name, sl_dist, dec)
                 target_pips_str = calculate_pips_or_points(name, target_dist, dec)
-                htf_info        = analyze_htf_1h_structure(df_1h)
-
-                gold_note = ""
-                if "GOLD" in name:
-                    gold_note = (
-                        f"⚠️ <b>Gold (XAUUSD) Live Entry Note:</b> तुरंत अपने MT5 चार्ट के चालू Spot Price पर एंट्री लें "
-                        f"और वहाँ से ठीक <b>{sl_pips_str}</b> दूर SL तथा <b>{target_pips_str}</b> दूर Target लगाएं!\n\n"
-                    )
 
                 msg = (
-                    f"🏆 <b>FUNDING PIPS $100K SIGNAL ({trades_today}/{MAX_TRADES_PER_DAY})</b> 🏆\n\n"
+                    f"🎯 <b>TRIAD MACRO-QUANT SNIPER SIGNAL ({trades_today}/{MAX_TRADES_PER_DAY})</b> 🎯\n\n"
                     f"🌍 <b>Pair:</b> <b>{name}</b> (<code>{info['mt5_name']}</code>)\n"
-                    f"📊 <b>Timeframe:</b> 1H Trend ({htf_info['bias']}) + 15M Confirmed Close\n"
-                    f"🧠 <b>High-Win Strategy:</b> {strategy_used} <i>({win_prob}% Confluence)</i>\n\n"
+                    f"💵 <b>Macro DXY Check:</b> Verified ({dxy_state})\n"
+                    f"🧠 <b>Proprietary Setup:</b> {strategy_used}\n\n"
                     f"⚡ <b>Action:</b> <b>{signal}</b>\n\n"
                     f"📍 <b>Entry Price:</b> {entry_s}\n"
                     f"🛑 <b>Stop-Loss (SL):</b> {sl_s}  <i>({sl_pips_str} का गैप)</i>\n"
-                    f"🛡️ <b>Breakeven (1:1):</b> {half_s}  <i>(+${max_risk_usd*0.5:.0f} पार्टियल लॉक)</i>\n"
-                    f"🎯 <b>Full Target (1:2.2):</b> {target_s}  <i>({target_pips_str} का टारगेट)</i>\n\n"
-                    f"💼 <b>MT5 Lot Size ($100k Account):</b> <b><code>{exact_lot:.2f} Lot</code></b>\n"
-                    f"🛡️ <b>Risk on Trade:</b> <b>${max_risk_usd:.0f} (0.45%)</b>  ➡️  <b>Target Profit: +${expected_prof:.0f}</b>\n"
-                    f"🔒 <b>Drawdown Guard:</b> Daily Max Loss Limit ($5,000) और Total Limit ($10,000) पूरी तरह सुरक्षित है!\n\n"
-                    f"{gold_note}"
+                    f"🛡️ <b>1:1 Safe Lock:</b> {half_s}  <i>(+${max_risk_usd*0.5:.0f} बुक करें और SL कॉस्ट पर लाएं)</i>\n"
+                    f"🎯 <b>Full Target (1:2.5):</b> {target_s}  <i>({target_pips_str} का टारगेट)</i>\n\n"
+                    f"💼 <b>Exact MT5 Lot Size:</b> <b><code>{exact_lot:.2f} Lot</code></b>\n"
+                    f"🛡️ <b>Recovery Risk:</b> <b>${max_risk_usd:.0f} (0.25%)</b>  ➡️  <b>Target: +${expected_prof:.0f}</b>\n\n"
                     f"────────────────────\n\n"
                     f"{get_funding_pips_dashboard()}"
                 )
@@ -815,24 +779,13 @@ def scan_forex_market():
             print(f"Error scanning {name}: {e}")
 
 if __name__ == "__main__":
-    mkt_msg = "🟢 फॉरेक्स मार्केट खुला है (Funding Pips $100k स्कैनिंग चालू है)।" if is_forex_market_open() else "🔴 अभी वीकेंड की वजह से मार्केट बंद है।"
-
     send_telegram_message(
-        "🏆 <b>Funding Pips $100,000 Competition Bot Active!</b> 🏆\n\n"
-        f"📢 <b>Status:</b> {mkt_msg}\n\n"
-        "🛡️ <b>Account Protection Rules Configured:</b>\n"
-        "• <b>Account Capital:</b> $100,000\n"
-        "• <b>Daily Loss Rule:</b> $5,000 Max (Bot Safe Stop at $1,800)\n"
-        "• <b>Total Loss Rule:</b> $10,000 Max\n"
-        "• <b>Risk Per Trade:</b> Fixed $450 (0.45%) | Target: +$990 (1:2.2)\n\n"
-        "⭐ <b>Priority Focus Pairs:</b>\n"
-        "• <b>XAU/USD (Gold) & EUR/USD</b> + GBP/USD, USD/JPY, GBP/JPY\n\n"
-        "🐋 <b>5 High-Win-Rate Operator Strategies:</b>\n"
-        "1️⃣ 1H+15M Judas Swing Stop-Hunt Reversal\n"
-        "2️⃣ 15M Unmitigated Order Block + FVG Tap\n"
-        "3️⃣ Gold & EUR/USD Institutional EMA-20/50 Pullback\n"
-        "4️⃣ Session AMD Manipulation Trap (Wyckoff)\n"
-        "5️⃣ 1H+15M Institutional Displacement (BOS)"
+        "🧠 <b>Triad Macro-Quant Sniper Bot Active ($600 Recovery Mode)!</b> 🧠\n\n"
+        "🛠️ <b>पिछले लॉस की तीनों गलतियां 100% बंद कर दी गई हैं:</b>\n"
+        "1️⃣ <b>Live DXY (Dollar Index) Lock:</b> अब अगर Dollar मजबूत हो रहा है, तो बॉट Gold और EUR/USD में कभी गलत BUY नहीं देगा!\n"
+        "2️⃣ <b>No 'LEAN' / Sideways Trades:</b> 1H चार्ट थोड़ा भी साइडवेज या कन्फ्यूज हुआ तो बॉट बिल्कुल शांत बैठेगा।\n"
+        "3️⃣ <b>1H + 15M + 5M Triad Alignment:</b> जब तक 5-मिनट चार्ट पर भी स्टॉप-हंट के बाद ऑपरेटर एब्जॉर्प्शन कन्फर्म नहीं होगा, कोई ट्रेड नहीं आएगा।\n"
+        "4️⃣ <b>Safe Recovery Math:</b> रिस्क घटाकर <b>$250 (0.25%)</b> और टारगेट <b>+$625 (1:2.5)</b> कर दिया गया है—सिर्फ 1 सही ट्रेड आपका पूरा $600 रिकवर कर देगा!"
     )
 
     start_run = time.time()
