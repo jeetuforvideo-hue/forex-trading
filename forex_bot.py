@@ -17,7 +17,7 @@ except ImportError:
     CHART_AVAILABLE = False
 
 # =====================================================================
-# 1. $100,000 INSTITUTIONAL FIBONACCI + EMA 9/20 TRADING ENGINE
+# 1. $100,000 ALL-ROUNDER PRICE-ACTION & FIBONACCI ENGINE
 # =====================================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID   = "5610520408"
@@ -31,7 +31,7 @@ TARGET_RR_RATIO            = 1.8       # 1:1.8 Target (+$720 Profit per trade)
 LOCK_PROFIT_R              = 0.8       # 0.8R Safe Breakeven Lock
 DAILY_PROTECTION_CAP       = 1600.0
 MAX_CONCURRENT_TRADES      = 2
-MIN_GAP_BETWEEN_TRADES_MIN = 15
+MIN_GAP_BETWEEN_TRADES_MIN = 12
 
 FOREX_PAIRS = {
     "XAU/USD (GOLD)": {
@@ -44,9 +44,9 @@ FOREX_PAIRS = {
         "decimals": 2,
         "unit_name": "Points",
         "usd_exposure": "SHORT_USD_ON_BUY",
-        "min_sl_dist": 5.50,
-        "max_sl_dist": 10.00,
-        "max_lot_cap": 1.20,
+        "min_sl_dist": 5.00,
+        "max_sl_dist": 9.50,
+        "max_lot_cap": 1.25,
         "is_crypto": False
     },
     "EUR/USD": {
@@ -59,8 +59,8 @@ FOREX_PAIRS = {
         "decimals": 5,
         "unit_name": "Pips",
         "usd_exposure": "SHORT_USD_ON_BUY",
-        "min_sl_dist": 0.0014,
-        "max_sl_dist": 0.0026,
+        "min_sl_dist": 0.0013,
+        "max_sl_dist": 0.0025,
         "max_lot_cap": 3.00,
         "is_crypto": False
     },
@@ -74,8 +74,8 @@ FOREX_PAIRS = {
         "decimals": 5,
         "unit_name": "Pips",
         "usd_exposure": "SHORT_USD_ON_BUY",
-        "min_sl_dist": 0.0016,
-        "max_sl_dist": 0.0030,
+        "min_sl_dist": 0.0015,
+        "max_sl_dist": 0.0028,
         "max_lot_cap": 3.00,
         "is_crypto": False
     },
@@ -89,8 +89,8 @@ FOREX_PAIRS = {
         "decimals": 3,
         "unit_name": "Pips",
         "usd_exposure": "LONG_USD_ON_BUY",
-        "min_sl_dist": 0.160,
-        "max_sl_dist": 0.300,
+        "min_sl_dist": 0.150,
+        "max_sl_dist": 0.280,
         "max_lot_cap": 3.00,
         "is_crypto": False
     },
@@ -104,8 +104,8 @@ FOREX_PAIRS = {
         "decimals": 3,
         "unit_name": "Pips",
         "usd_exposure": "NEUTRAL",
-        "min_sl_dist": 0.220,
-        "max_sl_dist": 0.380,
+        "min_sl_dist": 0.200,
+        "max_sl_dist": 0.360,
         "max_lot_cap": 2.50,
         "is_crypto": False
     },
@@ -134,15 +134,15 @@ FOREX_PAIRS = {
         "decimals": 2,
         "unit_name": "Points",
         "usd_exposure": "NEUTRAL",
-        "min_sl_dist": 280.0,
-        "max_sl_dist": 550.0,
+        "min_sl_dist": 260.0,
+        "max_sl_dist": 520.0,
         "max_lot_cap": 1.50,
         "is_crypto": True
     }
 }
 
 last_candle_traded     = {name: None for name in FOREX_PAIRS}
-last_swing_traded      = {name: None for name in FOREX_PAIRS}
+last_structure_traded  = {name: None for name in FOREX_PAIRS}
 pair_cooldown_until    = {name: datetime.min.replace(tzinfo=timezone.utc) for name in FOREX_PAIRS}
 sl_direction_lock      = {name: {"BUY": datetime.min.replace(tzinfo=timezone.utc), "SELL": datetime.min.replace(tzinfo=timezone.utc)} for name in FOREX_PAIRS}
 last_global_trade_time = datetime.min.replace(tzinfo=timezone.utc)
@@ -182,9 +182,9 @@ def get_trading_session(is_crypto=False):
     hr = now.hour + (now.minute / 60.0)
     if is_crypto:
         return True, "Crypto 24/7 Session"
-    if 3.0 <= hr <= 5.5:
+    if 3.25 <= hr <= 5.0:
         return False, "Rollover Pause"
-    elif 5.5 < hr < 12.0:
+    elif 5.0 < hr < 12.0:
         return True, "Asian Session"
     elif 12.0 <= hr < 18.0:
         return True, "London Session"
@@ -347,7 +347,7 @@ def get_clean_spot_data(pair_name, info):
     return df_15m, df_5m, live_spot_price, source_used
 
 # =====================================================================
-# 3. TECHNICAL TOOLS: EMA 9/20, RSI, SWING HIGH/LOW & FIBONACCI
+# 3. TECHNICAL INDICATORS & 4 CORE PRICE-ACTION DETECTORS
 # =====================================================================
 def calculate_chart_indicators(df):
     df = df.copy()
@@ -367,6 +367,9 @@ def calculate_chart_indicators(df):
     df["Upper_Wick"] = df["High"] - df[["Open", "Close"]].max(axis=1)
     df["Lower_Wick"] = df[["Open", "Close"]].min(axis=1) - df["Low"]
     df["Close_Pos"]  = (df["Close"] - df["Low"]) / df["Range"]
+
+    avg_body = df["Body"].rolling(16).mean().replace(0, 1e-9)
+    df["Disp_Power"] = df["Body"] / avg_body
 
     delta = df["Close"].diff()
     gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
@@ -398,13 +401,13 @@ def detect_fibonacci_swing_structure(df_5m, lookback=38):
     if np.isnan(atr_5m) or atr_5m <= 0:
         return None
 
-    if swing_range < (atr_5m * 2.2):
+    if swing_range < (atr_5m * 2.1):
         return None
 
     if min_idx < max_idx and (len(window) - max_idx) >= 2:
         return {
             "type": "BULLISH_SWING",
-            "swing_id": f"BULL_{swing_low_time}_{swing_high_time}",
+            "swing_id": f"BULL_FIB_{swing_low_time}_{swing_high_time}",
             "swing_high": swing_high,
             "swing_low": swing_low,
             "fib_0": swing_high,
@@ -418,7 +421,7 @@ def detect_fibonacci_swing_structure(df_5m, lookback=38):
     if max_idx < min_idx and (len(window) - min_idx) >= 2:
         return {
             "type": "BEARISH_SWING",
-            "swing_id": f"BEAR_{swing_high_time}_{swing_low_time}",
+            "swing_id": f"BEAR_FIB_{swing_high_time}_{swing_low_time}",
             "swing_high": swing_high,
             "swing_low": swing_low,
             "fib_0": swing_low,
@@ -428,6 +431,100 @@ def detect_fibonacci_swing_structure(df_5m, lookback=38):
             "fib_786": swing_low + (swing_range * 0.786),
             "fib_100": swing_high
         }
+
+    return None
+
+def detect_reversal_neckline_breakout(df_5m):
+    """
+    Setup A: Inverse Head & Shoulders / W-Bottom / M-Top Neckline Breakout Detector
+    (जैसे XAUUSD में 4108 का Head + 4111.50 का Right Shoulder बनने के बाद 4117 का Neckline टूटा)
+    """
+    if len(df_5m) < 40:
+        return None
+
+    c0 = df_5m.iloc[-2]  # अभी क्लोज हुई ब्रेकआउट कैंडल
+    price      = float(c0["Close"])
+    open_0     = float(c0["Open"])
+    high_0     = float(c0["High"])
+    low_0      = float(c0["Low"])
+    atr_5m     = float(c0["ATR"])
+    ema9       = float(c0["EMA9"])
+    ema20      = float(c0["EMA20"])
+    rsi        = float(c0["RSI"])
+    body_ratio = float(c0["Body_Ratio"])
+    close_pos  = float(c0["Close_Pos"])
+    disp_power = float(c0["Disp_Power"])
+
+    if np.isnan(atr_5m) or atr_5m <= 0:
+        return None
+
+    # पिछले 28 कैंडल्स में स्विंग स्ट्रक्चर देखें
+    win = df_5m.iloc[-30:-2]
+    highs = win["High"].values
+    lows  = win["Low"].values
+    times = win.index
+    n_len = len(win)
+
+    min_idx = int(np.argmin(lows))
+    max_idx = int(np.argmax(highs))
+    head_low  = float(lows[min_idx])
+    head_high = float(highs[max_idx])
+    total_rng = head_high - head_low
+
+    if total_rng < (atr_5m * 2.4):
+        return None
+
+    # 1. BULLISH REVERSAL (Inverse Head & Shoulders / Double Bottom + Neckline Breakout)
+    # शर्त: Head Low कम से कम 3 से 22 कैंडल पहले बना हो, उसके बाद Higher Low (Right Shoulder) बना हो और अब Neckline टूटी हो
+    if 4 <= (n_len - min_idx) <= 23:
+        post_head_highs = highs[min_idx + 1:]
+        post_head_lows  = lows[min_idx + 2:] if (min_idx + 2) < n_len else lows[min_idx + 1:]
+
+        if len(post_head_highs) >= 3 and len(post_head_lows) >= 2:
+            neckline_res       = float(np.max(post_head_highs[:-1])) if len(post_head_highs) > 1 else float(np.max(post_head_highs))
+            right_shoulder_low = float(np.min(post_head_lows))
+
+            # Higher Low (Right Shoulder >= Head Low) और Neckline उचित दूरी पर हो
+            valid_structure = (right_shoulder_low > head_low) and ((neckline_res - head_low) >= atr_5m * 1.1) and ((neckline_res - head_low) <= atr_5m * 3.8)
+            broke_neckline  = (price > neckline_res) and (float(df_5m.iloc[-3]["Close"]) <= neckline_res * 1.0003)
+            strong_ignition = (price > open_0) and (price > ema9) and (price > ema20) and (body_ratio >= 0.48) and (close_pos >= 0.65) and (disp_power >= 0.95)
+
+            if valid_structure and broke_neckline and strong_ignition and (42.0 <= rsi <= 72.0):
+                sl_level = min(right_shoulder_low, low_0) - (atr_5m * 0.25)
+                return {
+                    "direction": "BUY",
+                    "action": "BUY (LONG) 🟢",
+                    "struct_id": f"IHNS_BUY_{times[min_idx]}",
+                    "setup_text": f"Inverse H&S / Bottom Reversal Neckline Breakout ({neckline_res:.2f}) | RSI: {rsi:.0f}",
+                    "sl_raw": sl_level,
+                    "neckline": neckline_res,
+                    "head_level": head_low
+                }
+
+    # 2. BEARISH REVERSAL (Head & Shoulders / Double Top + Neckline Breakdown)
+    if 4 <= (n_len - max_idx) <= 23:
+        post_head_lows  = lows[max_idx + 1:]
+        post_head_highs = highs[max_idx + 2:] if (max_idx + 2) < n_len else highs[max_idx + 1:]
+
+        if len(post_head_lows) >= 3 and len(post_head_highs) >= 2:
+            neckline_sup        = float(np.min(post_head_lows[:-1])) if len(post_head_lows) > 1 else float(np.min(post_head_lows))
+            right_shoulder_high = float(np.max(post_head_highs))
+
+            valid_structure = (right_shoulder_high < head_high) and ((head_high - neckline_sup) >= atr_5m * 1.1) and ((head_high - neckline_sup) <= atr_5m * 3.8)
+            broke_neckline  = (price < neckline_sup) and (float(df_5m.iloc[-3]["Close"]) >= neckline_sup * 0.9997)
+            strong_collapse = (price < open_0) and (price < ema9) and (price < ema20) and (body_ratio >= 0.48) and (close_pos <= 0.35) and (disp_power >= 0.95)
+
+            if valid_structure and broke_neckline and strong_collapse and (28.0 <= rsi <= 58.0):
+                sl_level = max(right_shoulder_high, high_0) + (atr_5m * 0.25)
+                return {
+                    "direction": "SELL",
+                    "action": "SELL (SHORT) 🔴",
+                    "struct_id": f"HNS_SELL_{times[max_idx]}",
+                    "setup_text": f"H&S / Top Reversal Neckline Breakdown ({neckline_sup:.2f}) | RSI: {rsi:.0f}",
+                    "sl_raw": sl_level,
+                    "neckline": neckline_sup,
+                    "head_level": head_high
+                }
 
     return None
 
@@ -441,7 +538,17 @@ def check_usd_exposure_filter(pair_info):
                     return False
     return True
 
-def evaluate_chart_setup(pair_name, pair_info, df_15m, df_5m):
+# =====================================================================
+# 4. MASTER DECISION ENGINE (ALL 4 SETUPS ACTIVE)
+# =====================================================================
+def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
+    """
+    चारों तरह के प्रोफेशनल सेटअप चेक करता है:
+    1. Setup A: Inverse H&S / Double Bottom / Top Neckline Breakout (Reversal)
+    2. Setup B: Fibonacci (0.382-0.618) + EMA 9/20 Trend Pullback
+    3. Setup C: 10-Bar Liquidity Sweep / Stop-Hunt Reclaim
+    4. Setup D: 6-Bar Consolidation Box Breakout Ignition
+    """
     now_utc = get_utc_now()
     if now_utc < pair_cooldown_until.get(pair_name, datetime.min.replace(tzinfo=timezone.utc)):
         return None, None, None, None, None
@@ -450,23 +557,7 @@ def evaluate_chart_setup(pair_name, pair_info, df_15m, df_5m):
     if not session_ok:
         return None, None, None, None, None
 
-    m15_c = df_15m.iloc[-2]
-    m15_prev = df_15m.iloc[-4]
-    m15_close = float(m15_c["Close"])
-    m15_ema20 = float(m15_c["EMA20"])
-    m15_ema50 = float(m15_c["EMA50"])
-
-    htf_bullish = (m15_close > m15_ema20) and (m15_ema20 >= m15_ema50) and (m15_ema20 >= float(m15_prev["EMA20"]))
-    htf_bearish = (m15_close < m15_ema20) and (m15_ema20 <= m15_ema50) and (m15_ema20 <= float(m15_prev["EMA20"]))
-
-    if not htf_bullish and not htf_bearish:
-        return None, None, None, None, None
-
-    fib = detect_fibonacci_swing_structure(df_5m, lookback=38)
-    if fib is None:
-        return None, None, None, None, None
-
-    if last_swing_traded.get(pair_name) == fib["swing_id"]:
+    if not check_usd_exposure_filter(pair_info):
         return None, None, None, None, None
 
     c0 = df_5m.iloc[-2]
@@ -484,47 +575,131 @@ def evaluate_chart_setup(pair_name, pair_info, df_15m, df_5m):
     rsi        = float(c0["RSI"])
     close_pos  = float(c0["Close_Pos"])
     body_ratio = float(c0["Body_Ratio"])
+    disp_power = float(c0["Disp_Power"])
+    l_wick     = float(c0["Lower_Wick"])
+    u_wick     = float(c0["Upper_Wick"])
 
-    ema_separation = abs(ema9 - ema20)
-    if ema_separation < (atr_5m * 0.12):
+    if np.isnan(atr_5m) or atr_5m <= 0:
         return None, None, None, None, None
 
-    # BULLISH SETUP: 15M Bullish + Fibonacci (0.382-0.618) Pullback + EMA 9/20 Bounce
-    if htf_bullish and fib["type"] == "BULLISH_SWING" and now_utc >= sl_direction_lock[pair_name]["BUY"]:
-        if not check_usd_exposure_filter(pair_info):
-            return None, None, None, None, None
+    fib = detect_fibonacci_swing_structure(df_5m, lookback=38)
 
-        recent_3_low  = min(low_0, float(c1["Low"]), float(c2["Low"]))
-        in_fib_zone   = (recent_3_low <= fib["fib_382"]) and (recent_3_low >= fib["fib_786"])
-        ema_support   = (price > ema9) and (ema9 >= ema20 * 0.9995) and (ema20 >= ema50)
-        green_trigger = (price > open_0) and (close_pos >= 0.60) and (body_ratio >= 0.42) and (price > float(c1["High"]) or price > float(c1["Close"]))
-        rsi_healthy   = (40.0 <= rsi <= 65.0)
+    # -----------------------------------------------------------------
+    # 1. SETUP A: REVERSAL NECKLINE BREAKOUT (Inverse H&S / W-Bottom / M-Top)
+    # (15M के पुराने ट्रेंड का इंतज़ार किए बिना नीचे/ऊपर से पलटने वाला ब्रेकआउट पकड़ता है)
+    # -----------------------------------------------------------------
+    rev = detect_reversal_neckline_breakout(df_5m)
+    if rev is not None:
+        r_dir = rev["direction"]
+        if now_utc >= sl_direction_lock[pair_name][r_dir] and last_structure_traded.get(pair_name) != rev["struct_id"]:
+            return rev["action"], r_dir, rev["setup_text"], rev["sl_raw"], fib
 
-        if in_fib_zone and ema_support and green_trigger and rsi_healthy:
-            sl_raw = min(recent_3_low, fib["fib_786"]) - (atr_5m * 0.25)
-            setup_text = f"Fibonacci Golden Zone (0.50-0.618) + EMA 9/20 Bounce | RSI: {rsi:.0f}"
+    # 15M Trend Direction for Trend Setups
+    m15_c     = df_15m.iloc[-2]
+    m15_close = float(m15_c["Close"])
+    m15_ema20 = float(m15_c["EMA20"])
+    m15_ema50 = float(m15_c["EMA50"])
+
+    htf_bullish = (m15_close >= m15_ema20) or (ema9 > ema20 > ema50)
+    htf_bearish = (m15_close <= m15_ema20) or (ema9 < ema20 < ema50)
+
+    # -----------------------------------------------------------------
+    # 2. SETUP B: FIBONACCI (0.382-0.618) + EMA 9/20 TREND PULLBACK
+    # -----------------------------------------------------------------
+    if fib is not None and last_structure_traded.get(pair_name) != fib["swing_id"]:
+        ema_separation = abs(ema9 - ema20)
+        if ema_separation >= (atr_5m * 0.10):
+            # Bullish Fib Pullback
+            if htf_bullish and fib["type"] == "BULLISH_SWING" and now_utc >= sl_direction_lock[pair_name]["BUY"]:
+                recent_3_low  = min(low_0, float(c1["Low"]), float(c2["Low"]))
+                in_fib_zone   = (recent_3_low <= fib["fib_382"]) and (recent_3_low >= fib["fib_786"])
+                ema_support   = (price > ema9) and (ema9 >= ema20 * 0.9995)
+                green_trigger = (price > open_0) and (close_pos >= 0.58) and (body_ratio >= 0.42) and (price > float(c1["High"]) or price > float(c1["Close"]))
+                if in_fib_zone and ema_support and green_trigger and (38.0 <= rsi <= 66.0):
+                    sl_raw = min(recent_3_low, fib["fib_786"]) - (atr_5m * 0.25)
+                    setup_text = f"Fibonacci Golden Zone (0.50-0.618) + EMA 9/20 Bounce | RSI: {rsi:.0f}"
+                    return "BUY (LONG) 🟢", "BUY", setup_text, sl_raw, fib
+
+            # Bearish Fib Pullback
+            if htf_bearish and fib["type"] == "BEARISH_SWING" and now_utc >= sl_direction_lock[pair_name]["SELL"]:
+                recent_3_high = max(high_0, float(c1["High"]), float(c2["High"]))
+                in_fib_zone   = (recent_3_high >= fib["fib_382"]) and (recent_3_high <= fib["fib_786"])
+                ema_resist    = (price < ema9) and (ema9 <= ema20 * 1.0005)
+                red_trigger   = (price < open_0) and (close_pos <= 0.42) and (body_ratio >= 0.42) and (price < float(c1["Low"]) or price < float(c1["Close"]))
+                if in_fib_zone and ema_resist and red_trigger and (34.0 <= rsi <= 62.0):
+                    sl_raw = max(recent_3_high, fib["fib_786"]) + (atr_5m * 0.25)
+                    setup_text = f"Fibonacci Golden Zone (0.50-0.618) + EMA 9/20 Reject | RSI: {rsi:.0f}"
+                    return "SELL (SHORT) 🔴", "SELL", setup_text, sl_raw, fib
+
+    # -----------------------------------------------------------------
+    # 3. SETUP C: 10-BAR STOP-HUNT LIQUIDITY SWEEP & RECLAIM
+    # -----------------------------------------------------------------
+    pool_10   = df_5m.iloc[-13:-3]
+    pool_high = float(pool_10["High"].max())
+    pool_low  = float(pool_10["Low"].min())
+    sweep_id  = f"SWEEP_{pool_low}_{pool_high}"
+
+    if last_structure_traded.get(pair_name) != sweep_id:
+        # Bullish Stop-Hunt Sweep
+        swept_below = (low_0 < pool_low and price > pool_low) or (float(c1["Low"]) < pool_low and price > float(c1["High"]) and price > pool_low)
+        bull_reclaim = (price > open_0) and (price > ema9) and (close_pos >= 0.62) and (l_wick >= float(c0["Range"]) * 0.28 or disp_power >= 0.95)
+        if swept_below and bull_reclaim and (35.0 <= rsi <= 65.0) and now_utc >= sl_direction_lock[pair_name]["BUY"]:
+            sl_raw = min(low_0, float(c1["Low"])) - (atr_5m * 0.25)
+            setup_text = f"Liquidity Sweep Stop-Hunt & Bullish Reclaim ({pool_low:.2f}) | RSI: {rsi:.0f}"
+            if fib is None:
+                fib = {"swing_id": sweep_id, "fib_500": pool_low, "fib_618": pool_low, "fib_0": pool_high, "fib_382": pool_low, "fib_786": sl_raw, "fib_100": pool_low}
+            else:
+                fib["swing_id"] = sweep_id
             return "BUY (LONG) 🟢", "BUY", setup_text, sl_raw, fib
 
-    # BEARISH SETUP: 15M Bearish + Fibonacci (0.382-0.618) Pullback + EMA 9/20 Reject
-    if htf_bearish and fib["type"] == "BEARISH_SWING" and now_utc >= sl_direction_lock[pair_name]["SELL"]:
-        if not check_usd_exposure_filter(pair_info):
-            return None, None, None, None, None
-
-        recent_3_high = max(high_0, float(c1["High"]), float(c2["High"]))
-        in_fib_zone   = (recent_3_high >= fib["fib_382"]) and (recent_3_high <= fib["fib_786"])
-        ema_resist    = (price < ema9) and (ema9 <= ema20 * 1.0005) and (ema20 <= ema50)
-        red_trigger   = (price < open_0) and (close_pos <= 0.40) and (body_ratio >= 0.42) and (price < float(c1["Low"]) or price < float(c1["Close"]))
-        rsi_healthy   = (35.0 <= rsi <= 60.0)
-
-        if in_fib_zone and ema_resist and red_trigger and rsi_healthy:
-            sl_raw = max(recent_3_high, fib["fib_786"]) + (atr_5m * 0.25)
-            setup_text = f"Fibonacci Golden Zone (0.50-0.618) + EMA 9/20 Reject | RSI: {rsi:.0f}"
+        # Bearish Stop-Hunt Sweep
+        swept_above = (high_0 > pool_high and price < pool_high) or (float(c1["High"]) > pool_high and price < float(c1["Low"]) and price < pool_high)
+        bear_reclaim = (price < open_0) and (price < ema9) and (close_pos <= 0.38) and (u_wick >= float(c0["Range"]) * 0.28 or disp_power >= 0.95)
+        if swept_above and bear_reclaim and (35.0 <= rsi <= 65.0) and now_utc >= sl_direction_lock[pair_name]["SELL"]:
+            sl_raw = max(high_0, float(c1["High"])) + (atr_5m * 0.25)
+            setup_text = f"Liquidity Sweep Stop-Hunt & Bearish Breakdown ({pool_high:.2f}) | RSI: {rsi:.0f}"
+            if fib is None:
+                fib = {"swing_id": sweep_id, "fib_500": pool_high, "fib_618": pool_high, "fib_0": pool_low, "fib_382": pool_high, "fib_786": sl_raw, "fib_100": pool_high}
+            else:
+                fib["swing_id"] = sweep_id
             return "SELL (SHORT) 🔴", "SELL", setup_text, sl_raw, fib
+
+    # -----------------------------------------------------------------
+    # 4. SETUP D: 6-BAR CONSOLIDATION BOX BREAKOUT IGNITION
+    # -----------------------------------------------------------------
+    box_6    = df_5m.iloc[-8:-2]
+    box_high = float(box_6["High"].max())
+    box_low  = float(box_6["Low"].min())
+    box_rng  = box_high - box_low
+    box_id   = f"BOX_{box_low}_{box_high}"
+
+    if box_rng <= (atr_5m * 2.2) and last_structure_traded.get(pair_name) != box_id:
+        # Bullish Box Breakout
+        if htf_bullish and price > box_high and price > open_0 and ema9 > ema20 and body_ratio >= 0.55 and close_pos >= 0.68 and disp_power >= 1.15 and (45.0 <= rsi <= 72.0):
+            if now_utc >= sl_direction_lock[pair_name]["BUY"]:
+                sl_raw = max(box_low, low_0 - (atr_5m * 0.25))
+                setup_text = f"Consolidation Range Breakout Above {box_high:.2f} | RSI: {rsi:.0f}"
+                if fib is None:
+                    fib = {"swing_id": box_id, "fib_500": box_high, "fib_618": box_low, "fib_0": price, "fib_382": box_high, "fib_786": sl_raw, "fib_100": box_low}
+                else:
+                    fib["swing_id"] = box_id
+                return "BUY (LONG) 🟢", "BUY", setup_text, sl_raw, fib
+
+        # Bearish Box Breakdown
+        if htf_bearish and price < box_low and price < open_0 and ema9 < ema20 and body_ratio >= 0.55 and close_pos <= 0.32 and disp_power >= 1.15 and (28.0 <= rsi <= 55.0):
+            if now_utc >= sl_direction_lock[pair_name]["SELL"]:
+                sl_raw = min(box_high, high_0 + (atr_5m * 0.25))
+                setup_text = f"Consolidation Range Breakdown Below {box_low:.2f} | RSI: {rsi:.0f}"
+                if fib is None:
+                    fib = {"swing_id": box_id, "fib_500": box_low, "fib_618": box_high, "fib_0": price, "fib_382": box_low, "fib_786": sl_raw, "fib_100": box_high}
+                else:
+                    fib["swing_id"] = box_id
+                return "SELL (SHORT) 🔴", "SELL", setup_text, sl_raw, fib
 
     return None, None, None, None, None
 
 # =====================================================================
-# 4. CHART GENERATOR WITH FIBONACCI LEVELS + EMA 9 & 20
+# 5. CHART GENERATOR WITH FIBONACCI LEVELS + EMA 9 & 20
 # =====================================================================
 def generate_fibonacci_ema_chart(df_5m, pair_name, direction, entry_p, sl_p, tp_p, half_p, fib, decimals, lot_size, risk_usd, reward_usd, rr_ratio):
     if not CHART_AVAILABLE:
@@ -544,20 +719,18 @@ def generate_fibonacci_ema_chart(df_5m, pair_name, direction, entry_p, sl_p, tp_
         ax.plot(x_vals, sub["EMA9"].values, color="#16a34a", linewidth=1.5, label="EMA 9 (Green)", zorder=4)
         ax.plot(x_vals, sub["EMA20"].values, color="#dc2626", linewidth=1.5, label="EMA 20 (Red)", zorder=4)
 
-        if fib is not None:
+        if fib is not None and "fib_500" in fib and "fib_618" in fib:
             gold_top = max(fib["fib_500"], fib["fib_618"])
             gold_bot = min(fib["fib_500"], fib["fib_618"])
-            ax.add_patch(mpatches.Rectangle(
-                (0, gold_bot), n_bars + 14, gold_top - gold_bot,
-                facecolor="#fbbf24", alpha=0.22, edgecolor="#d97706", linestyle="--", linewidth=1.0, zorder=1
-            ))
+            if abs(gold_top - gold_bot) > 0:
+                ax.add_patch(mpatches.Rectangle(
+                    (0, gold_bot), n_bars + 14, gold_top - gold_bot,
+                    facecolor="#fbbf24", alpha=0.20, edgecolor="#d97706", linestyle="--", linewidth=1.0, zorder=1
+                ))
             for f_lbl, f_val, f_col in [
-                ("Fib 0.0 (Swing)", fib["fib_0"], "#4b5563"),
-                ("Fib 0.382", fib["fib_382"], "#9ca3af"),
-                ("Fib 0.500", fib["fib_500"], "#d97706"),
-                ("Fib 0.618 (Golden)", fib["fib_618"], "#b45309"),
-                ("Fib 0.786 (SL Guard)", fib["fib_786"], "#dc2626"),
-                ("Fib 1.0 (Origin)", fib["fib_100"], "#4b5563")
+                ("Key Level / 0.50", fib["fib_500"], "#d97706"),
+                ("Golden / 0.618", fib["fib_618"], "#b45309"),
+                ("Invalidation / SL Guard", fib["fib_786"], "#dc2626")
             ]:
                 ax.axhline(f_val, color=f_col, linestyle=":", linewidth=0.9, alpha=0.75, zorder=2)
                 ax.text(0.5, f_val, f" {f_lbl}: {format_price(f_val, decimals)} ", fontsize=7.2, color=f_col, fontweight="bold", va="bottom")
@@ -584,9 +757,9 @@ def generate_fibonacci_ema_chart(df_5m, pair_name, direction, entry_p, sl_p, tp_
         entry_s, sl_s, tp_s, half_s = format_price(entry_p, decimals), format_price(sl_p, decimals), format_price(tp_p, decimals), format_price(half_p, decimals)
 
         ax.text(box_center_x, tp_p, f" Target (1:{rr_ratio}): {tp_s} (+${reward_usd:.0f}) ", color="white", fontweight="bold", fontsize=8.5, ha="center", va="bottom" if direction == "BUY" else "top", bbox=dict(boxstyle="round,pad=0.35", facecolor="#16a34a", edgecolor="none"), zorder=7)
-        ax.text(box_center_x, sl_p, f" Fib 0.786 SL: {sl_s} (-${risk_usd:.0f}) ", color="white", fontweight="bold", fontsize=8.5, ha="center", va="top" if direction == "BUY" else "bottom", bbox=dict(boxstyle="round,pad=0.35", facecolor="#dc2626", edgecolor="none"), zorder=7)
+        ax.text(box_center_x, sl_p, f" Structure SL: {sl_s} (-${risk_usd:.0f}) ", color="white", fontweight="bold", fontsize=8.5, ha="center", va="top" if direction == "BUY" else "bottom", bbox=dict(boxstyle="round,pad=0.35", facecolor="#dc2626", edgecolor="none"), zorder=7)
 
-        pos_title = "FIB + EMA LONG" if direction == "BUY" else "FIB + EMA SHORT"
+        pos_title = "PRO LONG SETUP" if direction == "BUY" else "PRO SHORT SETUP"
         ax.text(box_center_x, entry_p, f" {pos_title} @ {entry_s} | Lot: {lot_size:.2f}\n 0.8R Safe Lock: {half_s} ", color="white", fontweight="bold", fontsize=8.2, ha="center", va="center", bbox=dict(boxstyle="round,pad=0.38", facecolor="#1f2937", edgecolor="white", alpha=0.92), zorder=8)
 
         ax.yaxis.tick_right()
@@ -597,7 +770,7 @@ def generate_fibonacci_ema_chart(df_5m, pair_name, direction, entry_p, sl_p, tp_
         y_pad = (y_max - y_min) * 0.14
         ax.set_ylim(y_min - y_pad, y_max + y_pad)
 
-        ax.set_title(f"{pair_name} — Fibonacci (0.50-0.618) + EMA 9/20 Setup ({lot_size:.2f} Lot)", loc="left", fontsize=11, fontweight="bold", color="#111827", pad=10)
+        ax.set_title(f"{pair_name} — Live M5 Price-Action & Fibonacci Setup ({lot_size:.2f} Lot)", loc="left", fontsize=11, fontweight="bold", color="#111827", pad=10)
         ax.legend(loc="upper left", fontsize=8)
         ax.grid(True, linestyle="--", alpha=0.30, color="#9ca3af")
 
@@ -616,14 +789,14 @@ def send_telegram_signal_with_chart(caption_html, chart_buf, target_chat_id=CHAT
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
         try:
             if len(caption_html) <= 1020:
-                files = {"photo": ("fib_ema_setup.png", chart_buf, "image/png")}
+                files = {"photo": ("price_action_setup.png", chart_buf, "image/png")}
                 data = {"chat_id": target_chat_id, "caption": caption_html, "parse_mode": "HTML"}
                 res = requests.post(url, data=data, files=files, timeout=15)
                 if res.status_code == 200:
                     return
             else:
-                files = {"photo": ("fib_ema_setup.png", chart_buf, "image/png")}
-                data = {"chat_id": target_chat_id, "caption": "📊 <b>Fibonacci + EMA 9/20 Live Chart</b>", "parse_mode": "HTML"}
+                files = {"photo": ("price_action_setup.png", chart_buf, "image/png")}
+                data = {"chat_id": target_chat_id, "caption": "📊 <b>Live M5 Price-Action & Fibonacci Chart</b>", "parse_mode": "HTML"}
                 requests.post(url, data=data, files=files, timeout=15)
                 send_telegram_message(caption_html, target_chat_id)
                 return
@@ -632,17 +805,17 @@ def send_telegram_signal_with_chart(caption_html, chart_buf, target_chat_id=CHAT
     send_telegram_message(caption_html, target_chat_id)
 
 # =====================================================================
-# 5. ACTIVE TRADE MANAGEMENT & /STATUS COMMAND
+# 6. ACTIVE TRADE MANAGEMENT & /STATUS COMMAND
 # =====================================================================
 def send_live_status_summary():
     forex_open = is_forex_market_open()
-    market_state = "🟢 ALL MARKETS ACTIVE" if forex_open else "🟡 WEEKEND: BTC/USD ACTIVE"
+    market_state = "🟢 ALL 4 SETUPS ACTIVE" if forex_open else "🟡 WEEKEND: BTC/USD ACTIVE"
     _, session_name = get_trading_session(True)
 
     report = (
-        f"📐 <b>FIBONACCI + EMA 9/20 ENGINE STATUS</b> 📐\n\n"
+        f"📐 <b>ALL-ROUNDER PRICE-ACTION ENGINE STATUS</b> 📐\n\n"
         f"📢 <b>Market:</b> {market_state} ({session_name})\n"
-        f"🛰️ <b>Data Feeds:</b> TradingView OANDA Spot + Kraken + Binance Vision\n\n"
+        f"🧠 <b>Active Setups:</b> Inverse H&S Reversal + Fib 0.50-0.618 + Sweep + Box Breakout\n\n"
     )
 
     for name, info in FOREX_PAIRS.items():
@@ -650,16 +823,11 @@ def send_live_status_summary():
             df_15m, df_5m, live_spot, src = get_clean_spot_data(name, info)
             if df_5m is None or df_15m is None:
                 continue
-            df_5m  = calculate_chart_indicators(df_5m)
-            df_15m = calculate_chart_indicators(df_15m)
-            fib    = detect_fibonacci_swing_structure(df_5m)
-
+            df_5m = calculate_chart_indicators(df_5m)
             c = df_5m.iloc[-1]
             rsi = float(c["RSI"])
             p_str = format_price(live_spot, info["decimals"])
-            fib_str = "Fib 0.50-0.618 Ready" if fib else "Scanning Structure"
-
-            report += f"🔹 <b>{name}:</b> <code>{p_str}</code> | {fib_str} | RSI: {rsi:.0f}\n"
+            report += f"🔹 <b>{name}:</b> <code>{p_str}</code> | RSI: {rsi:.0f}\n"
         except Exception:
             pass
 
@@ -736,7 +904,7 @@ def manage_open_trades(pair_name, candle_time, live_spot, latest_5m, decimals):
 
             if hit_type == "TARGET":
                 trade["is_open"] = False
-                pair_cooldown_until[pair_name] = now_utc + timedelta(minutes=45)
+                pair_cooldown_until[pair_name] = now_utc + timedelta(minutes=40)
                 net_win = trade["expected_profit"]
                 daily_realized_pnl += net_win
                 total_account_pnl += net_win
@@ -751,7 +919,7 @@ def manage_open_trades(pair_name, candle_time, live_spot, latest_5m, decimals):
 
             elif hit_type == "TRAILING_SL":
                 trade["is_open"] = False
-                pair_cooldown_until[pair_name] = now_utc + timedelta(minutes=30)
+                pair_cooldown_until[pair_name] = now_utc + timedelta(minutes=25)
                 half_prof = round(trade["max_risk"] * 0.5, 0)
                 daily_realized_pnl += half_prof
                 total_account_pnl += half_prof
@@ -765,8 +933,8 @@ def manage_open_trades(pair_name, candle_time, live_spot, latest_5m, decimals):
 
             elif hit_type == "SL":
                 trade["is_open"] = False
-                pair_cooldown_until[pair_name] = now_utc + timedelta(minutes=60)
-                sl_direction_lock[pair_name][trade["direction"]] = now_utc + timedelta(hours=2)
+                pair_cooldown_until[pair_name] = now_utc + timedelta(minutes=50)
+                sl_direction_lock[pair_name][trade["direction"]] = now_utc + timedelta(minutes=90)
 
                 loss_amt = trade["max_risk"]
                 daily_realized_pnl -= loss_amt
@@ -781,7 +949,7 @@ def manage_open_trades(pair_name, candle_time, live_spot, latest_5m, decimals):
                 continue
 
 def scan_markets():
-    global trades_today, current_day, last_candle_traded, last_swing_traded, daily_trades_log, daily_realized_pnl, last_global_trade_time
+    global trades_today, current_day, last_candle_traded, last_structure_traded, daily_trades_log, daily_realized_pnl, last_global_trade_time
 
     today = get_ist_now().date()
     if today != current_day:
@@ -830,18 +998,18 @@ def scan_markets():
             if last_candle_traded[name] == closed_time:
                 continue
 
-            signal, direction, setup_text, custom_sl, fib_info = evaluate_chart_setup(
+            signal, direction, setup_text, custom_sl, struct_info = evaluate_all_market_setups(
                 name, info, df_15m, df_5m
             )
 
-            if signal and custom_sl is not None and fib_info is not None:
+            if signal and custom_sl is not None:
                 if direction == "BUY" and custom_sl >= live_spot:
                     continue
                 if direction == "SELL" and custom_sl <= live_spot:
                     continue
 
                 raw_sl_dist = abs(live_spot - custom_sl)
-                min_sl      = max(atr_5m * 1.15, info.get("min_sl_dist", atr_5m * 1.15))
+                min_sl      = max(atr_5m * 1.10, info.get("min_sl_dist", atr_5m * 1.10))
                 max_sl      = max(atr_5m * 2.20, info.get("max_sl_dist", atr_5m * 2.20))
                 sl_dist     = round(max(min_sl, min(raw_sl_dist, max_sl)), dec)
 
@@ -849,8 +1017,9 @@ def scan_markets():
                     continue
 
                 last_candle_traded[name] = closed_time
-                last_swing_traded[name]  = fib_info["swing_id"]
-                last_global_trade_time   = get_utc_now()
+                if struct_info is not None and "swing_id" in struct_info:
+                    last_structure_traded[name] = struct_info["swing_id"]
+                last_global_trade_time = get_utc_now()
                 trades_today += 1
 
                 rr_ratio    = TARGET_RR_RATIO
@@ -891,25 +1060,22 @@ def scan_markets():
                     "status": "RUNNING"
                 })
 
-                entry_s   = format_price(live_spot, dec)
-                sl_s      = format_price(sl_level, dec)
-                half_s    = format_price(half_target_level, dec)
-                target_s  = format_price(target_level, dec)
-                fib50_s   = format_price(fib_info["fib_500"], dec)
-                fib618_s  = format_price(fib_info["fib_618"], dec)
+                entry_s  = format_price(live_spot, dec)
+                sl_s     = format_price(sl_level, dec)
+                half_s   = format_price(half_target_level, dec)
+                target_s = format_price(target_level, dec)
 
                 sl_pips_str     = calculate_pips_or_points(name, sl_dist, dec)
                 target_pips_str = calculate_pips_or_points(name, target_dist, dec)
 
                 msg = (
-                    f"📐 <b>INSTITUTIONAL FIBONACCI + EMA SIGNAL</b> 📐\n\n"
+                    f"📐 <b>PRO PRICE-ACTION & FIBONACCI SIGNAL</b> 📐\n\n"
                     f"🌍 <b>Asset:</b> <b>{name}</b> (<code>{info['mt5_name']}</code>)\n"
                     f"⚡ <b>Action:</b> <b>{signal}</b>\n"
                     f"🛰️ <b>Spot Feed:</b> {source_used}\n"
-                    f"🧠 <b>Chart Analysis:</b> {setup_text}\n"
-                    f"📏 <b>Fib Golden Zone (0.50-0.618):</b> <code>{fib50_s} - {fib618_s}</code>\n\n"
+                    f"🧠 <b>Pattern Detected:</b> {setup_text}\n\n"
                     f"📍 <b>MT5 Spot Entry:</b> <code>{entry_s}</code>\n"
-                    f"🛑 <b>Stop-Loss (Behind 0.786):</b> <code>{sl_s}</code>  <i>({sl_pips_str})</i>\n"
+                    f"🛑 <b>Structure SL:</b> <code>{sl_s}</code>  <i>({sl_pips_str})</i>\n"
                     f"🛡️ <b>0.8R Safe Lock:</b> <code>{half_s}</code>\n"
                     f"🎯 <b>Target (1:{rr_ratio}):</b> <code>{target_s}</code>  <i>({target_pips_str})</i>\n\n"
                     f"💼 <b>MT5 Lot Size:</b> <b><code>{exact_lot:.2f} Lot</code></b>\n"
@@ -918,7 +1084,7 @@ def scan_markets():
 
                 chart_buf = generate_fibonacci_ema_chart(
                     df_5m, name, direction, live_spot, sl_level, target_level,
-                    half_target_level, fib_info, dec, exact_lot, max_risk_usd, expected_prof, rr_ratio
+                    half_target_level, struct_info, dec, exact_lot, max_risk_usd, expected_prof, rr_ratio
                 )
                 send_telegram_signal_with_chart(msg, chart_buf)
 
@@ -927,10 +1093,13 @@ def scan_markets():
 
 if __name__ == "__main__":
     send_telegram_message(
-        "📐 <b>Institutional Fibonacci + EMA 9/20 Engine Online</b> 📐\n\n"
+        "📐 <b>All-Rounder Price-Action & Fibonacci Engine Online</b> 📐\n\n"
         "• <b>Data Feeds:</b> TradingView OANDA Spot + Kraken + Binance Vision\n"
-        "• <b>Technicals:</b> Fibonacci (0.382-0.618 Golden Zone) + EMA 9/20 + RSI\n"
-        "• <b>Pairs (7):</b> XAUUSD, EURUSD, GBPUSD, USDJPY, GBPJPY, AUDUSD, BTCUSD"
+        "• <b>4 Active Setups:</b>\n"
+        "  1. Inverse H&S / Double Bottom & Top Neckline Breakout\n"
+        "  2. Fibonacci (0.382-0.618) + EMA 9/20 Trend Pullback\n"
+        "  3. Liquidity Sweep Stop-Hunt & Reclaim\n"
+        "  4. Consolidation Box Breakout Ignition"
     )
 
     start_run = time.time()
