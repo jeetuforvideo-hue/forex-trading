@@ -1,37 +1,42 @@
 import os
 import io
+import sys
 import time
+import subprocess
 import requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
 
+# =====================================================================
+# AUTO-INSTALL MATPLOTLIB (ताकि GitHub पर फोटो बनने में कभी रुकावट न आए)
+# =====================================================================
 try:
     import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-    CHART_AVAILABLE = True
 except ImportError:
-    CHART_AVAILABLE = False
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "matplotlib"])
+    import matplotlib
+
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+CHART_AVAILABLE = True
 
 # =====================================================================
-# 1. INSTITUTIONAL ALL-ROUNDER ENGINE (NEWS + EASY TP + BUFFERED SL)
+# 1. INSTITUTIONAL ALL-ROUNDER ENGINE (MT5 IMAGE + NEWS + EASY TP)
 # =====================================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID   = "5610520408"
 
-# अपने अकाउंट के हिसाब से इसे $5000 या $100000 रख सकते हैं
 TOTAL_CAPITAL_USD          = 5000.0
-RISK_PER_TRADE_USD         = 25.0      # $5,000 अकाउंट पर 0.5% ($25) सुरक्षित रिस्क ($100k हो तो 400.0 कर लें)
-DAILY_PROTECTION_CAP       = 125.0     # डेली सुरक्षा कैप
+RISK_PER_TRADE_USD         = 25.0      # $5,000 अकाउंट पर $25 रिस्क
+DAILY_PROTECTION_CAP       = 125.0
 
-# SMART TARGET & STOP-LOSS SETTINGS
-BASE_EASY_RR_RATIO         = 1.45      # 1:1.45 Easy-Reach Target (ताकि 80-90% से वापस न लौटे)
-LOCK_PROFIT_R              = 0.65      # 65% मूव (0.65R) होते ही SL को Entry पर लॉक करें
-NEAR_TARGET_ALERT_RATIO    = 0.82      # टारगेट के 82% के पास पहुँचते ही तुरंत प्रॉफिट बुक अलर्ट
-SL_STOP_HUNT_BUFFER_ATR    = 0.55      # SL के पीछे 0.55x ATR का एक्स्ट्रा बफर (ताकि Wick छू न पाए)
+BASE_EASY_RR_RATIO         = 1.45      # Easy-Reach Target
+LOCK_PROFIT_R              = 0.65      # 0.65R पर Breakeven Lock
+NEAR_TARGET_ALERT_RATIO    = 0.82      # 82% Target पर Instant Book Alert
+SL_STOP_HUNT_BUFFER_ATR    = 0.55      # Stop-Hunt से बचने के लिए एक्स्ट्रा बफर
 
 MAX_CONCURRENT_TRADES      = 2
 MIN_GAP_BETWEEN_TRADES_MIN = 12
@@ -39,6 +44,7 @@ MIN_GAP_BETWEEN_TRADES_MIN = 12
 FOREX_PAIRS = {
     "XAU/USD (GOLD)": {
         "mt5_name": "XAUUSD",
+        "sub_title": "Gold vs US Dollar",
         "tv_ticker": "OANDA:XAUUSD",
         "tv_screener": "cfd",
         "kraken_pair": "PAXGUSD",
@@ -48,13 +54,14 @@ FOREX_PAIRS = {
         "decimals": 2,
         "unit_name": "Points",
         "usd_exposure": "SHORT_USD_ON_BUY",
-        "min_sl_dist": 6.20,    # Stop-Hunt से बचने के लिए सुरक्षित बफर SL
+        "min_sl_dist": 6.20,
         "max_sl_dist": 11.50,
         "max_lot_cap": 0.15,
         "is_crypto": False
     },
     "EUR/USD": {
         "mt5_name": "EURUSD",
+        "sub_title": "Euro vs US Dollar",
         "tv_ticker": "OANDA:EURUSD",
         "tv_screener": "forex",
         "kraken_pair": "EURUSD",
@@ -71,6 +78,7 @@ FOREX_PAIRS = {
     },
     "GBP/USD": {
         "mt5_name": "GBPUSD",
+        "sub_title": "Great Britain Pound vs US Dollar",
         "tv_ticker": "OANDA:GBPUSD",
         "tv_screener": "forex",
         "kraken_pair": "GBPUSD",
@@ -87,6 +95,7 @@ FOREX_PAIRS = {
     },
     "USD/JPY": {
         "mt5_name": "USDJPY",
+        "sub_title": "US Dollar vs Japanese Yen",
         "tv_ticker": "OANDA:USDJPY",
         "tv_screener": "forex",
         "kraken_pair": "USDJPY",
@@ -103,6 +112,7 @@ FOREX_PAIRS = {
     },
     "GBP/JPY": {
         "mt5_name": "GBPJPY",
+        "sub_title": "Great Britain Pound vs Japanese Yen",
         "tv_ticker": "OANDA:GBPJPY",
         "tv_screener": "forex",
         "kraken_pair": None,
@@ -119,6 +129,7 @@ FOREX_PAIRS = {
     },
     "AUD/USD": {
         "mt5_name": "AUDUSD",
+        "sub_title": "Australian Dollar vs US Dollar",
         "tv_ticker": "OANDA:AUDUSD",
         "tv_screener": "forex",
         "kraken_pair": "AUDUSD",
@@ -135,6 +146,7 @@ FOREX_PAIRS = {
     },
     "BTC/USD (BITCOIN)": {
         "mt5_name": "BTCUSD",
+        "sub_title": "Bitcoin vs US Dollar",
         "tv_ticker": "BITSTAMP:BTCUSD",
         "tv_screener": "crypto",
         "kraken_pair": "XBTUSD",
@@ -249,13 +261,9 @@ def calculate_exact_mt5_lot(pair_name, pair_info, sl_dist, risk_usd, live_usdjpy
     return max(0.01, min(round(raw_lot, 2), max_cap))
 
 # =====================================================================
-# 2. LIVE HIGH-IMPACT ECONOMIC NEWS (CPI, NFP, FOMC) & CRASH DETECTOR
+# 2. LIVE HIGH-IMPACT ECONOMIC NEWS & CRASH DETECTOR
 # =====================================================================
 def fetch_live_economic_calendar():
-    """
-    ForexFactory के लाइव कैलेंडर फीड से CPI, NFP, FOMC, PPI, Fed Speech जैसी
-    सभी High-Impact (Red Folder) न्यूज़ का समय ऑटोमैटिक लाता है।
-    """
     global cached_news_events, last_news_fetch_time
     now_ts = time.time()
     if (now_ts - last_news_fetch_time) < 1800 and cached_news_events:
@@ -292,23 +300,18 @@ def fetch_live_economic_calendar():
     return cached_news_events
 
 def check_news_window_for_pair(pair_info):
-    """
-    1. अगर अगले 15 मिनट में या पिछले 5 मिनट में CPI/NFP जैसी High-Impact न्यूज़ है,
-       तो गलत स्पाइक से बचाने के लिए ट्रेड रोकता है और Telegram पर अलर्ट भेजता है।
-    """
     global announced_news_ids
     events = fetch_live_economic_calendar()
     now_utc = get_utc_now()
-    pair_Fitting_ccy = pair_info.get("currencies", ["USD"])
+    pair_ccy = pair_info.get("currencies", ["USD"])
 
     for ev in events:
         if ev["impact"] != "High":
             continue
-        if ev["country"] not in pair_Fitting_ccy and "USD" not in ev["country"]:
+        if ev["country"] not in pair_ccy and "USD" not in ev["country"]:
             continue
 
         diff_mins = (ev["time_utc"] - now_utc).total_seconds() / 60.0
-        # न्यूज़ आने से 15 मिनट पहले से लेकर 6 मिनट बाद तक Pre-News Shield
         if -6.0 <= diff_mins <= 15.0:
             if ev["id"] not in announced_news_ids:
                 announced_news_ids.add(ev["id"])
@@ -317,17 +320,13 @@ def check_news_window_for_pair(pair_info):
                     f"🚨 <b>HIGH-IMPACT NEWS ALERT ({ev['country']})</b> 🚨\n\n"
                     f"📰 <b>Event:</b> <b>{ev['title']}</b>\n"
                     f"⏰ <b>Time:</b> {ist_time}\n"
-                    f"🛡️ <b>Action:</b> न्यूज़ के शुरुआती व्हिपसॉ (Whipsaw) से बचने के लिए 15 मिनट का News Shield एक्टिव है। मार्केट की दिशा साफ होते ही ट्रेड लिया जाएगा।"
+                    f"🛡️ <b>Action:</b> न्यूज़ स्पाइक से बचाव के लिए 15 मिनट का News Shield एक्टिव है।"
                 )
             return False, f"News Pause: {ev['title']}"
 
     return True, "Clear"
 
 def detect_live_market_crash_or_shock(df_5m):
-    """
-    अगर CPI/News या किसी बड़े फंड की वजह से अचानक बहुत बड़ी क्रैश या पंप कैंडल बनी है,
-    तो यह तुरंत उस Shock Direction को पकड़ लेता है ताकि क्रैश के खिलाफ कभी BUY न हो!
-    """
     if df_5m is None or len(df_5m) < 20:
         return "NORMAL", None
 
@@ -336,16 +335,14 @@ def detect_live_market_crash_or_shock(df_5m):
     if np.isnan(atr_5m) or atr_5m <= 0:
         return "NORMAL", None
 
-    # पिछले 15-20 मिनट में कुल मूवमेंट और सबसे बड़ी कैंडल जांचें
     max_bar_rng = float(recent_4["Range"].max())
     net_move    = float(recent_4.iloc[-1]["Close"]) - float(recent_4.iloc[0]["Open"])
 
-    # अगर कोई कैंडल 2.1x ATR से बड़ी है या 3 कैंडल्स में 2.8x ATR का एकतरफा क्रैश/पंप हुआ है
     if max_bar_rng >= (atr_5m * 2.1) or abs(net_move) >= (atr_5m * 2.8):
         if net_move < 0:
-            return "BEARISH_CRASH", "Heavy Sell-Off / News Crash Active (BUY Blocked)"
+            return "BEARISH_CRASH", "Heavy Sell-Off Active"
         elif net_move > 0:
-            return "BULLISH_SURGE", "Heavy Bullish Surge Active (SELL Blocked)"
+            return "BULLISH_SURGE", "Heavy Bullish Surge Active"
 
     return "NORMAL", None
 
@@ -465,17 +462,8 @@ def get_clean_spot_data(pair_name, info):
 # 4. SMART TARGET (FRONT-RUN TP) & ANTI-STOP-HUNT BUFFERED SL ENGINE
 # =====================================================================
 def calculate_smart_sl_and_easy_tp(df_5m, df_15m, info, direction, live_spot, raw_structure_sl, atr_5m):
-    """
-    1. STOP-LOSS (Anti-Stop-Hunt Buffer):
-       SL को ठीक कैंडल के Low/High पर रखने के बजाय उसके पीछे 0.55x ATR का अतिरिक्त
-       सुरक्षा कुशन रखता है, ताकि मार्केट की विक (Wick) SL को छुए बिना पहले ही घूम जाए।
-    2. TARGET (Easy-Reach Front-Run TP):
-       चार्ट के अगले Resistance/Support Wall को देखता है और टारगेट को उस दीवार से
-       15%-18% पहले (1.35R - 1.50R में) रखता है ताकि कैंडल 80% से वापस न लौटे और 100% हिट करे!
-    """
     dec = info["decimals"]
 
-    # 1. ANTI-STOP-HUNT BUFFERED SL CALCULATION
     extra_wick_cushion = atr_5m * 0.30
     if direction == "BUY":
         buffered_sl = raw_structure_sl - extra_wick_cushion
@@ -487,17 +475,14 @@ def calculate_smart_sl_and_easy_tp(df_5m, df_15m, info, direction, live_spot, ra
     max_sl      = max(atr_5m * 2.35, info.get("max_sl_dist", atr_5m * 2.35))
     sl_dist     = round(max(min_sl, min(raw_sl_dist, max_sl)), dec)
 
-    # 2. EASY-REACH FRONT-RUN TARGET CALCULATION
-    # पिछले 40 M5 कैंडल्स में असली Resistance/Support रुकावट देखें
-    recent_m5 = df_5m.iloc[-42:-2]
+    recent_m5       = df_5m.iloc[-42:-2]
     major_high_wall = float(recent_m5["High"].max())
     major_low_wall  = float(recent_m5["Low"].min())
 
-    default_tp_dist = sl_dist * BASE_EASY_RR_RATIO  # 1.45R Base Easy Target
+    default_tp_dist = sl_dist * BASE_EASY_RR_RATIO
 
     if direction == "BUY":
         room_to_wall = major_high_wall - live_spot
-        # अगर ऊपर Resistance की दीवार पास है, तो दीवार के 85% पर ही (Front-Run) टारगेट रखो!
         if (sl_dist * 1.20) <= room_to_wall <= default_tp_dist:
             tp_dist = round(room_to_wall * 0.88, dec)
         else:
@@ -510,7 +495,6 @@ def calculate_smart_sl_and_easy_tp(df_5m, df_15m, info, direction, live_spot, ra
         target_level = round(live_spot + tp_dist, dec)
     else:
         room_to_wall = live_spot - major_low_wall
-        # अगर नीचे Support की दीवार पास है, तो दीवार से थोड़ा पहले (88% दूरी पर) टारगेट रखो!
         if (sl_dist * 1.20) <= room_to_wall <= default_tp_dist:
             tp_dist = round(room_to_wall * 0.88, dec)
         else:
@@ -647,7 +631,6 @@ def detect_reversal_neckline_breakout(df_5m, shock_state):
     if total_rng < (atr_5m * 2.4):
         return None
 
-    # 1. BULLISH REVERSAL (Blocked if market is in an active Bearish News Crash)
     if shock_state != "BEARISH_CRASH" and 4 <= (n_len - min_idx) <= 23:
         post_head_highs = highs[min_idx + 1:]
         post_head_lows  = lows[min_idx + 2:] if (min_idx + 2) < n_len else lows[min_idx + 1:]
@@ -666,11 +649,11 @@ def detect_reversal_neckline_breakout(df_5m, shock_state):
                     "direction": "BUY",
                     "action": "BUY (LONG) 🟢",
                     "struct_id": f"IHNS_BUY_{times[min_idx]}",
+                    "short_tag": "Inverse H&S Breakout",
                     "setup_text": f"Inverse H&S / Bottom Reversal Neckline Breakout ({neckline_res:.2f}) | RSI: {rsi:.0f}",
                     "sl_raw": sl_level
                 }
 
-    # 2. BEARISH REVERSAL (Blocked if market is in an active Bullish News Surge)
     if shock_state != "BULLISH_SURGE" and 4 <= (n_len - max_idx) <= 23:
         post_head_lows  = lows[max_idx + 1:]
         post_head_highs = highs[max_idx + 2:] if (max_idx + 2) < n_len else highs[max_idx + 1:]
@@ -689,6 +672,7 @@ def detect_reversal_neckline_breakout(df_5m, shock_state):
                     "direction": "SELL",
                     "action": "SELL (SHORT) 🔴",
                     "struct_id": f"HNS_SELL_{times[max_idx]}",
+                    "short_tag": "Double Top / H&S Breakdown",
                     "setup_text": f"H&S / Top Reversal Neckline Breakdown ({neckline_sup:.2f}) | RSI: {rsi:.0f}",
                     "sl_raw": sl_level
                 }
@@ -711,21 +695,19 @@ def check_usd_exposure_filter(pair_info):
 def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
     now_utc = get_utc_now()
     if now_utc < pair_cooldown_until.get(pair_name, datetime.min.replace(tzinfo=timezone.utc)):
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
     session_ok, _ = get_trading_session(pair_info.get("is_crypto", False))
     if not session_ok:
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
-    # 1. LIVE ECONOMIC NEWS WINDOW CHECK (CPI / NFP / FOMC)
     news_ok, _ = check_news_window_for_pair(pair_info)
     if not news_ok:
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
     if not check_usd_exposure_filter(pair_info):
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
-    # 2. LIVE MARKET CRASH / NEWS SHOCK DETECTOR
     shock_state, _ = detect_live_market_crash_or_shock(df_5m)
 
     c0 = df_5m.iloc[-2]
@@ -748,7 +730,7 @@ def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
     u_wick     = float(c0["Upper_Wick"])
 
     if np.isnan(atr_5m) or atr_5m <= 0:
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
     fib = detect_fibonacci_swing_structure(df_5m, lookback=38)
 
@@ -761,7 +743,7 @@ def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
                 fib = {"swing_id": rev["struct_id"], "fib_500": price, "fib_618": price, "fib_786": rev["sl_raw"]}
             else:
                 fib["swing_id"] = rev["struct_id"]
-            return rev["action"], r_dir, rev["setup_text"], rev["sl_raw"], fib
+            return rev["action"], r_dir, rev["setup_text"], rev["short_tag"], rev["sl_raw"], fib
 
     m15_c     = df_15m.iloc[-2]
     m15_close = float(m15_c["Close"])
@@ -783,7 +765,7 @@ def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
                 if in_fib_zone and ema_support and green_trigger and (38.0 <= rsi <= 66.0):
                     sl_raw = min(recent_3_low, fib["fib_786"]) - (atr_5m * SL_STOP_HUNT_BUFFER_ATR)
                     setup_text = f"Fibonacci Golden Zone (0.50-0.618) + EMA 9/20 Bounce | RSI: {rsi:.0f}"
-                    return "BUY (LONG) 🟢", "BUY", setup_text, sl_raw, fib
+                    return "BUY (LONG) 🟢", "BUY", setup_text, "Fib 0.618 + EMA Bounce", sl_raw, fib
 
             if htf_bearish and fib["type"] == "BEARISH_SWING" and now_utc >= sl_direction_lock[pair_name]["SELL"]:
                 recent_3_high = max(high_0, float(c1["High"]), float(c2["High"]))
@@ -793,7 +775,7 @@ def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
                 if in_fib_zone and ema_resist and red_trigger and (34.0 <= rsi <= 62.0):
                     sl_raw = max(recent_3_high, fib["fib_786"]) + (atr_5m * SL_STOP_HUNT_BUFFER_ATR)
                     setup_text = f"Fibonacci Golden Zone (0.50-0.618) + EMA 9/20 Reject | RSI: {rsi:.0f}"
-                    return "SELL (SHORT) 🔴", "SELL", setup_text, sl_raw, fib
+                    return "SELL (SHORT) 🔴", "SELL", setup_text, "Fib 0.618 + EMA Reject", sl_raw, fib
 
     # SETUP C: 10-BAR STOP-HUNT LIQUIDITY SWEEP & RECLAIM
     pool_10   = df_5m.iloc[-13:-3]
@@ -811,7 +793,7 @@ def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
                 fib = {"swing_id": sweep_id, "fib_500": pool_low, "fib_618": pool_low, "fib_786": sl_raw}
             else:
                 fib["swing_id"] = sweep_id
-            return "BUY (LONG) 🟢", "BUY", setup_text, sl_raw, fib
+            return "BUY (LONG) 🟢", "BUY", setup_text, "Liquidity Sweep Reclaim", sl_raw, fib
 
         swept_above  = (high_0 > pool_high and price < pool_high) or (float(c1["High"]) > pool_high and price < float(c1["Low"]) and price < pool_high)
         bear_reclaim = (price < open_0) and (price < ema9) and (close_pos <= 0.38) and (u_wick >= float(c0["Range"]) * 0.28 or disp_power >= 0.95)
@@ -822,9 +804,9 @@ def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
                 fib = {"swing_id": sweep_id, "fib_500": pool_high, "fib_618": pool_high, "fib_786": sl_raw}
             else:
                 fib["swing_id"] = sweep_id
-            return "SELL (SHORT) 🔴", "SELL", setup_text, sl_raw, fib
+            return "SELL (SHORT) 🔴", "SELL", setup_text, "Resistance Sweep Reject", sl_raw, fib
 
-    # SETUP D: 6-BAR CONSOLIDATION BOX BREAKOUT (Also catches Post-News Breakouts!)
+    # SETUP D: 6-BAR CONSOLIDATION BOX BREAKOUT
     box_6    = df_5m.iloc[-8:-2]
     box_high = float(box_6["High"].max())
     box_low  = float(box_6["Low"].min())
@@ -840,7 +822,7 @@ def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
                     fib = {"swing_id": box_id, "fib_500": box_high, "fib_618": box_low, "fib_786": sl_raw}
                 else:
                     fib["swing_id"] = box_id
-                return "BUY (LONG) 🟢", "BUY", setup_text, sl_raw, fib
+                return "BUY (LONG) 🟢", "BUY", setup_text, "Range Box Breakout", sl_raw, fib
 
         if htf_bearish and price < box_low and price < open_0 and ema9 < ema20 and body_ratio >= 0.55 and close_pos <= 0.32 and disp_power >= 1.15 and (28.0 <= rsi <= 55.0):
             if now_utc >= sl_direction_lock[pair_name]["SELL"]:
@@ -850,131 +832,273 @@ def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
                     fib = {"swing_id": box_id, "fib_500": box_low, "fib_618": box_high, "fib_786": sl_raw}
                 else:
                     fib["swing_id"] = box_id
-                return "SELL (SHORT) 🔴", "SELL", setup_text, sl_raw, fib
+                return "SELL (SHORT) 🔴", "SELL", setup_text, "Support Box Breakdown", sl_raw, fib
 
-    return None, None, None, None, None
+    return None, None, None, None, None, None
 
 # =====================================================================
-# 7. CHART GENERATOR WITH EASY TARGET & PROTECTED SL VISUALS
+# 7. MT5 MOBILE-STYLE CHART GENERATOR (EXACT SCREENSHOT VISUALS)
 # =====================================================================
-def generate_fibonacci_ema_chart(df_5m, pair_name, direction, entry_p, sl_p, tp_p, half_p, fib, decimals, lot_size, risk_usd, reward_usd, rr_ratio):
-    if not CHART_AVAILABLE:
-        return None
+def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p, near_tp_p, short_tag, lot_size):
+    """
+    बिल्कुल आपके MT5 मोबाइल स्क्रीनशॉट जैसा चार्ट बनाता है:
+    - ऊपर SELL / Lot / BUY का MT5 टॉप बार और Symbol • M5 हेडर
+    - सफेद ग्रिड बैकग्राउंड पर हरी/लाल कैंडल्स
+    - STOP-LOSS (SL) का लाल शेडेड ज़ोन और बोल्ड लेबल
+    - पीली ENTRY लाइन और कारण (जैसे Support Breakdown / Fib Bounce)
+    - TARGET 1 (Easy TP) | TARGET 2 का हरा शेडेड ज़ोन + दिशा वाला तीर (Arrow)
+    """
     try:
-        sub = df_5m.iloc[-45:-1].copy()
-        if sub.empty or len(sub) < 20:
+        sub = df_5m.iloc[-44:].copy()
+        if sub.empty or len(sub) < 18:
             return None
 
-        fig, ax = plt.subplots(figsize=(11.5, 6.5), dpi=130)
-        fig.patch.set_facecolor("#f3f4f6")
-        ax.set_facecolor("#f3f4f6")
+        dec      = info["decimals"]
+        mt5_sym  = info["mt5_name"]
+        sub_Desc = info.get("sub_title", "Spot vs US Dollar")
+
+        fig = plt.figure(figsize=(6.8, 10.2), dpi=130, facecolor="#ffffff")
+        ax  = fig.add_axes([0.04, 0.08, 0.80, 0.78], facecolor="#ffffff")
 
         n_bars = len(sub)
-        x_vals = np.arange(n_bars)
+        zone_start_idx = max(10, int(n_bars * 0.36))
+        right_edge_idx = n_bars + 4
 
-        ax.plot(x_vals, sub["EMA9"].values, color="#16a34a", linewidth=1.5, label="EMA 9 (Green)", zorder=4)
-        ax.plot(x_vals, sub["EMA20"].values, color="#dc2626", linewidth=1.5, label="EMA 20 (Red)", zorder=4)
+        # 1. MT5 White Dashed Grid
+        ax.grid(True, linestyle="--", linewidth=0.75, color="#d1d5db", alpha=0.85, zorder=1)
+        for spine in ["top", "left"]:
+            ax.spines[spine].set_visible(False)
+        ax.spines["right"].set_color("#9ca3af")
+        ax.spines["bottom"].set_color("#9ca3af")
 
-        if fib is not None and "fib_500" in fib and "fib_618" in fib:
-            gold_top = max(fib["fib_500"], fib["fib_618"])
-            gold_bot = min(fib["fib_500"], fib["fib_618"])
-            if abs(gold_top - gold_bot) > 0:
-                ax.add_patch(mpatches.Rectangle(
-                    (0, gold_bot), n_bars + 14, gold_top - gold_bot,
-                    facecolor="#fbbf24", alpha=0.20, edgecolor="#d97706", linestyle="--", linewidth=1.0, zorder=1
-                ))
-
+        # 2. Plot MT5 Style Candlesticks
         for idx in range(n_bars):
             row = sub.iloc[idx]
             o, h, l, c = float(row["Open"]), float(row["High"]), float(row["Low"]), float(row["Close"])
-            color = "#16a34a" if c >= o else "#dc2626"
-            ax.plot([idx, idx], [l, h], color=color, linewidth=1.1, zorder=3)
+            is_bull = c >= o
+            wick_col = "#0d9488" if is_bull else "#e11d48"
+            body_col = "#10b981" if is_bull else "#ef4444"
+
+            ax.plot([idx, idx], [l, h], color=wick_col, linewidth=1.15, zorder=3)
             body_low = min(o, c)
-            body_h = max(abs(c - o), (h - l) * 0.04, 1e-6)
-            ax.add_patch(mpatches.Rectangle((idx - 0.32, body_low), 0.64, body_h, facecolor=color, edgecolor=color, linewidth=0.8, zorder=3))
+            body_h   = max(abs(c - o), (h - l) * 0.04, 1e-6)
+            ax.add_patch(mpatches.Rectangle(
+                (idx - 0.33, body_low), 0.66, body_h,
+                facecolor=body_col, edgecolor=wick_col, linewidth=0.6, zorder=3
+            ))
 
-        box_start_x = n_bars - 1
-        box_width = 15
-        box_center_x = box_start_x + (box_width / 2.0)
+        # 3. Red STOP-LOSS Zone Box + Top Line
+        sl_box_low  = min(entry_p, sl_p)
+        sl_box_high = max(entry_p, sl_p)
+        sl_band_h   = abs(sl_p - entry_p) * 0.35
+        if direction == "SELL":
+            red_rect_y = sl_p - sl_band_h
+            red_rect_h = sl_band_h
+        else:
+            red_rect_y = sl_p
+            red_rect_h = sl_band_h
 
-        ax.add_patch(mpatches.Rectangle((box_start_x, min(entry_p, tp_p)), box_width, abs(tp_p - entry_p), facecolor="#22c55e", alpha=0.28, edgecolor="#15803d", linewidth=1.2, zorder=4))
-        ax.add_patch(mpatches.Rectangle((box_start_x, min(entry_p, sl_p)), box_width, abs(entry_p - sl_p), facecolor="#ef4444", alpha=0.28, edgecolor="#b91c1c", linewidth=1.2, zorder=4))
+        ax.add_patch(mpatches.Rectangle(
+            (zone_start_idx, red_rect_y), right_edge_idx - zone_start_idx, red_rect_h,
+            facecolor="#ef4444", alpha=0.23, edgecolor="#b91c1c", linewidth=1.2, zorder=2
+        ))
+        ax.plot([zone_start_idx, right_edge_idx], [sl_p, sl_p], color="#991b1b", linewidth=1.6, zorder=4)
 
-        ax.plot([box_start_x, box_start_x + box_width], [entry_p, entry_p], color="#1f2937", linewidth=1.6, zorder=5)
-        ax.plot([box_start_x, box_start_x + box_width], [half_p, half_p], color="#0284c7", linestyle="--", linewidth=1.1, alpha=0.85, zorder=5)
+        # 4. Green TARGET Zone Box (Entry to TP) + Arrow
+        tp_box_low  = min(entry_p, tp_p)
+        tp_box_high = max(entry_p, tp_p)
+        ax.add_patch(mpatches.Rectangle(
+            (zone_start_idx + 4, tp_box_low), (right_edge_idx - zone_start_idx - 4), (tp_box_high - tp_box_low),
+            facecolor="#22c55e", alpha=0.22, edgecolor="#16a34a", linewidth=1.1, zorder=2
+        ))
 
-        entry_s, sl_s, tp_s, half_s = format_price(entry_p, decimals), format_price(sl_p, decimals), format_price(tp_p, decimals), format_price(half_p, decimals)
+        # Directional Green Arrow inside Target Zone
+        arrow_x = n_bars + 1.2
+        arrow_start_y = entry_p + (tp_p - entry_p) * 0.12
+        arrow_end_y   = entry_p + (tp_p - entry_p) * 0.88
+        ax.annotate(
+            "", xy=(arrow_x, arrow_end_y), xytext=(arrow_x, arrow_start_y),
+            arrowprops=dict(arrowstyle="->,head_width=0.55,head_length=0.55", color="#15803d", lw=2.5),
+            zorder=6
+        )
 
-        ax.text(box_center_x, tp_p, f" Easy Target (1:{rr_ratio}): {tp_s} (+${reward_usd:.0f}) ", color="white", fontweight="bold", fontsize=8.5, ha="center", va="bottom" if direction == "BUY" else "top", bbox=dict(boxstyle="round,pad=0.35", facecolor="#16a34a", edgecolor="none"), zorder=7)
-        ax.text(box_center_x, sl_p, f" Buffered Safe SL: {sl_s} (-${risk_usd:.0f}) ", color="white", fontweight="bold", fontsize=8.5, ha="center", va="top" if direction == "BUY" else "bottom", bbox=dict(boxstyle="round,pad=0.35", facecolor="#dc2626", edgecolor="none"), zorder=7)
+        # 5. Yellow Horizontal ENTRY Line across chart
+        ax.axhline(entry_p, color="#eab308", linewidth=2.0, zorder=5)
+        ax.axhline(entry_p, color="#0d9488", linewidth=0.8, linestyle="-", alpha=0.6, zorder=4)
 
-        pos_title = "PRO LONG" if direction == "BUY" else "PRO SHORT"
-        ax.text(box_center_x, entry_p, f" {pos_title} @ {entry_s} | Lot: {lot_size:.2f}\n 0.65R Safe Lock: {half_s} ", color="white", fontweight="bold", fontsize=8.2, ha="center", va="center", bbox=dict(boxstyle="round,pad=0.38", facecolor="#1f2937", edgecolor="white", alpha=0.92), zorder=8)
+        # 6. Bold Text Callout Labels (Matching Screenshot Style)
+        entry_s   = format_price(entry_p, dec)
+        sl_s      = format_price(sl_p, dec)
+        near_tp_s = format_price(near_tp_p, dec)
+        tp_s      = format_price(tp_p, dec)
 
+        mid_zone_x = (zone_start_idx + right_edge_idx) / 2.0
+
+        # STOP-LOSS Label
+        sl_va = "bottom" if direction == "SELL" else "top"
+        sl_offset = abs(sl_p - entry_p) * (0.08 if direction == "SELL" else -0.08)
+        ax.text(
+            mid_zone_x, sl_p + sl_offset,
+            f"STOP-LOSS (SL): {sl_s} ({short_tag})",
+            fontsize=8.8, fontweight="bold", color="#111827", ha="center", va=sl_va,
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="#fecaca", edgecolor="#f87171", alpha=0.92),
+            zorder=8
+        )
+
+        # ENTRY Label
+        entry_va = "bottom" if direction == "SELL" else "top"
+        entry_offset = abs(tp_p - entry_p) * (0.06 if direction == "SELL" else -0.06)
+        ax.text(
+            right_edge_idx - 0.5, entry_p + entry_offset,
+            f"{direction} ENTRY: {entry_s}\n({short_tag})",
+            fontsize=8.6, fontweight="bold", color="#111827", ha="right", va=entry_va,
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="#fef08a", edgecolor="#eab308", alpha=0.94),
+            zorder=8
+        )
+
+        # TARGET 1 & TARGET 2 Label
+        tp_va = "top" if direction == "SELL" else "bottom"
+        tp_offset = abs(tp_p - entry_p) * (-0.06 if direction == "SELL" else 0.06)
+        ax.text(
+            mid_zone_x + 1.0, tp_p + tp_offset,
+            f"TARGET 1 (Easy TP): {near_tp_s} | TARGET 2: {tp_s}",
+            fontsize=8.6, fontweight="bold", color="#111827", ha="center", va=tp_va,
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="#bbf7d0", edgecolor="#22c55e", alpha=0.94),
+            zorder=8
+        )
+
+        # 7. Right Price Axis & Current Price Green Tag
         ax.yaxis.tick_right()
-        right_edge_x = box_start_x + box_width + 4.5
-        ax.set_xlim(-1, right_edge_x)
+        ax.tick_params(axis="y", labelsize=9.5, colors="#111827")
+        ax.set_xlim(-1, right_edge_idx)
+
         all_y = list(sub["High"].values) + list(sub["Low"].values) + [tp_p, sl_p, entry_p]
         y_min, y_max = min(all_y), max(all_y)
-        y_pad = (y_max - y_min) * 0.14
+        y_pad = (y_max - y_min) * 0.22
         ax.set_ylim(y_min - y_pad, y_max + y_pad)
 
-        ax.set_title(f"{pair_name} — Easy-Reach Target & Buffered SL Setup ({lot_size:.2f} Lot)", loc="left", fontsize=11, fontweight="bold", color="#111827", pad=10)
-        ax.legend(loc="upper left", fontsize=8)
-        ax.grid(True, linestyle="--", alpha=0.30, color="#9ca3af")
+        # Right-axis Live Price Badge
+        ax.text(
+            right_edge_idx + 0.3, entry_p,
+            f" {entry_s} \n LIVE M5 ",
+            fontsize=8.5, fontweight="bold", color="white", va="center", ha="left",
+            bbox=dict(boxstyle="square,pad=0.3", facecolor="#0d9488", edgecolor="none"),
+            clip_on=False, zorder=9
+        )
+
+        # Bottom Time Axis Labels (IST)
+        tick_indices = [2, int(n_bars * 0.45), n_bars - 2]
+        tick_labels  = []
+        for ti in tick_indices:
+            ts_ist = to_utc_timestamp(sub.index[ti]) + timedelta(hours=5, minutes=30)
+            tick_labels.append(ts_ist.strftime("%d %b %H:%M"))
+        ax.set_xticks(tick_indices)
+        ax.set_xticklabels(tick_labels, fontsize=9, color="#374151")
+
+        # Top-Left MT5 Symbol Header inside Chart
+        ax.text(
+            0.02, 0.97, f"{mt5_sym} • M5",
+            transform=ax.transAxes, fontsize=12, fontweight="bold", color="#0284c7", va="top"
+        )
+        ax.text(
+            0.02, 0.935, sub_Desc,
+            transform=ax.transAxes, fontsize=9.5, color="#1f2937", va="top"
+        )
+
+        # Top MT5 SELL / Lot / BUY Header Banner
+        header_ax = fig.add_axes([0.04, 0.88, 0.92, 0.08], facecolor="#ffffff")
+        header_ax.axis("off")
+        header_ax.add_patch(mpatches.Rectangle((0.0, 0.1), 0.32, 0.8, facecolor="#2563eb", edgecolor="none"))
+        header_ax.text(0.16, 0.5, f"SELL\n{entry_s}", color="white", fontweight="bold", fontsize=11, ha="center", va="center")
+
+        header_ax.add_patch(mpatches.Rectangle((0.33, 0.1), 0.34, 0.8, facecolor="#f9fafb", edgecolor="#d1d5db"))
+        header_ax.text(0.50, 0.5, f"Lot: {lot_size:.2f}", color="#111827", fontweight="bold", fontsize=11, ha="center", va="center")
+
+        header_ax.add_patch(mpatches.Rectangle((0.68, 0.1), 0.32, 0.8, facecolor="#ef4444", edgecolor="none"))
+        header_ax.text(0.84, 0.5, f"BUY\n{entry_s}", color="white", fontweight="bold", fontsize=11, ha="center", va="center")
 
         buf = io.BytesIO()
-        plt.tight_layout()
-        plt.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
+        plt.savefig(buf, format="png", dpi=130, facecolor="#ffffff")
         plt.close(fig)
         buf.seek(0)
         return buf
     except Exception as e:
-        print(f"Chart Error: {e}")
+        print(f"MT5 Chart Generation Error: {e}")
         return None
 
 def send_telegram_signal_with_chart(caption_html, chart_buf, target_chat_id=CHAT_ID):
+    """
+    गारंटीड फोटो सेंडर: पहले फोटो + कैप्शन भेजता है;
+    अगर कैप्शन बड़ा हो तो पहले MT5 चार्ट फोटो और तुरंत बाद पूरा मैसेज भेजता है।
+    """
     if chart_buf is not None:
+        photo_bytes = chart_buf.getvalue()
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
         try:
-            if len(caption_html) <= 1020:
-                files = {"photo": ("setup.png", chart_buf, "image/png")}
-                data = {"chat_id": target_chat_id, "caption": caption_html, "parse_mode": "HTML"}
-                res = requests.post(url, data=data, files=files, timeout=15)
-                if res.status_code == 200:
+            if len(caption_html) <= 950:
+                files = {"photo": ("mt5_trade_setup.png", photo_bytes, "image/png")}
+                data  = {"chat_id": target_chat_id, "caption": caption_html, "parse_mode": "HTML"}
+                res   = requests.post(url, data=data, files=files, timeout=20)
+                if res.status_code == 200 and res.json().get("ok"):
                     return
-            else:
-                files = {"photo": ("setup.png", chart_buf, "image/png")}
-                data = {"chat_id": target_chat_id, "caption": "📊 <b>Live Price-Action & Fibonacci Chart</b>", "parse_mode": "HTML"}
-                requests.post(url, data=data, files=files, timeout=15)
-                send_telegram_message(caption_html, target_chat_id)
-                return
+
+            # Fallback: Send Photo First, then Detailed Text Message
+            files = {"photo": ("mt5_trade_setup.png", photo_bytes, "image/png")}
+            data  = {"chat_id": target_chat_id, "caption": "📊 <b>MT5 M5 Marked Trade Setup (Entry / SL / Target)</b>", "parse_mode": "HTML"}
+            requests.post(url, data=data, files=files, timeout=20)
+            send_telegram_message(caption_html, target_chat_id)
+            return
         except Exception as e:
-            print(f"Photo Send Error: {e}")
+            print(f"Telegram Photo Send Error: {e}")
+
     send_telegram_message(caption_html, target_chat_id)
 
 # =====================================================================
-# 8. ACTIVE TRADE MANAGEMENT (0.65R LOCK + 82% TP BOOK ALERT)
+# 8. ACTIVE TRADE MANAGEMENT & /CHART + /STATUS COMMANDS
 # =====================================================================
+def send_instant_preview_chart(pair_key="XAU/USD (GOLD)"):
+    """Telegram पर /chart भेजते ही तुरंत लाइव MT5 मार्क किया हुआ चार्ट बनाकर भेजता है"""
+    info = FOREX_PAIRS.get(pair_key, FOREX_PAIRS["XAU/USD (GOLD)"])
+    df_15m, df_5m, live_spot, src = get_clean_spot_data(pair_key, info)
+    if df_5m is None or live_spot is None:
+        send_telegram_message("⚠️ चार्ट डेटा लोड हो रहा है, कृपया 10 सेकंड बाद ट्राय करें।")
+        return
+
+    df_5m  = calculate_chart_indicators(df_5m)
+    df_15m = calculate_chart_indicators(df_15m)
+    c0     = df_5m.iloc[-2]
+    atr_5m = float(c0["ATR"])
+    ema9   = float(c0["EMA9"])
+    ema20  = float(c0["EMA20"])
+
+    direction = "BUY" if ema9 >= ema20 else "SELL"
+    raw_sl    = (live_spot - atr_5m * 1.4) if direction == "BUY" else (live_spot + atr_5m * 1.4)
+    sl_level, sl_dist, lock_level, near_tp_lvl, target_level, tp_dist, actual_rr = calculate_smart_sl_and_easy_tp(
+        df_5m, df_15m, info, direction, live_spot, raw_sl, atr_5m
+    )
+    lot_size = calculate_exact_mt5_lot(pair_key, info, sl_dist, RISK_PER_TRADE_USD)
+
+    chart_buf = generate_mt5_mobile_style_chart(
+        df_5m, info, direction, live_spot, sl_level, target_level, near_tp_lvl, "Live Structure Preview", lot_size
+    )
+    caption = (
+        f"📸 <b>MT5 LIVE CHART PREVIEW ({info['mt5_name']})</b>\n\n"
+        f"📍 <b>Live Spot:</b> <code>{format_price(live_spot, info['decimals'])}</code>\n"
+        f"🛑 <b>Projected SL Zone:</b> <code>{format_price(sl_level, info['decimals'])}</code>\n"
+        f"🎯 <b>Easy TP 1:</b> <code>{format_price(near_tp_lvl, info['decimals'])}</code> | <b>TP 2:</b> <code>{format_price(target_level, info['decimals'])}</code>"
+    )
+    send_telegram_signal_with_chart(caption, chart_buf)
+
 def send_live_status_summary():
     forex_open = is_forex_market_open()
-    market_state = "🟢 ALL 4 SETUPS + NEWS RADAR ACTIVE" if forex_open else "🟡 WEEKEND: BTC/USD ACTIVE"
+    market_state = "🟢 ALL 4 SETUPS + MT5 CHART ACTIVE" if forex_open else "🟡 WEEKEND: BTC/USD ACTIVE"
     _, session_name = get_trading_session(True)
 
-    events = fetch_live_economic_calendar()
-    now_utc = get_utc_now()
-    upcoming_str = "None Today"
-    for ev in events:
-        diff_hr = (ev["time_utc"] - now_utc).total_seconds() / 3600.0
-        if -0.5 <= diff_hr <= 12.0:
-            ist_t = (ev["time_utc"] + timedelta(hours=5, minutes=30)).strftime("%I:%M %p")
-            upcoming_str = f"{ev['country']} {ev['title']} ({ist_t} IST)"
-            break
-
     report = (
-        f"📐 <b>PRO PRICE-ACTION & NEWS ENGINE STATUS</b> 📐\n\n"
+        f"📐 <b>MT5 VISUAL & PRICE-ACTION ENGINE STATUS</b> 📐\n\n"
         f"📢 <b>Market:</b> {market_state} ({session_name})\n"
-        f"📰 <b>Next Major News:</b> <b>{upcoming_str}</b>\n\n"
+        f"🖼️ <b>Chart Image Mode:</b> <b>ENABLED (MT5 Mobile Style)</b>\n"
+        f"💡 <i>Tip: किसी भी समय लाइव फोटो देखने के लिए</i> <code>/chart</code> <i>या</i> <code>/btc</code> <i>भेजें।</i>\n\n"
     )
 
     for name, info in FOREX_PAIRS.items():
@@ -983,11 +1107,10 @@ def send_live_status_summary():
             if df_5m is None or df_15m is None:
                 continue
             df_5m = calculate_chart_indicators(df_5m)
-            shock_state, _ = detect_live_market_crash_or_shock(df_5m)
             c = df_5m.iloc[-1]
             rsi = float(c["RSI"])
             p_str = format_price(live_spot, info["decimals"])
-            report += f"🔹 <b>{name}:</b> <code>{p_str}</code> | RSI: {rsi:.0f} | {shock_state}\n"
+            report += f"🔹 <b>{name}:</b> <code>{p_str}</code> | RSI: {rsi:.0f}\n"
         except Exception:
             pass
 
@@ -1010,6 +1133,10 @@ def check_telegram_commands():
                     continue
                 if msg_text in ["/status", "status", "/start", "start"]:
                     send_live_status_summary()
+                elif msg_text in ["/chart", "chart", "/gold", "gold"]:
+                    send_instant_preview_chart("XAU/USD (GOLD)")
+                elif msg_text in ["/btc", "btc"]:
+                    send_instant_preview_chart("BTC/USD (BITCOIN)")
     except Exception:
         pass
 
@@ -1030,7 +1157,6 @@ def manage_open_trades(pair_name, candle_time, live_spot, latest_5m, decimals):
             sl_str     = format_price(trade["sl"], decimals)
             price_str  = format_price(live_spot, decimals)
 
-            # 1. 0.65R SAFE BREAKEVEN LOCK (जल्दी SL को Entry पर सुरक्षित करना)
             if not trade["trailed_to_cost"]:
                 half_reached = False
                 if trade["direction"] == "BUY" and current_high >= trade["half_target"]:
@@ -1050,7 +1176,6 @@ def manage_open_trades(pair_name, candle_time, live_spot, latest_5m, decimals):
                         f"📢 <b>Action:</b> 50% लॉट बुक करें (<b>+${half_prof:.0f}</b>) और बचे हुए लॉट का SL <b>Entry ({entry_str})</b> पर लगा दें।"
                     )
 
-            # 2. 82% TARGET ZONE REACHED ALERT (ताकि 80-90% से कैंडल वापस मुड़ने पर प्रॉफिट न छूटे!)
             if not trade.get("near_tp_alerted", False):
                 near_hit = False
                 if trade["direction"] == "BUY" and current_high >= trade["near_target"] and current_high < trade["target"]:
@@ -1062,13 +1187,12 @@ def manage_open_trades(pair_name, candle_time, live_spot, latest_5m, decimals):
                     trade["near_tp_alerted"] = True
                     near_prof = round(trade["expected_profit"] * 0.85, 1)
                     send_telegram_message(
-                        f"⚡ <b>85% TARGET ZONE REACHED — BOOK / LOCK PROFIT NOW</b> ⚡\n\n"
+                        f"⚡ <b>TARGET 1 (Easy TP) HIT — BOOK / LOCK PROFIT NOW</b> ⚡\n\n"
                         f"🌍 <b>Asset:</b> {trade['pair']} (<b>{trade['lot_size']} Lot</b>)\n"
-                        f"📍 <b>Live Price:</b> {price_str}  |  <b>Full Target:</b> {target_str}\n"
-                        f"💰 <b>Action:</b> कीमत टारगेट के 85% हिस्से तक पहुँच चुकी है (<b>+${near_prof:.0f}</b>)। यहाँ से रिवर्सल का रिस्क न लें—या तो पूरा प्रॉफिट बुक कर लें या SL को बिल्कुल पास ट्रेल कर लें!"
+                        f"📍 <b>Live Price:</b> {price_str}  |  <b>Target 2:</b> {target_str}\n"
+                        f"💰 <b>Action:</b> Easy Target 1 हिट हो चुका है (<b>+${near_prof:.0f}</b>)। यहाँ 75-80% प्रॉफिट बुक कर लें!"
                     )
 
-            # 3. FULL TARGET OR SL CHECK
             hit_type = None
             if trade["direction"] == "BUY":
                 if current_high >= trade["target"]:
@@ -1089,7 +1213,7 @@ def manage_open_trades(pair_name, candle_time, live_spot, latest_5m, decimals):
                 total_account_pnl += net_win
                 trade["status"] = "TARGET HIT"
                 send_telegram_message(
-                    f"🎯 <b>100% EASY TARGET HIT (+${net_win:.0f})</b> 🎯\n\n"
+                    f"🎯 <b>FULL TARGET 2 HIT (+${net_win:.0f})</b> 🎯\n\n"
                     f"🌍 <b>Asset:</b> {trade['pair']} (<b>{trade['lot_size']} Lot</b>)\n"
                     f"📍 <b>Entry:</b> {entry_str}  ➡️  <b>Target:</b> {target_str}\n"
                     f"💰 <b>Net Profit:</b> <b>+${net_win:.0f}</b>"
@@ -1177,7 +1301,7 @@ def scan_markets():
             if last_candle_traded[name] == closed_time:
                 continue
 
-            signal, direction, setup_text, custom_sl, struct_info = evaluate_all_market_setups(
+            signal, direction, setup_text, short_tag, custom_sl, struct_info = evaluate_all_market_setups(
                 name, info, df_15m, df_5m
             )
 
@@ -1237,23 +1361,21 @@ def scan_markets():
                 target_pips_str = calculate_pips_or_points(name, target_dist, dec)
 
                 msg = (
-                    f"📐 <b>PRO PRICE-ACTION & NEWS-SAFE SIGNAL</b> 📐\n\n"
-                    f"🌍 <b>Asset:</b> <b>{name}</b> (<code>{info['mt5_name']}</code>)\n"
+                    f"📐 <b>MT5 VISUAL SIGNAL — {info['mt5_name']}</b> 📐\n\n"
                     f"⚡ <b>Action:</b> <b>{signal}</b>\n"
-                    f"🛰️ <b>Spot Feed:</b> {source_used} | News Check: Clear\n"
-                    f"🧠 <b>Pattern:</b> {setup_text}\n\n"
-                    f"📍 <b>MT5 Spot Entry:</b> <code>{entry_s}</code>\n"
-                    f"🛑 <b>Anti-Hunt Buffered SL:</b> <code>{sl_s}</code>  <i>({sl_pips_str})</i>\n"
-                    f"🛡️ <b>0.65R Breakeven Lock:</b> <code>{half_s}</code>\n"
-                    f"⚡ <b>82% Safe Book Zone:</b> <code>{near_tp_s}</code>\n"
-                    f"🎯 <b>Easy-Reach Target (1:{actual_rr}):</b> <code>{target_s}</code>  <i>({target_pips_str})</i>\n\n"
-                    f"💼 <b>MT5 Lot Size ($5k Acc):</b> <b><code>{exact_lot:.2f} Lot</code></b>\n"
+                    f"🧠 <b>Logic:</b> {setup_text}\n\n"
+                    f"📍 <b>ENTRY:</b> <code>{entry_s}</code>\n"
+                    f"🛑 <b>STOP-LOSS (SL):</b> <code>{sl_s}</code>  <i>({sl_pips_str})</i>\n"
+                    f"🎯 <b>TARGET 1 (Easy TP):</b> <code>{near_tp_s}</code>\n"
+                    f"🎯 <b>TARGET 2 (Full TP):</b> <code>{target_s}</code>  <i>({target_pips_str})</i>\n"
+                    f"🛡️ <b>0.65R Breakeven Lock:</b> <code>{half_s}</code>\n\n"
+                    f"💼 <b>Lot Size ($5k Acc):</b> <b><code>{exact_lot:.2f} Lot</code></b>\n"
                     f"💰 <b>Risk:</b> ${max_risk_usd:.0f}  ➡️  <b>Reward:</b> <b>+${expected_prof:.0f}</b>"
                 )
 
-                chart_buf = generate_fibonacci_ema_chart(
-                    df_5m, name, direction, live_spot, sl_level, target_level,
-                    half_target_level, struct_info, dec, exact_lot, max_risk_usd, expected_prof, actual_rr
+                chart_buf = generate_mt5_mobile_style_chart(
+                    df_5m, info, direction, live_spot, sl_level, target_level,
+                    near_tp_level, short_tag, exact_lot
                 )
                 send_telegram_signal_with_chart(msg, chart_buf)
 
@@ -1263,11 +1385,9 @@ def scan_markets():
 if __name__ == "__main__":
     fetch_live_economic_calendar()
     send_telegram_message(
-        "📐 <b>All-Rounder Engine (Live News + Easy TP + Buffered SL) Online</b> 📐\n\n"
-        "• <b>News Shield:</b> Live CPI / NFP / FOMC Calendar + Market Crash Filter\n"
-        "• <b>Smart Target:</b> Front-Runs Resistance Walls + 82% Instant Book Alert\n"
-        "• <b>Protected SL:</b> Extra 0.55x ATR Stop-Hunt Buffer Behind Structure\n"
-        "• <b>Account Sizing:</b> $5,000 Prop Mode ($25 Risk / Trade)"
+        "📐 <b>MT5 Visual Chart Engine Online</b> 📐\n\n"
+        "• <b>MT5 Mobile Style Chart:</b> Auto-marked STOP-LOSS, ENTRY & TARGET 1/2 Boxes\n"
+        "• <b>Test Anytime:</b> टेलीग्राम पर अभी <code>/chart</code> (Gold) या <code>/btc</code> (Bitcoin) लिखकर भेजें और तुरंत फोटो देखें!"
     )
 
     start_run = time.time()
