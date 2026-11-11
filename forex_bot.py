@@ -9,9 +9,6 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
 
-# =====================================================================
-# AUTO-INSTALL MATPLOTLIB (ताकि GitHub पर फोटो बनने में कभी रुकावट न आए)
-# =====================================================================
 try:
     import matplotlib
 except ImportError:
@@ -24,7 +21,7 @@ import matplotlib.patches as mpatches
 CHART_AVAILABLE = True
 
 # =====================================================================
-# 1. INSTITUTIONAL ALL-ROUNDER ENGINE (MT5 IMAGE + NEWS + EASY TP)
+# 1. CORE TRADING ENGINE SETTINGS
 # =====================================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID   = "5610520408"
@@ -45,10 +42,10 @@ FOREX_PAIRS = {
     "XAU/USD (GOLD)": {
         "mt5_name": "XAUUSD",
         "sub_title": "Gold vs US Dollar",
+        "cmd_keys": ["/xauusd", "xauusd", "/gold", "gold"],
         "tv_ticker": "OANDA:XAUUSD",
         "tv_screener": "cfd",
-        "kraken_pair": "PAXGUSD",
-        "binance_symbol": "PAXGUSDT",
+        "binance_symbol": None,
         "yf_symbol": "GC=F",
         "currencies": ["USD"],
         "decimals": 2,
@@ -62,10 +59,10 @@ FOREX_PAIRS = {
     "EUR/USD": {
         "mt5_name": "EURUSD",
         "sub_title": "Euro vs US Dollar",
+        "cmd_keys": ["/eurusd", "eurusd", "/eur", "eur"],
         "tv_ticker": "OANDA:EURUSD",
         "tv_screener": "forex",
-        "kraken_pair": "EURUSD",
-        "binance_symbol": "EURUSDT",
+        "binance_symbol": None,
         "yf_symbol": "EURUSD=X",
         "currencies": ["EUR", "USD"],
         "decimals": 5,
@@ -79,9 +76,9 @@ FOREX_PAIRS = {
     "GBP/USD": {
         "mt5_name": "GBPUSD",
         "sub_title": "Great Britain Pound vs US Dollar",
+        "cmd_keys": ["/gbpusd", "gbpusd", "/gbp", "gbp"],
         "tv_ticker": "OANDA:GBPUSD",
         "tv_screener": "forex",
-        "kraken_pair": "GBPUSD",
         "binance_symbol": None,
         "yf_symbol": "GBPUSD=X",
         "currencies": ["GBP", "USD"],
@@ -96,9 +93,9 @@ FOREX_PAIRS = {
     "USD/JPY": {
         "mt5_name": "USDJPY",
         "sub_title": "US Dollar vs Japanese Yen",
+        "cmd_keys": ["/usdjpy", "usdjpy", "/jpy", "jpy"],
         "tv_ticker": "OANDA:USDJPY",
         "tv_screener": "forex",
-        "kraken_pair": "USDJPY",
         "binance_symbol": None,
         "yf_symbol": "JPY=X",
         "currencies": ["USD", "JPY"],
@@ -113,9 +110,9 @@ FOREX_PAIRS = {
     "GBP/JPY": {
         "mt5_name": "GBPJPY",
         "sub_title": "Great Britain Pound vs Japanese Yen",
+        "cmd_keys": ["/gbpjpy", "gbpjpy", "/gj", "gj"],
         "tv_ticker": "OANDA:GBPJPY",
         "tv_screener": "forex",
-        "kraken_pair": None,
         "binance_symbol": None,
         "yf_symbol": "GBPJPY=X",
         "currencies": ["GBP", "JPY"],
@@ -130,9 +127,9 @@ FOREX_PAIRS = {
     "AUD/USD": {
         "mt5_name": "AUDUSD",
         "sub_title": "Australian Dollar vs US Dollar",
+        "cmd_keys": ["/audusd", "audusd", "/aud", "aud"],
         "tv_ticker": "OANDA:AUDUSD",
         "tv_screener": "forex",
-        "kraken_pair": "AUDUSD",
         "binance_symbol": None,
         "yf_symbol": "AUDUSD=X",
         "currencies": ["AUD", "USD"],
@@ -147,9 +144,9 @@ FOREX_PAIRS = {
     "BTC/USD (BITCOIN)": {
         "mt5_name": "BTCUSD",
         "sub_title": "Bitcoin vs US Dollar",
+        "cmd_keys": ["/btcusd", "btcusd", "/btc", "btc"],
         "tv_ticker": "BITSTAMP:BTCUSD",
         "tv_screener": "crypto",
-        "kraken_pair": "XBTUSD",
         "binance_symbol": "BTCUSDT",
         "yf_symbol": "BTC-USD",
         "currencies": ["USD"],
@@ -172,6 +169,7 @@ last_global_trade_time = datetime.min.replace(tzinfo=timezone.utc)
 cached_news_events     = []
 last_news_fetch_time   = 0
 announced_news_ids     = set()
+chart_rotation_index   = 0
 
 trades_today       = 0
 last_update_id     = 0
@@ -347,15 +345,15 @@ def detect_live_market_crash_or_shock(df_5m):
     return "NORMAL", None
 
 # =====================================================================
-# 3. MULTI-SOURCE SPOT DATA ENGINE (OANDA + KRAKEN + BINANCE)
+# 3. CONTINUOUS DENSE CANDLE ENGINE + LIVE OANDA SPOT CALIBRATION
 # =====================================================================
 def fetch_tradingview_live_spot(tv_ticker, screener="forex"):
     url = f"https://scanner.tradingview.com/{screener}/scan"
     payload = {
         "symbols": {"tickers": [tv_ticker], "query": {"types": []}},
-        "columns": ["close", "Recommend.Other", "RSI"]
+        "columns": ["close", "high", "low", "Recommend.Other", "RSI"]
     }
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {"User-Agent": "Mozilla/5.0", "Cache-Control": "no-cache"}
     try:
         res = requests.post(url, json=payload, headers=headers, timeout=6)
         if res.status_code == 200:
@@ -364,29 +362,6 @@ def fetch_tradingview_live_spot(tv_ticker, screener="forex"):
                 spot_close = float(data[0]["d"][0])
                 if spot_close > 0:
                     return spot_close
-    except Exception:
-        pass
-    return None
-
-def fetch_kraken_ohlc(kraken_pair, interval_min):
-    if not kraken_pair:
-        return None
-    url = "https://api.kraken.com/0/public/OHLC"
-    params = {"pair": kraken_pair, "interval": interval_min}
-    try:
-        r = requests.get(url, params=params, timeout=7).json()
-        if not r.get("error"):
-            res = r.get("result", {})
-            keys = [k for k in res.keys() if k != "last"]
-            if keys:
-                rows = res[keys[0]]
-                df = pd.DataFrame(rows, columns=["time", "Open", "High", "Low", "Close", "vwap", "Volume", "count"])
-                df["Date"] = pd.to_datetime(df["time"], unit="s", utc=True)
-                df.set_index("Date", inplace=True)
-                for col in ["Open", "High", "Low", "Close", "Volume"]:
-                    df[col] = df[col].astype(float)
-                if len(df) >= 50:
-                    return df[["Open", "High", "Low", "Close", "Volume"]]
     except Exception:
         pass
     return None
@@ -412,47 +387,76 @@ def fetch_binance_vision_ohlc(binance_symbol, interval_str="5m", limit=120):
         pass
     return None
 
+def clean_and_densify_candles(df):
+    """
+    खाली/फ्लैट या टूटी हुई कैंडल्स को हटाता है ताकि चार्ट पर एक भी कैंडल Skip या दूर-दूर न दिखे
+    और हर कैंडल के बीच कंटिन्यूटी (Continuity) बनी रहे।
+    """
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    df = df[~df.index.duplicated(keep="last")]
+    df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
+
+    # ऐसी खाली कैंडल्स हटाएं जहाँ Open == High == Low == Close हो और कोई मूवमेंट न हुआ हो
+    active_mask = (df["High"] > df["Low"]) | (df["Open"] != df["Close"])
+    if active_mask.sum() >= 45:
+        df = df[active_mask]
+
+    return df
+
 def get_clean_spot_data(pair_name, info):
+    """
+    हाई-वॉल्यूम 5M और 15M कैंडल्स लाता है और उन्हें सीधे OANDA Live Spot Price
+    पर सिंक करता है, साथ ही आखिरी चलती कैंडल (Live Running Candle) को भी अपडेट करता है।
+    """
     df_5m  = None
     df_15m = None
-    source_used = "Spot Feed"
+    source_used = "OANDA Live Spot Sync"
 
-    if info.get("kraken_pair"):
-        df_5m  = fetch_kraken_ohlc(info["kraken_pair"], 5)
-        df_15m = fetch_kraken_ohlc(info["kraken_pair"], 15)
-        if df_5m is not None and df_15m is not None:
-            source_used = "Kraken Spot + OANDA Sync"
-
-    if (df_5m is None or df_15m is None) and info.get("binance_symbol"):
+    # 1. Crypto के लिए Binance Spot Continuous Feed
+    if info.get("binance_symbol"):
         df_5m  = fetch_binance_vision_ohlc(info["binance_symbol"], "5m", 120)
         df_15m = fetch_binance_vision_ohlc(info["binance_symbol"], "15m", 100)
         if df_5m is not None and df_15m is not None:
-            source_used = "Binance Spot + OANDA Sync"
+            source_used = "Binance + Bitstamp Live Sync"
 
+    # 2. Gold & Forex के लिए Continuous Institutional Candle Structure
     if df_5m is None or df_15m is None:
         try:
             tkr = yf.Ticker(info["yf_symbol"])
-            df_5m  = tkr.history(period="5d", interval="5m")
-            df_15m = tkr.history(period="5d", interval="15m")
-            source_used = "OANDA Spot Sync"
+            df_5m  = tkr.history(period="5d", interval="5m", auto_adjust=False)
+            df_15m = tkr.history(period="5d", interval="15m", auto_adjust=False)
+            source_used = "OANDA Live Spot Sync"
         except Exception:
             return None, None, None, ""
 
-    if df_5m is None or df_5m.empty or len(df_5m) < 55 or df_15m is None or df_15m.empty or len(df_15m) < 40:
+    df_5m  = clean_and_densify_candles(df_5m)
+    df_15m = clean_and_densify_candles(df_15m)
+
+    if df_5m is None or df_5m.empty or len(df_5m) < 45 or df_15m is None or df_15m.empty or len(df_15m) < 35:
         return None, None, None, ""
 
+    # 3. Real-Time OANDA Spot Calibration + Live Forming Candle Update
     tv_spot = fetch_tradingview_live_spot(info["tv_ticker"], info["tv_screener"])
     raw_last_close = float(df_5m.iloc[-1]["Close"])
 
     if tv_spot is not None and tv_spot > 0:
         basis_diff = tv_spot - raw_last_close
-        if abs(basis_diff) < (tv_spot * 0.03):
+        if abs(basis_diff) < (tv_spot * 0.04):
             for col in ["Open", "High", "Low", "Close"]:
                 df_5m[col]  = df_5m[col] + basis_diff
                 df_15m[col] = df_15m[col] + basis_diff
-            live_spot_price = tv_spot
-        else:
-            live_spot_price = raw_last_close
+
+        # आखिरी चलती कैंडल को वर्तमान लाइव टिक से अपडेट करें ताकि हर बार नया मूव दिखे
+        last_idx = df_5m.index[-1]
+        df_5m.loc[last_idx, "Close"] = tv_spot
+        if tv_spot > float(df_5m.loc[last_idx, "High"]):
+            df_5m.loc[last_idx, "High"] = tv_spot
+        if tv_spot < float(df_5m.loc[last_idx, "Low"]):
+            df_5m.loc[last_idx, "Low"] = tv_spot
+
+        live_spot_price = tv_spot
     else:
         live_spot_price = raw_last_close
 
@@ -475,7 +479,7 @@ def calculate_smart_sl_and_easy_tp(df_5m, df_15m, info, direction, live_spot, ra
     max_sl      = max(atr_5m * 2.35, info.get("max_sl_dist", atr_5m * 2.35))
     sl_dist     = round(max(min_sl, min(raw_sl_dist, max_sl)), dec)
 
-    recent_m5       = df_5m.iloc[-42:-2]
+    recent_m5       = df_5m.iloc[-40:-2]
     major_high_wall = float(recent_m5["High"].max())
     major_low_wall  = float(recent_m5["Low"].min())
 
@@ -541,7 +545,7 @@ def calculate_chart_indicators(df):
 
     return df
 
-def detect_fibonacci_swing_structure(df_5m, lookback=38):
+def detect_fibonacci_swing_structure(df_5m, lookback=36):
     window = df_5m.iloc[-(lookback + 2):-2]
     if len(window) < 20:
         return None
@@ -672,7 +676,7 @@ def detect_reversal_neckline_breakout(df_5m, shock_state):
                     "direction": "SELL",
                     "action": "SELL (SHORT) 🔴",
                     "struct_id": f"HNS_SELL_{times[max_idx]}",
-                    "short_tag": "Double Top / H&S Breakdown",
+                    "short_tag": "Double Top Breakdown",
                     "setup_text": f"H&S / Top Reversal Neckline Breakdown ({neckline_sup:.2f}) | RSI: {rsi:.0f}",
                     "sl_raw": sl_level
                 }
@@ -732,7 +736,7 @@ def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
     if np.isnan(atr_5m) or atr_5m <= 0:
         return None, None, None, None, None, None
 
-    fib = detect_fibonacci_swing_structure(df_5m, lookback=38)
+    fib = detect_fibonacci_swing_structure(df_5m, lookback=36)
 
     # SETUP A: REVERSAL NECKLINE BREAKOUT
     rev = detect_reversal_neckline_breakout(df_5m, shock_state)
@@ -837,32 +841,34 @@ def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
     return None, None, None, None, None, None
 
 # =====================================================================
-# 7. MT5 MOBILE-STYLE CHART GENERATOR (EXACT SCREENSHOT VISUALS)
+# 7. DENSE, NON-SKIPPING MT5 CHART GENERATOR
 # =====================================================================
 def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p, near_tp_p, short_tag, lot_size):
     """
-    बिल्कुल आपके MT5 मोबाइल स्क्रीनशॉट जैसा चार्ट बनाता है:
-    - ऊपर SELL / Lot / BUY का MT5 टॉप बार और Symbol • M5 हेडर
-    - सफेद ग्रिड बैकग्राउंड पर हरी/लाल कैंडल्स
-    - STOP-LOSS (SL) का लाल शेडेड ज़ोन और बोल्ड लेबल
-    - पीली ENTRY लाइन और कारण (जैसे Support Breakdown / Fib Bounce)
-    - TARGET 1 (Easy TP) | TARGET 2 का हरा शेडेड ज़ोन + दिशा वाला तीर (Arrow)
+    बिना किसी गैप या स्किप के (Tight-Packed 34 Candles) साफ चार्ट बनाता है:
+    - हर कैंडल चौड़ी (width=0.78) और एक-दूसरे के बिल्कुल पास होती है।
+    - आखिरी लाइव कैंडल तक पूरा ताज़ा प्राइस मूवमेंट दिखता है।
     """
     try:
-        sub = df_5m.iloc[-44:].copy()
-        if sub.empty or len(sub) < 18:
+        sub = df_5m.iloc[-34:].copy()
+        if sub.empty or len(sub) < 16:
             return None
 
         dec      = info["decimals"]
         mt5_sym  = info["mt5_name"]
         sub_Desc = info.get("sub_title", "Spot vs US Dollar")
 
-        fig = plt.figure(figsize=(6.8, 10.2), dpi=130, facecolor="#ffffff")
+        fig = plt.figure(figsize=(6.8, 10.0), dpi=130, facecolor="#ffffff")
         ax  = fig.add_axes([0.04, 0.08, 0.80, 0.78], facecolor="#ffffff")
 
         n_bars = len(sub)
-        zone_start_idx = max(10, int(n_bars * 0.36))
-        right_edge_idx = n_bars + 4
+        x_vals = np.arange(n_bars)
+        zone_start_idx = max(8, int(n_bars * 0.38))
+        right_edge_idx = n_bars + 3
+
+        all_y = list(sub["High"].values) + list(sub["Low"].values) + [tp_p, sl_p, entry_p]
+        y_min, y_max = min(all_y), max(all_y)
+        total_y_span = max(y_max - y_min, 1e-6)
 
         # 1. MT5 White Dashed Grid
         ax.grid(True, linestyle="--", linewidth=0.75, color="#d1d5db", alpha=0.85, zorder=1)
@@ -871,7 +877,13 @@ def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p,
         ax.spines["right"].set_color("#9ca3af")
         ax.spines["bottom"].set_color("#9ca3af")
 
-        # 2. Plot MT5 Style Candlesticks
+        # 2. Plot Smooth EMA 9 & EMA 20 Lines
+        if "EMA9" in sub.columns and "EMA20" in sub.columns:
+            ax.plot(x_vals, sub["EMA9"].values, color="#16a34a", linewidth=1.25, alpha=0.80, zorder=3)
+            ax.plot(x_vals, sub["EMA20"].values, color="#dc2626", linewidth=1.25, alpha=0.80, zorder=3)
+
+        # 3. Plot Tightly-Packed Candlesticks (width=0.78 so zero skipping/gaps)
+        min_visible_body = total_y_span * 0.0055
         for idx in range(n_bars):
             row = sub.iloc[idx]
             o, h, l, c = float(row["Open"]), float(row["High"]), float(row["Low"]), float(row["Close"])
@@ -879,18 +891,16 @@ def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p,
             wick_col = "#0d9488" if is_bull else "#e11d48"
             body_col = "#10b981" if is_bull else "#ef4444"
 
-            ax.plot([idx, idx], [l, h], color=wick_col, linewidth=1.15, zorder=3)
+            ax.plot([idx, idx], [l, h], color=wick_col, linewidth=1.3, zorder=4)
             body_low = min(o, c)
-            body_h   = max(abs(c - o), (h - l) * 0.04, 1e-6)
+            body_h   = max(abs(c - o), min_visible_body)
             ax.add_patch(mpatches.Rectangle(
-                (idx - 0.33, body_low), 0.66, body_h,
-                facecolor=body_col, edgecolor=wick_col, linewidth=0.6, zorder=3
+                (idx - 0.39, body_low), 0.78, body_h,
+                facecolor=body_col, edgecolor=wick_col, linewidth=0.7, zorder=4
             ))
 
-        # 3. Red STOP-LOSS Zone Box + Top Line
-        sl_box_low  = min(entry_p, sl_p)
-        sl_box_high = max(entry_p, sl_p)
-        sl_band_h   = abs(sl_p - entry_p) * 0.35
+        # 4. Red STOP-LOSS Zone Box
+        sl_band_h = abs(sl_p - entry_p) * 0.35
         if direction == "SELL":
             red_rect_y = sl_p - sl_band_h
             red_rect_h = sl_band_h
@@ -902,18 +912,17 @@ def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p,
             (zone_start_idx, red_rect_y), right_edge_idx - zone_start_idx, red_rect_h,
             facecolor="#ef4444", alpha=0.23, edgecolor="#b91c1c", linewidth=1.2, zorder=2
         ))
-        ax.plot([zone_start_idx, right_edge_idx], [sl_p, sl_p], color="#991b1b", linewidth=1.6, zorder=4)
+        ax.plot([zone_start_idx, right_edge_idx], [sl_p, sl_p], color="#991b1b", linewidth=1.6, zorder=5)
 
-        # 4. Green TARGET Zone Box (Entry to TP) + Arrow
+        # 5. Green TARGET Zone Box + Directional Arrow
         tp_box_low  = min(entry_p, tp_p)
         tp_box_high = max(entry_p, tp_p)
         ax.add_patch(mpatches.Rectangle(
-            (zone_start_idx + 4, tp_box_low), (right_edge_idx - zone_start_idx - 4), (tp_box_high - tp_box_low),
+            (zone_start_idx + 3, tp_box_low), (right_edge_idx - zone_start_idx - 3), (tp_box_high - tp_box_low),
             facecolor="#22c55e", alpha=0.22, edgecolor="#16a34a", linewidth=1.1, zorder=2
         ))
 
-        # Directional Green Arrow inside Target Zone
-        arrow_x = n_bars + 1.2
+        arrow_x       = n_bars + 0.8
         arrow_start_y = entry_p + (tp_p - entry_p) * 0.12
         arrow_end_y   = entry_p + (tp_p - entry_p) * 0.88
         ax.annotate(
@@ -922,11 +931,9 @@ def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p,
             zorder=6
         )
 
-        # 5. Yellow Horizontal ENTRY Line across chart
+        # 6. Yellow Horizontal ENTRY Line
         ax.axhline(entry_p, color="#eab308", linewidth=2.0, zorder=5)
-        ax.axhline(entry_p, color="#0d9488", linewidth=0.8, linestyle="-", alpha=0.6, zorder=4)
 
-        # 6. Bold Text Callout Labels (Matching Screenshot Style)
         entry_s   = format_price(entry_p, dec)
         sl_s      = format_price(sl_p, dec)
         near_tp_s = format_price(near_tp_p, dec)
@@ -935,59 +942,56 @@ def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p,
         mid_zone_x = (zone_start_idx + right_edge_idx) / 2.0
 
         # STOP-LOSS Label
-        sl_va = "bottom" if direction == "SELL" else "top"
+        sl_va     = "bottom" if direction == "SELL" else "top"
         sl_offset = abs(sl_p - entry_p) * (0.08 if direction == "SELL" else -0.08)
         ax.text(
             mid_zone_x, sl_p + sl_offset,
             f"STOP-LOSS (SL): {sl_s} ({short_tag})",
-            fontsize=8.8, fontweight="bold", color="#111827", ha="center", va=sl_va,
-            bbox=dict(boxstyle="round,pad=0.25", facecolor="#fecaca", edgecolor="#f87171", alpha=0.92),
+            fontsize=8.6, fontweight="bold", color="#111827", ha="center", va=sl_va,
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="#fecaca", edgecolor="#f87171", alpha=0.93),
             zorder=8
         )
 
         # ENTRY Label
-        entry_va = "bottom" if direction == "SELL" else "top"
+        entry_va     = "bottom" if direction == "SELL" else "top"
         entry_offset = abs(tp_p - entry_p) * (0.06 if direction == "SELL" else -0.06)
         ax.text(
-            right_edge_idx - 0.5, entry_p + entry_offset,
+            right_edge_idx - 0.3, entry_p + entry_offset,
             f"{direction} ENTRY: {entry_s}\n({short_tag})",
-            fontsize=8.6, fontweight="bold", color="#111827", ha="right", va=entry_va,
+            fontsize=8.5, fontweight="bold", color="#111827", ha="right", va=entry_va,
             bbox=dict(boxstyle="round,pad=0.25", facecolor="#fef08a", edgecolor="#eab308", alpha=0.94),
             zorder=8
         )
 
         # TARGET 1 & TARGET 2 Label
-        tp_va = "top" if direction == "SELL" else "bottom"
+        tp_va     = "top" if direction == "SELL" else "bottom"
         tp_offset = abs(tp_p - entry_p) * (-0.06 if direction == "SELL" else 0.06)
         ax.text(
-            mid_zone_x + 1.0, tp_p + tp_offset,
+            mid_zone_x + 0.5, tp_p + tp_offset,
             f"TARGET 1 (Easy TP): {near_tp_s} | TARGET 2: {tp_s}",
-            fontsize=8.6, fontweight="bold", color="#111827", ha="center", va=tp_va,
+            fontsize=8.5, fontweight="bold", color="#111827", ha="center", va=tp_va,
             bbox=dict(boxstyle="round,pad=0.25", facecolor="#bbf7d0", edgecolor="#22c55e", alpha=0.94),
             zorder=8
         )
 
-        # 7. Right Price Axis & Current Price Green Tag
+        # 7. Right Axis & Live Price Tag
         ax.yaxis.tick_right()
         ax.tick_params(axis="y", labelsize=9.5, colors="#111827")
-        ax.set_xlim(-1, right_edge_idx)
+        ax.set_xlim(-0.8, right_edge_idx)
 
-        all_y = list(sub["High"].values) + list(sub["Low"].values) + [tp_p, sl_p, entry_p]
-        y_min, y_max = min(all_y), max(all_y)
-        y_pad = (y_max - y_min) * 0.22
+        y_pad = total_y_span * 0.22
         ax.set_ylim(y_min - y_pad, y_max + y_pad)
 
-        # Right-axis Live Price Badge
+        now_ist_str = get_ist_now().strftime("%H:%M:%S")
         ax.text(
-            right_edge_idx + 0.3, entry_p,
-            f" {entry_s} \n LIVE M5 ",
-            fontsize=8.5, fontweight="bold", color="white", va="center", ha="left",
-            bbox=dict(boxstyle="square,pad=0.3", facecolor="#0d9488", edgecolor="none"),
+            right_edge_idx + 0.2, entry_p,
+            f" {entry_s} \n {now_ist_str} ",
+            fontsize=8.2, fontweight="bold", color="white", va="center", ha="left",
+            bbox=dict(boxstyle="square,pad=0.28", facecolor="#0d9488", edgecolor="none"),
             clip_on=False, zorder=9
         )
 
-        # Bottom Time Axis Labels (IST)
-        tick_indices = [2, int(n_bars * 0.45), n_bars - 2]
+        tick_indices = [1, int(n_bars * 0.48), n_bars - 1]
         tick_labels  = []
         for ti in tick_indices:
             ts_ist = to_utc_timestamp(sub.index[ti]) + timedelta(hours=5, minutes=30)
@@ -995,17 +999,9 @@ def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p,
         ax.set_xticks(tick_indices)
         ax.set_xticklabels(tick_labels, fontsize=9, color="#374151")
 
-        # Top-Left MT5 Symbol Header inside Chart
-        ax.text(
-            0.02, 0.97, f"{mt5_sym} • M5",
-            transform=ax.transAxes, fontsize=12, fontweight="bold", color="#0284c7", va="top"
-        )
-        ax.text(
-            0.02, 0.935, sub_Desc,
-            transform=ax.transAxes, fontsize=9.5, color="#1f2937", va="top"
-        )
+        ax.text(0.02, 0.97, f"{mt5_sym} • M5", transform=ax.transAxes, fontsize=12, fontweight="bold", color="#0284c7", va="top")
+        ax.text(0.02, 0.935, sub_Desc, transform=ax.transAxes, fontsize=9.5, color="#1f2937", va="top")
 
-        # Top MT5 SELL / Lot / BUY Header Banner
         header_ax = fig.add_axes([0.04, 0.88, 0.92, 0.08], facecolor="#ffffff")
         header_ax.axis("off")
         header_ax.add_patch(mpatches.Rectangle((0.0, 0.1), 0.32, 0.8, facecolor="#2563eb", edgecolor="none"))
@@ -1023,28 +1019,23 @@ def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p,
         buf.seek(0)
         return buf
     except Exception as e:
-        print(f"MT5 Chart Generation Error: {e}")
+        print(f"Chart Generation Error: {e}")
         return None
 
 def send_telegram_signal_with_chart(caption_html, chart_buf, target_chat_id=CHAT_ID):
-    """
-    गारंटीड फोटो सेंडर: पहले फोटो + कैप्शन भेजता है;
-    अगर कैप्शन बड़ा हो तो पहले MT5 चार्ट फोटो और तुरंत बाद पूरा मैसेज भेजता है।
-    """
     if chart_buf is not None:
         photo_bytes = chart_buf.getvalue()
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
         try:
             if len(caption_html) <= 950:
-                files = {"photo": ("mt5_trade_setup.png", photo_bytes, "image/png")}
+                files = {"photo": ("trade_setup.png", photo_bytes, "image/png")}
                 data  = {"chat_id": target_chat_id, "caption": caption_html, "parse_mode": "HTML"}
                 res   = requests.post(url, data=data, files=files, timeout=20)
                 if res.status_code == 200 and res.json().get("ok"):
                     return
 
-            # Fallback: Send Photo First, then Detailed Text Message
-            files = {"photo": ("mt5_trade_setup.png", photo_bytes, "image/png")}
-            data  = {"chat_id": target_chat_id, "caption": "📊 <b>MT5 M5 Marked Trade Setup (Entry / SL / Target)</b>", "parse_mode": "HTML"}
+            files = {"photo": ("trade_setup.png", photo_bytes, "image/png")}
+            data  = {"chat_id": target_chat_id, "caption": "📊 <b>Live M5 Trade Setup</b>", "parse_mode": "HTML"}
             requests.post(url, data=data, files=files, timeout=20)
             send_telegram_message(caption_html, target_chat_id)
             return
@@ -1054,51 +1045,82 @@ def send_telegram_signal_with_chart(caption_html, chart_buf, target_chat_id=CHAT
     send_telegram_message(caption_html, target_chat_id)
 
 # =====================================================================
-# 8. ACTIVE TRADE MANAGEMENT & /CHART + /STATUS COMMANDS
+# 8. MULTI-PAIR CHART COMMANDS & ACTIVE TRADE MANAGEMENT
 # =====================================================================
-def send_instant_preview_chart(pair_key="XAU/USD (GOLD)"):
-    """Telegram पर /chart भेजते ही तुरंत लाइव MT5 मार्क किया हुआ चार्ट बनाकर भेजता है"""
+def send_instant_preview_chart(pair_key=None):
+    """
+    अगर कोई खास पेयर पूछा गया है (जैसे /eurusd, /gbpusd, /btc, /gold) तो उसका चार्ट भेजता है।
+    अगर सिर्फ /chart लिखा गया है, तो सभी 7 पेयर्स में से सबसे मजबूत एक्टिव सेटअप या अगले पेयर का चार्ट भेजता है (सिर्फ Gold नहीं)।
+    """
+    global chart_rotation_index
+    pair_names_list = list(FOREX_PAIRS.keys())
+
+    if pair_key is None:
+        # पहले चेक करें कि किस पेयर में अभी लाइव सिग्नल बन रहा है
+        selected_key = None
+        for name, info in FOREX_PAIRS.items():
+            df_15m, df_5m, live_spot, _ = get_clean_spot_data(name, info)
+            if df_5m is not None and df_15m is not None:
+                df_15m = calculate_chart_indicators(df_15m)
+                df_5m  = calculate_chart_indicators(df_5m)
+                sig, _, _, _, _, _ = evaluate_all_market_setups(name, info, df_15m, df_5m)
+                if sig:
+                    selected_key = name
+                    break
+
+        # अगर अभी किसी में तुरंत सिग्नल नहीं है, तो बारी-बारी से अलग-अलग पेयर का ताज़ा चार्ट दिखाएं
+        if selected_key is None:
+            selected_key = pair_names_list[chart_rotation_index % len(pair_names_list)]
+            chart_rotation_index += 1
+        pair_key = selected_key
+
     info = FOREX_PAIRS.get(pair_key, FOREX_PAIRS["XAU/USD (GOLD)"])
     df_15m, df_5m, live_spot, src = get_clean_spot_data(pair_key, info)
     if df_5m is None or live_spot is None:
-        send_telegram_message("⚠️ चार्ट डेटा लोड हो रहा है, कृपया 10 सेकंड बाद ट्राय करें।")
+        send_telegram_message("⚠️ डेटा लोड हो रहा है, कृपया कुछ सेकंड बाद प्रयास करें।")
         return
 
     df_5m  = calculate_chart_indicators(df_5m)
     df_15m = calculate_chart_indicators(df_15m)
+
+    sig, direction, setup_text, short_tag, custom_sl, _ = evaluate_all_market_setups(pair_key, info, df_15m, df_5m)
     c0     = df_5m.iloc[-2]
     atr_5m = float(c0["ATR"])
     ema9   = float(c0["EMA9"])
     ema20  = float(c0["EMA20"])
 
-    direction = "BUY" if ema9 >= ema20 else "SELL"
-    raw_sl    = (live_spot - atr_5m * 1.4) if direction == "BUY" else (live_spot + atr_5m * 1.4)
+    if direction is None:
+        direction  = "BUY" if ema9 >= ema20 else "SELL"
+        short_tag  = "EMA 9/20 + Structure"
+        setup_text = f"Live M5 Structure ({direction} Bias) | RSI: {float(c0['RSI']):.0f}"
+        custom_sl  = (live_spot - atr_5m * 1.4) if direction == "BUY" else (live_spot + atr_5m * 1.4)
+
     sl_level, sl_dist, lock_level, near_tp_lvl, target_level, tp_dist, actual_rr = calculate_smart_sl_and_easy_tp(
-        df_5m, df_15m, info, direction, live_spot, raw_sl, atr_5m
+        df_5m, df_15m, info, direction, live_spot, custom_sl, atr_5m
     )
     lot_size = calculate_exact_mt5_lot(pair_key, info, sl_dist, RISK_PER_TRADE_USD)
 
     chart_buf = generate_mt5_mobile_style_chart(
-        df_5m, info, direction, live_spot, sl_level, target_level, near_tp_lvl, "Live Structure Preview", lot_size
+        df_5m, info, direction, live_spot, sl_level, target_level, near_tp_lvl, short_tag, lot_size
     )
     caption = (
-        f"📸 <b>MT5 LIVE CHART PREVIEW ({info['mt5_name']})</b>\n\n"
+        f"📊 <b>{pair_key} ({info['mt5_name']}) — LIVE M5 ANALYSIS</b>\n\n"
+        f"🧠 <b>Structure:</b> {setup_text}\n"
         f"📍 <b>Live Spot:</b> <code>{format_price(live_spot, info['decimals'])}</code>\n"
-        f"🛑 <b>Projected SL Zone:</b> <code>{format_price(sl_level, info['decimals'])}</code>\n"
-        f"🎯 <b>Easy TP 1:</b> <code>{format_price(near_tp_lvl, info['decimals'])}</code> | <b>TP 2:</b> <code>{format_price(target_level, info['decimals'])}</code>"
+        f"🛑 <b>Buffered SL:</b> <code>{format_price(sl_level, info['decimals'])}</code>\n"
+        f"🎯 <b>Target 1 (Easy TP):</b> <code>{format_price(near_tp_lvl, info['decimals'])}</code> | <b>Target 2:</b> <code>{format_price(target_level, info['decimals'])}</code>\n"
+        f"💼 <b>Lot Size:</b> <code>{lot_size:.2f} Lot</code>"
     )
     send_telegram_signal_with_chart(caption, chart_buf)
 
 def send_live_status_summary():
     forex_open = is_forex_market_open()
-    market_state = "🟢 ALL 4 SETUPS + MT5 CHART ACTIVE" if forex_open else "🟡 WEEKEND: BTC/USD ACTIVE"
+    market_state = "🟢 ALL MARKETS ACTIVE" if forex_open else "🟡 WEEKEND: BTC/USD ACTIVE"
     _, session_name = get_trading_session(True)
 
     report = (
-        f"📐 <b>MT5 VISUAL & PRICE-ACTION ENGINE STATUS</b> 📐\n\n"
-        f"📢 <b>Market:</b> {market_state} ({session_name})\n"
-        f"🖼️ <b>Chart Image Mode:</b> <b>ENABLED (MT5 Mobile Style)</b>\n"
-        f"💡 <i>Tip: किसी भी समय लाइव फोटो देखने के लिए</i> <code>/chart</code> <i>या</i> <code>/btc</code> <i>भेजें।</i>\n\n"
+        f"📊 <b>LIVE MARKET SCANNER STATUS</b> 📊\n\n"
+        f"📢 <b>Session:</b> {market_state} ({session_name})\n\n"
     )
 
     for name, info in FOREX_PAIRS.items():
@@ -1131,12 +1153,17 @@ def check_telegram_commands():
 
                 if chat_id != CHAT_ID:
                     continue
+
                 if msg_text in ["/status", "status", "/start", "start"]:
                     send_live_status_summary()
-                elif msg_text in ["/chart", "chart", "/gold", "gold"]:
-                    send_instant_preview_chart("XAU/USD (GOLD)")
-                elif msg_text in ["/btc", "btc"]:
-                    send_instant_preview_chart("BTC/USD (BITCOIN)")
+                elif msg_text in ["/chart", "chart"]:
+                    send_instant_preview_chart(None)
+                else:
+                    # चेक करें कि यूजर ने किसी खास पेयर का नाम लिखा है क्या (जैसे /eurusd, /gbpusd, /usdjpy, /btc, /gold)
+                    for p_name, p_info in FOREX_PAIRS.items():
+                        if msg_text in p_info.get("cmd_keys", []) or msg_text == f"/chart {p_info['mt5_name'].lower()}":
+                            send_instant_preview_chart(p_name)
+                            break
     except Exception:
         pass
 
@@ -1213,7 +1240,7 @@ def manage_open_trades(pair_name, candle_time, live_spot, latest_5m, decimals):
                 total_account_pnl += net_win
                 trade["status"] = "TARGET HIT"
                 send_telegram_message(
-                    f"🎯 <b>FULL TARGET 2 HIT (+${net_win:.0f})</b> 🎯\n\n"
+                    f"🎯 <b>FULL TARGET HIT (+${net_win:.0f})</b> 🎯\n\n"
                     f"🌍 <b>Asset:</b> {trade['pair']} (<b>{trade['lot_size']} Lot</b>)\n"
                     f"📍 <b>Entry:</b> {entry_str}  ➡️  <b>Target:</b> {target_str}\n"
                     f"💰 <b>Net Profit:</b> <b>+${net_win:.0f}</b>"
@@ -1361,15 +1388,16 @@ def scan_markets():
                 target_pips_str = calculate_pips_or_points(name, target_dist, dec)
 
                 msg = (
-                    f"📐 <b>MT5 VISUAL SIGNAL — {info['mt5_name']}</b> 📐\n\n"
-                    f"⚡ <b>Action:</b> <b>{signal}</b>\n"
-                    f"🧠 <b>Logic:</b> {setup_text}\n\n"
-                    f"📍 <b>ENTRY:</b> <code>{entry_s}</code>\n"
-                    f"🛑 <b>STOP-LOSS (SL):</b> <code>{sl_s}</code>  <i>({sl_pips_str})</i>\n"
-                    f"🎯 <b>TARGET 1 (Easy TP):</b> <code>{near_tp_s}</code>\n"
-                    f"🎯 <b>TARGET 2 (Full TP):</b> <code>{target_s}</code>  <i>({target_pips_str})</i>\n"
-                    f"🛡️ <b>0.65R Breakeven Lock:</b> <code>{half_s}</code>\n\n"
-                    f"💼 <b>Lot Size ($5k Acc):</b> <b><code>{exact_lot:.2f} Lot</code></b>\n"
+                    f"⚡ <b>LIVE MARKET SIGNAL — {info['mt5_name']}</b> ⚡\n\n"
+                    f"🌍 <b>Asset:</b> <b>{name}</b>\n"
+                    f"📢 <b>Action:</b> <b>{signal}</b>\n"
+                    f"🧠 <b>Setup:</b> {setup_text}\n\n"
+                    f"📍 <b>Entry Price:</b> <code>{entry_s}</code>\n"
+                    f"🛑 <b>Stop-Loss (SL):</b> <code>{sl_s}</code>  <i>({sl_pips_str})</i>\n"
+                    f"🎯 <b>Target 1 (Easy TP):</b> <code>{near_tp_s}</code>\n"
+                    f"🎯 <b>Target 2 (Full TP):</b> <code>{target_s}</code>  <i>({target_pips_str})</i>\n"
+                    f"🛡️ <b>0.65R Safe Lock:</b> <code>{half_s}</code>\n\n"
+                    f"💼 <b>Lot Size:</b> <b><code>{exact_lot:.2f} Lot</code></b>\n"
                     f"💰 <b>Risk:</b> ${max_risk_usd:.0f}  ➡️  <b>Reward:</b> <b>+${expected_prof:.0f}</b>"
                 )
 
@@ -1384,11 +1412,7 @@ def scan_markets():
 
 if __name__ == "__main__":
     fetch_live_economic_calendar()
-    send_telegram_message(
-        "📐 <b>MT5 Visual Chart Engine Online</b> 📐\n\n"
-        "• <b>MT5 Mobile Style Chart:</b> Auto-marked STOP-LOSS, ENTRY & TARGET 1/2 Boxes\n"
-        "• <b>Test Anytime:</b> टेलीग्राम पर अभी <code>/chart</code> (Gold) या <code>/btc</code> (Bitcoin) लिखकर भेजें और तुरंत फोटो देखें!"
-    )
+    send_telegram_message("🟢 <b>Market Scanner Online & Active</b>")
 
     start_run = time.time()
     last_scan_time = 0
