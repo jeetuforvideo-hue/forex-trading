@@ -30,10 +30,10 @@ TOTAL_CAPITAL_USD          = 5000.0
 RISK_PER_TRADE_USD         = 25.0      # $5,000 अकाउंट पर $25 रिस्क
 DAILY_PROTECTION_CAP       = 125.0
 
-BASE_EASY_RR_RATIO         = 1.45      # Easy-Reach Target
-LOCK_PROFIT_R              = 0.65      # 0.65R पर Breakeven Lock
-NEAR_TARGET_ALERT_RATIO    = 0.82      # 82% Target पर Instant Book Alert
-SL_STOP_HUNT_BUFFER_ATR    = 0.55      # Stop-Hunt से बचने के लिए एक्स्ट्रा बफर
+BASE_EASY_RR_RATIO         = 1.35      # Realistic Full Target Ratio (1:1.35)
+LOCK_PROFIT_R              = 0.60      # 0.60R पर Breakeven Lock
+NEAR_TARGET_ALERT_RATIO    = 0.80      # 80% (या Wall से पहले) Easy Target 1
+SL_BUFFER_ATR              = 0.22      # Right-Shoulder / Structure के पीछे सटीक बफर
 
 MAX_CONCURRENT_TRADES      = 2
 MIN_GAP_BETWEEN_TRADES_MIN = 12
@@ -51,8 +51,8 @@ FOREX_PAIRS = {
         "decimals": 2,
         "unit_name": "Points",
         "usd_exposure": "SHORT_USD_ON_BUY",
-        "min_sl_dist": 6.20,
-        "max_sl_dist": 11.50,
+        "min_sl_dist": 3.80,    # Tight Right-Shoulder SL allowed ($3.80 - $8.50)
+        "max_sl_dist": 8.50,
         "max_lot_cap": 0.15,
         "is_crypto": False
     },
@@ -68,8 +68,8 @@ FOREX_PAIRS = {
         "decimals": 5,
         "unit_name": "Pips",
         "usd_exposure": "SHORT_USD_ON_BUY",
-        "min_sl_dist": 0.0016,
-        "max_sl_dist": 0.0028,
+        "min_sl_dist": 0.0010,  # 10 Pips Tight Structure SL
+        "max_sl_dist": 0.0022,  # 22 Pips Max SL
         "max_lot_cap": 0.30,
         "is_crypto": False
     },
@@ -85,8 +85,8 @@ FOREX_PAIRS = {
         "decimals": 5,
         "unit_name": "Pips",
         "usd_exposure": "SHORT_USD_ON_BUY",
-        "min_sl_dist": 0.0018,
-        "max_sl_dist": 0.0032,
+        "min_sl_dist": 0.0011,  # 11 Pips Tight Structure SL
+        "max_sl_dist": 0.0024,  # 24 Pips Max SL
         "max_lot_cap": 0.30,
         "is_crypto": False
     },
@@ -102,8 +102,8 @@ FOREX_PAIRS = {
         "decimals": 3,
         "unit_name": "Pips",
         "usd_exposure": "LONG_USD_ON_BUY",
-        "min_sl_dist": 0.180,
-        "max_sl_dist": 0.320,
+        "min_sl_dist": 0.110,   # 11 Pips Tight Structure SL
+        "max_sl_dist": 0.240,   # 24 Pips Max SL
         "max_lot_cap": 0.30,
         "is_crypto": False
     },
@@ -119,8 +119,8 @@ FOREX_PAIRS = {
         "decimals": 3,
         "unit_name": "Pips",
         "usd_exposure": "NEUTRAL",
-        "min_sl_dist": 0.240,
-        "max_sl_dist": 0.400,
+        "min_sl_dist": 0.130,   # 13 Pips Right-Shoulder SL (पहले 24-30 Pips था)
+        "max_sl_dist": 0.250,   # 25 Pips Max Cap
         "max_lot_cap": 0.25,
         "is_crypto": False
     },
@@ -136,8 +136,8 @@ FOREX_PAIRS = {
         "decimals": 5,
         "unit_name": "Pips",
         "usd_exposure": "SHORT_USD_ON_BUY",
-        "min_sl_dist": 0.0014,
-        "max_sl_dist": 0.0025,
+        "min_sl_dist": 0.0009,
+        "max_sl_dist": 0.0020,
         "max_lot_cap": 0.30,
         "is_crypto": False
     },
@@ -153,8 +153,8 @@ FOREX_PAIRS = {
         "decimals": 2,
         "unit_name": "Points",
         "usd_exposure": "NEUTRAL",
-        "min_sl_dist": 320.0,
-        "max_sl_dist": 600.0,
+        "min_sl_dist": 220.0,
+        "max_sl_dist": 480.0,
         "max_lot_cap": 0.15,
         "is_crypto": True
     }
@@ -388,17 +388,12 @@ def fetch_binance_vision_ohlc(binance_symbol, interval_str="5m", limit=120):
     return None
 
 def clean_and_densify_candles(df):
-    """
-    खाली/फ्लैट या टूटी हुई कैंडल्स को हटाता है ताकि चार्ट पर एक भी कैंडल Skip या दूर-दूर न दिखे
-    और हर कैंडल के बीच कंटिन्यूटी (Continuity) बनी रहे।
-    """
     if df is None or df.empty:
         return df
     df = df.copy()
     df = df[~df.index.duplicated(keep="last")]
     df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
 
-    # ऐसी खाली कैंडल्स हटाएं जहाँ Open == High == Low == Close हो और कोई मूवमेंट न हुआ हो
     active_mask = (df["High"] > df["Low"]) | (df["Open"] != df["Close"])
     if active_mask.sum() >= 45:
         df = df[active_mask]
@@ -406,22 +401,16 @@ def clean_and_densify_candles(df):
     return df
 
 def get_clean_spot_data(pair_name, info):
-    """
-    हाई-वॉल्यूम 5M और 15M कैंडल्स लाता है और उन्हें सीधे OANDA Live Spot Price
-    पर सिंक करता है, साथ ही आखिरी चलती कैंडल (Live Running Candle) को भी अपडेट करता है।
-    """
     df_5m  = None
     df_15m = None
     source_used = "OANDA Live Spot Sync"
 
-    # 1. Crypto के लिए Binance Spot Continuous Feed
     if info.get("binance_symbol"):
         df_5m  = fetch_binance_vision_ohlc(info["binance_symbol"], "5m", 120)
         df_15m = fetch_binance_vision_ohlc(info["binance_symbol"], "15m", 100)
         if df_5m is not None and df_15m is not None:
             source_used = "Binance + Bitstamp Live Sync"
 
-    # 2. Gold & Forex के लिए Continuous Institutional Candle Structure
     if df_5m is None or df_15m is None:
         try:
             tkr = yf.Ticker(info["yf_symbol"])
@@ -437,7 +426,6 @@ def get_clean_spot_data(pair_name, info):
     if df_5m is None or df_5m.empty or len(df_5m) < 45 or df_15m is None or df_15m.empty or len(df_15m) < 35:
         return None, None, None, ""
 
-    # 3. Real-Time OANDA Spot Calibration + Live Forming Candle Update
     tv_spot = fetch_tradingview_live_spot(info["tv_ticker"], info["tv_screener"])
     raw_last_close = float(df_5m.iloc[-1]["Close"])
 
@@ -448,7 +436,6 @@ def get_clean_spot_data(pair_name, info):
                 df_5m[col]  = df_5m[col] + basis_diff
                 df_15m[col] = df_15m[col] + basis_diff
 
-        # आखिरी चलती कैंडल को वर्तमान लाइव टिक से अपडेट करें ताकि हर बार नया मूव दिखे
         last_idx = df_5m.index[-1]
         df_5m.loc[last_idx, "Close"] = tv_spot
         if tv_spot > float(df_5m.loc[last_idx, "High"]):
@@ -463,54 +450,79 @@ def get_clean_spot_data(pair_name, info):
     return df_15m, df_5m, live_spot_price, source_used
 
 # =====================================================================
-# 4. SMART TARGET (FRONT-RUN TP) & ANTI-STOP-HUNT BUFFERED SL ENGINE
+# 4. RIGHT-SHOULDER TIGHT SL & SWING-WALL FRONT-RUN TARGET ENGINE
 # =====================================================================
-def calculate_smart_sl_and_easy_tp(df_5m, df_15m, info, direction, live_spot, raw_structure_sl, atr_5m):
+def calculate_smart_sl_and_easy_tp(df_5m, df_15m, info, direction, live_spot, raw_structure_sl, atr_5m, allow_wall_block=True):
+    """
+    FIX #1 (Right-Shoulder Tight SL):
+      अब SL में दोबारा एक्स्ट्रा ATR नहीं जोड़ा जाता और न ही उसे ज़बरदस्ती Head के नीचे धकेला जाता है।
+      SL सटीक Right Shoulder / EMA20 के पीछे (12-18 Pips में) रहता है।
+    FIX #2 (Swing High/Low Wall Radar):
+      पिछले 35 कैंडल्स की सबसे ऊँची चोटी (Resistance Wall) या निचला बॉटम (Support Wall) चेक करता है:
+      - अगर सामने की दीवार बहुत पास है (< 0.85R रास्ता बचा है), तो ट्रेड को ब्लॉक कर देता है।
+      - अगर सामने दीवार है, तो Target 1 (Easy TP) को उस दीवार से 12% पहले ही रख देता है
+        ताकि कैंडल दीवार से टकराकर लौटने से पहले ही Target 1 हिट कर दे!
+    """
     dec = info["decimals"]
 
-    extra_wick_cushion = atr_5m * 0.30
-    if direction == "BUY":
-        buffered_sl = raw_structure_sl - extra_wick_cushion
-    else:
-        buffered_sl = raw_structure_sl + extra_wick_cushion
-
-    raw_sl_dist = abs(live_spot - buffered_sl)
-    min_sl      = max(atr_5m * 1.25, info.get("min_sl_dist", atr_5m * 1.25))
-    max_sl      = max(atr_5m * 2.35, info.get("max_sl_dist", atr_5m * 2.35))
+    # 1. TIGHT STRUCTURE SL (No Double-Buffering!)
+    raw_sl_dist = abs(live_spot - raw_structure_sl)
+    min_sl      = max(atr_5m * 0.85, info.get("min_sl_dist", atr_5m * 0.85))
+    max_sl      = max(atr_5m * 1.85, info.get("max_sl_dist", atr_5m * 1.85))
     sl_dist     = round(max(min_sl, min(raw_sl_dist, max_sl)), dec)
 
-    recent_m5       = df_5m.iloc[-40:-2]
+    # 2. DETECT NEAREST OVERHEAD RESISTANCE / SUPPORT WALL (Last 35 Bars)
+    recent_m5       = df_5m.iloc[-36:-2]
     major_high_wall = float(recent_m5["High"].max())
     major_low_wall  = float(recent_m5["Low"].min())
 
-    default_tp_dist = sl_dist * BASE_EASY_RR_RATIO
+    default_tp2_dist = round(sl_dist * BASE_EASY_RR_RATIO, dec)
+    default_tp1_dist = round(default_tp2_dist * NEAR_TARGET_ALERT_RATIO, dec)
 
     if direction == "BUY":
         room_to_wall = major_high_wall - live_spot
-        if (sl_dist * 1.20) <= room_to_wall <= default_tp_dist:
-            tp_dist = round(room_to_wall * 0.88, dec)
-        else:
-            tp_dist = round(default_tp_dist, dec)
 
-        actual_rr    = round(tp_dist / max(sl_dist, 1e-9), 2)
+        # अगर अभी चोटी टूटी नहीं है और चोटी बहुत ही पास खड़ी है (< 0.85R), तो गलत जगह BUY मत करो!
+        if allow_wall_block and (atr_5m * 0.15) < room_to_wall < (sl_dist * 0.85):
+            return None, 0, None, None, None, 0, 0
+
+        # अगर चोटी (Resistance Wall) 0.85R से 1.55R के बीच खड़ी है (जैसे GBPJPY में 212.16 था):
+        # तो Target 1 को ठीक उस चोटी से थोड़ा पहले (88% दूरी पर) लॉक कर दो!
+        if (sl_dist * 0.85) <= room_to_wall <= (sl_dist * 1.55):
+            tp1_dist = round(room_to_wall * 0.88, dec)
+            tp2_dist = round(max(room_to_wall * 1.05, sl_dist * 1.25), dec)
+        else:
+            tp1_dist = default_tp1_dist
+            tp2_dist = default_tp2_dist
+
+        actual_rr    = round(tp2_dist / max(sl_dist, 1e-9), 2)
         sl_level     = round(live_spot - sl_dist, dec)
         lock_level   = round(live_spot + (sl_dist * LOCK_PROFIT_R), dec)
-        near_tp_lvl  = round(live_spot + (tp_dist * NEAR_TARGET_ALERT_RATIO), dec)
-        target_level = round(live_spot + tp_dist, dec)
+        near_tp_lvl  = round(live_spot + tp1_dist, dec)
+        target_level = round(live_spot + tp2_dist, dec)
+
     else:
         room_to_wall = live_spot - major_low_wall
-        if (sl_dist * 1.20) <= room_to_wall <= default_tp_dist:
-            tp_dist = round(room_to_wall * 0.88, dec)
-        else:
-            tp_dist = round(default_tp_dist, dec)
 
-        actual_rr    = round(tp_dist / max(sl_dist, 1e-9), 2)
+        # अगर नीचे Support की दीवार बहुत पास खड़ी है (< 0.85R), तो गलत जगह SELL मत करो!
+        if allow_wall_block and (atr_5m * 0.15) < room_to_wall < (sl_dist * 0.85):
+            return None, 0, None, None, None, 0, 0
+
+        # अगर नीचे Support की दीवार 0.85R से 1.55R के बीच है, तो Target 1 उस दीवार से पहले रखो!
+        if (sl_dist * 0.85) <= room_to_wall <= (sl_dist * 1.55):
+            tp1_dist = round(room_to_wall * 0.88, dec)
+            tp2_dist = round(max(room_to_wall * 1.05, sl_dist * 1.25), dec)
+        else:
+            tp1_dist = default_tp1_dist
+            tp2_dist = default_tp2_dist
+
+        actual_rr    = round(tp2_dist / max(sl_dist, 1e-9), 2)
         sl_level     = round(live_spot + sl_dist, dec)
         lock_level   = round(live_spot - (sl_dist * LOCK_PROFIT_R), dec)
-        near_tp_lvl  = round(live_spot - (tp_dist * NEAR_TARGET_ALERT_RATIO), dec)
-        target_level = round(live_spot - tp_dist, dec)
+        near_tp_lvl  = round(live_spot - tp1_dist, dec)
+        target_level = round(live_spot - tp2_dist, dec)
 
-    return sl_level, sl_dist, lock_level, near_tp_lvl, target_level, tp_dist, actual_rr
+    return sl_level, sl_dist, lock_level, near_tp_lvl, target_level, tp2_dist, actual_rr
 
 # =====================================================================
 # 5. TECHNICAL INDICATORS & 4 CORE PRICE-ACTION DETECTORS
@@ -601,6 +613,11 @@ def detect_fibonacci_swing_structure(df_5m, lookback=36):
     return None
 
 def detect_reversal_neckline_breakout(df_5m, shock_state):
+    """
+    Inverse H&S / Double Bottom & Top Detector with TRUE RIGHT-SHOULDER SL:
+    SL को सबसे निचले Head के नीचे रखने के बजाय हाल ही के 5-6 कैंडल्स के Right Shoulder
+    और EMA 20 के नीचे रखता है ताकि SL छोटा रहे और टारगेट हवा में न जाए।
+    """
     if len(df_5m) < 40:
         return None
 
@@ -620,14 +637,14 @@ def detect_reversal_neckline_breakout(df_5m, shock_state):
     if np.isnan(atr_5m) or atr_5m <= 0:
         return None
 
-    win = df_5m.iloc[-30:-2]
+    win   = df_5m.iloc[-30:-2]
     highs = win["High"].values
     lows  = win["Low"].values
     times = win.index
     n_len = len(win)
 
-    min_idx = int(np.argmin(lows))
-    max_idx = int(np.argmax(highs))
+    min_idx   = int(np.argmin(lows))
+    max_idx   = int(np.argmax(highs))
     head_low  = float(lows[min_idx])
     head_high = float(highs[max_idx])
     total_rng = head_high - head_low
@@ -635,49 +652,55 @@ def detect_reversal_neckline_breakout(df_5m, shock_state):
     if total_rng < (atr_5m * 2.4):
         return None
 
-    if shock_state != "BEARISH_CRASH" and 4 <= (n_len - min_idx) <= 23:
+    # 1. BULLISH INVERSE H&S BREAKOUT (SL strictly under Right Shoulder & EMA 20)
+    if shock_state != "BEARISH_CRASH" and 5 <= (n_len - min_idx) <= 23:
         post_head_highs = highs[min_idx + 1:]
-        post_head_lows  = lows[min_idx + 2:] if (min_idx + 2) < n_len else lows[min_idx + 1:]
+        # Right Shoulder हमेशा ब्रेकआउट से ठीक पहले के 5 कैंडल्स का Higher Low होता है (Head का Low नहीं!)
+        rs_window_lows  = df_5m.iloc[-7:-2]["Low"].values
 
-        if len(post_head_highs) >= 3 and len(post_head_lows) >= 2:
+        if len(post_head_highs) >= 3 and len(rs_window_lows) >= 3:
             neckline_res       = float(np.max(post_head_highs[:-1])) if len(post_head_highs) > 1 else float(np.max(post_head_highs))
-            right_shoulder_low = float(np.min(post_head_lows))
+            right_shoulder_low = float(np.min(rs_window_lows))
 
             valid_structure = (right_shoulder_low > head_low) and ((neckline_res - head_low) >= atr_5m * 1.1) and ((neckline_res - head_low) <= atr_5m * 3.8)
             broke_neckline  = (price > neckline_res) and (float(df_5m.iloc[-3]["Close"]) <= neckline_res * 1.0003)
             strong_ignition = (price > open_0) and (price > ema9) and (price > ema20) and (body_ratio >= 0.48) and (close_pos >= 0.65) and (disp_power >= 0.95)
 
             if valid_structure and broke_neckline and strong_ignition and (42.0 <= rsi <= 72.0):
-                sl_level = min(right_shoulder_low, low_0) - (atr_5m * SL_STOP_HUNT_BUFFER_ATR)
+                # Right Shoulder और EMA20 के ठीक नीचे सटीक SL
+                rs_anchor = min(right_shoulder_low, ema20, low_0)
+                sl_level  = rs_anchor - (atr_5m * SL_BUFFER_ATR)
                 return {
                     "direction": "BUY",
                     "action": "BUY (LONG) 🟢",
                     "struct_id": f"IHNS_BUY_{times[min_idx]}",
-                    "short_tag": "Inverse H&S Breakout",
-                    "setup_text": f"Inverse H&S / Bottom Reversal Neckline Breakout ({neckline_res:.2f}) | RSI: {rsi:.0f}",
+                    "short_tag": "Right-Shoulder Tight SL",
+                    "setup_text": f"Inverse H&S Neckline Breakout ({neckline_res:.2f}) | Right-Shoulder SL | RSI: {rsi:.0f}",
                     "sl_raw": sl_level
                 }
 
-    if shock_state != "BULLISH_SURGE" and 4 <= (n_len - max_idx) <= 23:
+    # 2. BEARISH H&S BREAKDOWN (SL strictly above Right Shoulder & EMA 20)
+    if shock_state != "BULLISH_SURGE" and 5 <= (n_len - max_idx) <= 23:
         post_head_lows  = lows[max_idx + 1:]
-        post_head_highs = highs[max_idx + 2:] if (max_idx + 2) < n_len else highs[max_idx + 1:]
+        rs_window_highs = df_5m.iloc[-7:-2]["High"].values
 
-        if len(post_head_lows) >= 3 and len(post_head_highs) >= 2:
+        if len(post_head_lows) >= 3 and len(rs_window_highs) >= 3:
             neckline_sup        = float(np.min(post_head_lows[:-1])) if len(post_head_lows) > 1 else float(np.min(post_head_lows))
-            right_shoulder_high = float(np.max(post_head_highs))
+            right_shoulder_high = float(np.max(rs_window_highs))
 
             valid_structure = (right_shoulder_high < head_high) and ((head_high - neckline_sup) >= atr_5m * 1.1) and ((head_high - neckline_sup) <= atr_5m * 3.8)
             broke_neckline  = (price < neckline_sup) and (float(df_5m.iloc[-3]["Close"]) >= neckline_sup * 0.9997)
             strong_collapse = (price < open_0) and (price < ema9) and (price < ema20) and (body_ratio >= 0.48) and (close_pos <= 0.35) and (disp_power >= 0.95)
 
             if valid_structure and broke_neckline and strong_collapse and (28.0 <= rsi <= 58.0):
-                sl_level = max(right_shoulder_high, high_0) + (atr_5m * SL_STOP_HUNT_BUFFER_ATR)
+                rs_anchor = max(right_shoulder_high, ema20, high_0)
+                sl_level  = rs_anchor + (atr_5m * SL_BUFFER_ATR)
                 return {
                     "direction": "SELL",
                     "action": "SELL (SHORT) 🔴",
                     "struct_id": f"HNS_SELL_{times[max_idx]}",
-                    "short_tag": "Double Top Breakdown",
-                    "setup_text": f"H&S / Top Reversal Neckline Breakdown ({neckline_sup:.2f}) | RSI: {rsi:.0f}",
+                    "short_tag": "Right-Shoulder Tight SL",
+                    "setup_text": f"H&S Neckline Breakdown ({neckline_sup:.2f}) | Right-Shoulder SL | RSI: {rsi:.0f}",
                     "sl_raw": sl_level
                 }
 
@@ -738,7 +761,7 @@ def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
 
     fib = detect_fibonacci_swing_structure(df_5m, lookback=36)
 
-    # SETUP A: REVERSAL NECKLINE BREAKOUT
+    # SETUP A: REVERSAL NECKLINE BREAKOUT (Right-Shoulder Tight SL)
     rev = detect_reversal_neckline_breakout(df_5m, shock_state)
     if rev is not None:
         r_dir = rev["direction"]
@@ -767,7 +790,7 @@ def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
                 ema_support   = (price > ema9) and (ema9 >= ema20 * 0.9995)
                 green_trigger = (price > open_0) and (close_pos >= 0.58) and (body_ratio >= 0.42) and (price > float(c1["High"]) or price > float(c1["Close"]))
                 if in_fib_zone and ema_support and green_trigger and (38.0 <= rsi <= 66.0):
-                    sl_raw = min(recent_3_low, fib["fib_786"]) - (atr_5m * SL_STOP_HUNT_BUFFER_ATR)
+                    sl_raw = recent_3_low - (atr_5m * SL_BUFFER_ATR)
                     setup_text = f"Fibonacci Golden Zone (0.50-0.618) + EMA 9/20 Bounce | RSI: {rsi:.0f}"
                     return "BUY (LONG) 🟢", "BUY", setup_text, "Fib 0.618 + EMA Bounce", sl_raw, fib
 
@@ -777,7 +800,7 @@ def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
                 ema_resist    = (price < ema9) and (ema9 <= ema20 * 1.0005)
                 red_trigger   = (price < open_0) and (close_pos <= 0.42) and (body_ratio >= 0.42) and (price < float(c1["Low"]) or price < float(c1["Close"]))
                 if in_fib_zone and ema_resist and red_trigger and (34.0 <= rsi <= 62.0):
-                    sl_raw = max(recent_3_high, fib["fib_786"]) + (atr_5m * SL_STOP_HUNT_BUFFER_ATR)
+                    sl_raw = recent_3_high + (atr_5m * SL_BUFFER_ATR)
                     setup_text = f"Fibonacci Golden Zone (0.50-0.618) + EMA 9/20 Reject | RSI: {rsi:.0f}"
                     return "SELL (SHORT) 🔴", "SELL", setup_text, "Fib 0.618 + EMA Reject", sl_raw, fib
 
@@ -791,7 +814,7 @@ def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
         swept_below  = (low_0 < pool_low and price > pool_low) or (float(c1["Low"]) < pool_low and price > float(c1["High"]) and price > pool_low)
         bull_reclaim = (price > open_0) and (price > ema9) and (close_pos >= 0.62) and (l_wick >= float(c0["Range"]) * 0.28 or disp_power >= 0.95)
         if shock_state != "BEARISH_CRASH" and swept_below and bull_reclaim and (35.0 <= rsi <= 65.0) and now_utc >= sl_direction_lock[pair_name]["BUY"]:
-            sl_raw = min(low_0, float(c1["Low"])) - (atr_5m * SL_STOP_HUNT_BUFFER_ATR)
+            sl_raw = min(low_0, float(c1["Low"])) - (atr_5m * SL_BUFFER_ATR)
             setup_text = f"Liquidity Sweep Stop-Hunt & Bullish Reclaim ({pool_low:.2f}) | RSI: {rsi:.0f}"
             if fib is None:
                 fib = {"swing_id": sweep_id, "fib_500": pool_low, "fib_618": pool_low, "fib_786": sl_raw}
@@ -802,7 +825,7 @@ def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
         swept_above  = (high_0 > pool_high and price < pool_high) or (float(c1["High"]) > pool_high and price < float(c1["Low"]) and price < pool_high)
         bear_reclaim = (price < open_0) and (price < ema9) and (close_pos <= 0.38) and (u_wick >= float(c0["Range"]) * 0.28 or disp_power >= 0.95)
         if shock_state != "BULLISH_SURGE" and swept_above and bear_reclaim and (35.0 <= rsi <= 65.0) and now_utc >= sl_direction_lock[pair_name]["SELL"]:
-            sl_raw = max(high_0, float(c1["High"])) + (atr_5m * SL_STOP_HUNT_BUFFER_ATR)
+            sl_raw = max(high_0, float(c1["High"])) + (atr_5m * SL_BUFFER_ATR)
             setup_text = f"Liquidity Sweep Stop-Hunt & Bearish Breakdown ({pool_high:.2f}) | RSI: {rsi:.0f}"
             if fib is None:
                 fib = {"swing_id": sweep_id, "fib_500": pool_high, "fib_618": pool_high, "fib_786": sl_raw}
@@ -820,7 +843,7 @@ def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
     if box_rng <= (atr_5m * 2.2) and last_structure_traded.get(pair_name) != box_id:
         if htf_bullish and price > box_high and price > open_0 and ema9 > ema20 and body_ratio >= 0.55 and close_pos >= 0.68 and disp_power >= 1.15 and (45.0 <= rsi <= 72.0):
             if now_utc >= sl_direction_lock[pair_name]["BUY"]:
-                sl_raw = max(box_low, low_0) - (atr_5m * SL_STOP_HUNT_BUFFER_ATR)
+                sl_raw = max(box_low, min(low_0, ema20)) - (atr_5m * SL_BUFFER_ATR)
                 setup_text = f"Consolidation Box Breakout Above {box_high:.2f} | RSI: {rsi:.0f}"
                 if fib is None:
                     fib = {"swing_id": box_id, "fib_500": box_high, "fib_618": box_low, "fib_786": sl_raw}
@@ -830,7 +853,7 @@ def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
 
         if htf_bearish and price < box_low and price < open_0 and ema9 < ema20 and body_ratio >= 0.55 and close_pos <= 0.32 and disp_power >= 1.15 and (28.0 <= rsi <= 55.0):
             if now_utc >= sl_direction_lock[pair_name]["SELL"]:
-                sl_raw = min(box_high, high_0) + (atr_5m * SL_STOP_HUNT_BUFFER_ATR)
+                sl_raw = min(box_high, max(high_0, ema20)) + (atr_5m * SL_BUFFER_ATR)
                 setup_text = f"Consolidation Box Breakdown Below {box_low:.2f} | RSI: {rsi:.0f}"
                 if fib is None:
                     fib = {"swing_id": box_id, "fib_500": box_low, "fib_618": box_high, "fib_786": sl_raw}
@@ -844,11 +867,6 @@ def evaluate_all_market_setups(pair_name, pair_info, df_15m, df_5m):
 # 7. DENSE, NON-SKIPPING MT5 CHART GENERATOR
 # =====================================================================
 def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p, near_tp_p, short_tag, lot_size):
-    """
-    बिना किसी गैप या स्किप के (Tight-Packed 34 Candles) साफ चार्ट बनाता है:
-    - हर कैंडल चौड़ी (width=0.78) और एक-दूसरे के बिल्कुल पास होती है।
-    - आखिरी लाइव कैंडल तक पूरा ताज़ा प्राइस मूवमेंट दिखता है।
-    """
     try:
         sub = df_5m.iloc[-34:].copy()
         if sub.empty or len(sub) < 16:
@@ -870,19 +888,16 @@ def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p,
         y_min, y_max = min(all_y), max(all_y)
         total_y_span = max(y_max - y_min, 1e-6)
 
-        # 1. MT5 White Dashed Grid
         ax.grid(True, linestyle="--", linewidth=0.75, color="#d1d5db", alpha=0.85, zorder=1)
         for spine in ["top", "left"]:
             ax.spines[spine].set_visible(False)
         ax.spines["right"].set_color("#9ca3af")
         ax.spines["bottom"].set_color("#9ca3af")
 
-        # 2. Plot Smooth EMA 9 & EMA 20 Lines
         if "EMA9" in sub.columns and "EMA20" in sub.columns:
             ax.plot(x_vals, sub["EMA9"].values, color="#16a34a", linewidth=1.25, alpha=0.80, zorder=3)
             ax.plot(x_vals, sub["EMA20"].values, color="#dc2626", linewidth=1.25, alpha=0.80, zorder=3)
 
-        # 3. Plot Tightly-Packed Candlesticks (width=0.78 so zero skipping/gaps)
         min_visible_body = total_y_span * 0.0055
         for idx in range(n_bars):
             row = sub.iloc[idx]
@@ -899,7 +914,6 @@ def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p,
                 facecolor=body_col, edgecolor=wick_col, linewidth=0.7, zorder=4
             ))
 
-        # 4. Red STOP-LOSS Zone Box
         sl_band_h = abs(sl_p - entry_p) * 0.35
         if direction == "SELL":
             red_rect_y = sl_p - sl_band_h
@@ -914,13 +928,15 @@ def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p,
         ))
         ax.plot([zone_start_idx, right_edge_idx], [sl_p, sl_p], color="#991b1b", linewidth=1.6, zorder=5)
 
-        # 5. Green TARGET Zone Box + Directional Arrow
         tp_box_low  = min(entry_p, tp_p)
         tp_box_high = max(entry_p, tp_p)
         ax.add_patch(mpatches.Rectangle(
             (zone_start_idx + 3, tp_box_low), (right_edge_idx - zone_start_idx - 3), (tp_box_high - tp_box_low),
             facecolor="#22c55e", alpha=0.22, edgecolor="#16a34a", linewidth=1.1, zorder=2
         ))
+
+        # Draw dashed line at Target 1 (Before Wall / Easy TP)
+        ax.plot([zone_start_idx + 3, right_edge_idx], [near_tp_p, near_tp_p], color="#15803d", linestyle="--", linewidth=1.2, alpha=0.85, zorder=4)
 
         arrow_x       = n_bars + 0.8
         arrow_start_y = entry_p + (tp_p - entry_p) * 0.12
@@ -931,7 +947,6 @@ def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p,
             zorder=6
         )
 
-        # 6. Yellow Horizontal ENTRY Line
         ax.axhline(entry_p, color="#eab308", linewidth=2.0, zorder=5)
 
         entry_s   = format_price(entry_p, dec)
@@ -941,7 +956,6 @@ def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p,
 
         mid_zone_x = (zone_start_idx + right_edge_idx) / 2.0
 
-        # STOP-LOSS Label
         sl_va     = "bottom" if direction == "SELL" else "top"
         sl_offset = abs(sl_p - entry_p) * (0.08 if direction == "SELL" else -0.08)
         ax.text(
@@ -952,7 +966,6 @@ def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p,
             zorder=8
         )
 
-        # ENTRY Label
         entry_va     = "bottom" if direction == "SELL" else "top"
         entry_offset = abs(tp_p - entry_p) * (0.06 if direction == "SELL" else -0.06)
         ax.text(
@@ -963,7 +976,6 @@ def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p,
             zorder=8
         )
 
-        # TARGET 1 & TARGET 2 Label
         tp_va     = "top" if direction == "SELL" else "bottom"
         tp_offset = abs(tp_p - entry_p) * (-0.06 if direction == "SELL" else 0.06)
         ax.text(
@@ -974,7 +986,6 @@ def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p,
             zorder=8
         )
 
-        # 7. Right Axis & Live Price Tag
         ax.yaxis.tick_right()
         ax.tick_params(axis="y", labelsize=9.5, colors="#111827")
         ax.set_xlim(-0.8, right_edge_idx)
@@ -1048,15 +1059,10 @@ def send_telegram_signal_with_chart(caption_html, chart_buf, target_chat_id=CHAT
 # 8. MULTI-PAIR CHART COMMANDS & ACTIVE TRADE MANAGEMENT
 # =====================================================================
 def send_instant_preview_chart(pair_key=None):
-    """
-    अगर कोई खास पेयर पूछा गया है (जैसे /eurusd, /gbpusd, /btc, /gold) तो उसका चार्ट भेजता है।
-    अगर सिर्फ /chart लिखा गया है, तो सभी 7 पेयर्स में से सबसे मजबूत एक्टिव सेटअप या अगले पेयर का चार्ट भेजता है (सिर्फ Gold नहीं)।
-    """
     global chart_rotation_index
     pair_names_list = list(FOREX_PAIRS.keys())
 
     if pair_key is None:
-        # पहले चेक करें कि किस पेयर में अभी लाइव सिग्नल बन रहा है
         selected_key = None
         for name, info in FOREX_PAIRS.items():
             df_15m, df_5m, live_spot, _ = get_clean_spot_data(name, info)
@@ -1068,7 +1074,6 @@ def send_instant_preview_chart(pair_key=None):
                     selected_key = name
                     break
 
-        # अगर अभी किसी में तुरंत सिग्नल नहीं है, तो बारी-बारी से अलग-अलग पेयर का ताज़ा चार्ट दिखाएं
         if selected_key is None:
             selected_key = pair_names_list[chart_rotation_index % len(pair_names_list)]
             chart_rotation_index += 1
@@ -1091,12 +1096,14 @@ def send_instant_preview_chart(pair_key=None):
 
     if direction is None:
         direction  = "BUY" if ema9 >= ema20 else "SELL"
-        short_tag  = "EMA 9/20 + Structure"
+        short_tag  = "Right-Shoulder / EMA20 SL"
         setup_text = f"Live M5 Structure ({direction} Bias) | RSI: {float(c0['RSI']):.0f}"
-        custom_sl  = (live_spot - atr_5m * 1.4) if direction == "BUY" else (live_spot + atr_5m * 1.4)
+        rs_low     = float(df_5m.iloc[-6:-1]["Low"].min())
+        rs_high    = float(df_5m.iloc[-6:-1]["High"].max())
+        custom_sl  = (min(rs_low, ema20) - atr_5m * SL_BUFFER_ATR) if direction == "BUY" else (max(rs_high, ema20) + atr_5m * SL_BUFFER_ATR)
 
     sl_level, sl_dist, lock_level, near_tp_lvl, target_level, tp_dist, actual_rr = calculate_smart_sl_and_easy_tp(
-        df_5m, df_15m, info, direction, live_spot, custom_sl, atr_5m
+        df_5m, df_15m, info, direction, live_spot, custom_sl, atr_5m, allow_wall_block=False
     )
     lot_size = calculate_exact_mt5_lot(pair_key, info, sl_dist, RISK_PER_TRADE_USD)
 
@@ -1107,8 +1114,8 @@ def send_instant_preview_chart(pair_key=None):
         f"📊 <b>{pair_key} ({info['mt5_name']}) — LIVE M5 ANALYSIS</b>\n\n"
         f"🧠 <b>Structure:</b> {setup_text}\n"
         f"📍 <b>Live Spot:</b> <code>{format_price(live_spot, info['decimals'])}</code>\n"
-        f"🛑 <b>Buffered SL:</b> <code>{format_price(sl_level, info['decimals'])}</code>\n"
-        f"🎯 <b>Target 1 (Easy TP):</b> <code>{format_price(near_tp_lvl, info['decimals'])}</code> | <b>Target 2:</b> <code>{format_price(target_level, info['decimals'])}</code>\n"
+        f"🛑 <b>Tight Structure SL:</b> <code>{format_price(sl_level, info['decimals'])}</code>\n"
+        f"🎯 <b>Target 1 (Before Wall):</b> <code>{format_price(near_tp_lvl, info['decimals'])}</code> | <b>Target 2:</b> <code>{format_price(target_level, info['decimals'])}</code>\n"
         f"💼 <b>Lot Size:</b> <code>{lot_size:.2f} Lot</code>"
     )
     send_telegram_signal_with_chart(caption, chart_buf)
@@ -1159,7 +1166,6 @@ def check_telegram_commands():
                 elif msg_text in ["/chart", "chart"]:
                     send_instant_preview_chart(None)
                 else:
-                    # चेक करें कि यूजर ने किसी खास पेयर का नाम लिखा है क्या (जैसे /eurusd, /gbpusd, /usdjpy, /btc, /gold)
                     for p_name, p_info in FOREX_PAIRS.items():
                         if msg_text in p_info.get("cmd_keys", []) or msg_text == f"/chart {p_info['mt5_name'].lower()}":
                             send_instant_preview_chart(p_name)
@@ -1195,9 +1201,9 @@ def manage_open_trades(pair_name, candle_time, live_spot, latest_5m, decimals):
                     trade["trailed_to_cost"] = True
                     trade["sl"]              = trade["entry"]
                     half_prof                = round(trade["max_risk"] * 0.5, 1)
-                    trade["status"]          = "0.65R LOCKED"
+                    trade["status"]          = "0.60R LOCKED"
                     send_telegram_message(
-                        f"🛡️ <b>0.65R SAFE LOCK REACHED — MOVE SL TO ENTRY</b> 🛡️\n\n"
+                        f"🛡️ <b>0.60R SAFE LOCK REACHED — MOVE SL TO ENTRY</b> 🛡️\n\n"
                         f"🌍 <b>Asset:</b> {trade['pair']} (<b>{trade['lot_size']} Lot</b>)\n"
                         f"📍 <b>Entry:</b> {entry_str}  |  <b>Live Spot:</b> {price_str}\n"
                         f"📢 <b>Action:</b> 50% लॉट बुक करें (<b>+${half_prof:.0f}</b>) और बचे हुए लॉट का SL <b>Entry ({entry_str})</b> पर लगा दें।"
@@ -1212,12 +1218,12 @@ def manage_open_trades(pair_name, candle_time, live_spot, latest_5m, decimals):
 
                 if near_hit:
                     trade["near_tp_alerted"] = True
-                    near_prof = round(trade["expected_profit"] * 0.85, 1)
+                    near_prof = round(trade["expected_profit"] * 0.80, 1)
                     send_telegram_message(
-                        f"⚡ <b>TARGET 1 (Easy TP) HIT — BOOK / LOCK PROFIT NOW</b> ⚡\n\n"
+                        f"⚡ <b>TARGET 1 (Before Resistance Wall) HIT — BOOK PROFIT NOW</b> ⚡\n\n"
                         f"🌍 <b>Asset:</b> {trade['pair']} (<b>{trade['lot_size']} Lot</b>)\n"
                         f"📍 <b>Live Price:</b> {price_str}  |  <b>Target 2:</b> {target_str}\n"
-                        f"💰 <b>Action:</b> Easy Target 1 हिट हो चुका है (<b>+${near_prof:.0f}</b>)। यहाँ 75-80% प्रॉफिट बुक कर लें!"
+                        f"💰 <b>Action:</b> सामने की रुकावट (Wall) से ठीक पहले वाला Easy Target 1 हिट हो चुका है (<b>+${near_prof:.0f}</b>)। यहाँ 75-80% प्रॉफिट बुक कर लें और SL को Entry पर लॉक रखें!"
                     )
 
             hit_type = None
@@ -1240,7 +1246,7 @@ def manage_open_trades(pair_name, candle_time, live_spot, latest_5m, decimals):
                 total_account_pnl += net_win
                 trade["status"] = "TARGET HIT"
                 send_telegram_message(
-                    f"🎯 <b>FULL TARGET HIT (+${net_win:.0f})</b> 🎯\n\n"
+                    f"🎯 <b>FULL TARGET 2 HIT (+${net_win:.0f})</b> 🎯\n\n"
                     f"🌍 <b>Asset:</b> {trade['pair']} (<b>{trade['lot_size']} Lot</b>)\n"
                     f"📍 <b>Entry:</b> {entry_str}  ➡️  <b>Target:</b> {target_str}\n"
                     f"💰 <b>Net Profit:</b> <b>+${net_win:.0f}</b>"
@@ -1339,10 +1345,11 @@ def scan_markets():
                     continue
 
                 sl_level, sl_dist, half_target_level, near_tp_level, target_level, target_dist, actual_rr = calculate_smart_sl_and_easy_tp(
-                    df_5m, df_15m, info, direction, live_spot, custom_sl, atr_5m
+                    df_5m, df_15m, info, direction, live_spot, custom_sl, atr_5m, allow_wall_block=True
                 )
 
-                if sl_dist <= 0 or target_dist <= 0:
+                # अगर सामने बहुत पास Resistance/Support की दीवार खड़ी है, तो यह ट्रेड छोड़ देगा
+                if sl_level is None or sl_dist <= 0 or target_dist <= 0:
                     continue
 
                 last_candle_traded[name] = closed_time
@@ -1393,10 +1400,10 @@ def scan_markets():
                     f"📢 <b>Action:</b> <b>{signal}</b>\n"
                     f"🧠 <b>Setup:</b> {setup_text}\n\n"
                     f"📍 <b>Entry Price:</b> <code>{entry_s}</code>\n"
-                    f"🛑 <b>Stop-Loss (SL):</b> <code>{sl_s}</code>  <i>({sl_pips_str})</i>\n"
-                    f"🎯 <b>Target 1 (Easy TP):</b> <code>{near_tp_s}</code>\n"
+                    f"🛑 <b>Tight Structure SL:</b> <code>{sl_s}</code>  <i>({sl_pips_str})</i>\n"
+                    f"🎯 <b>Target 1 (Before Wall):</b> <code>{near_tp_s}</code>\n"
                     f"🎯 <b>Target 2 (Full TP):</b> <code>{target_s}</code>  <i>({target_pips_str})</i>\n"
-                    f"🛡️ <b>0.65R Safe Lock:</b> <code>{half_s}</code>\n\n"
+                    f"🛡️ <b>0.60R Safe Lock:</b> <code>{half_s}</code>\n\n"
                     f"💼 <b>Lot Size:</b> <b><code>{exact_lot:.2f} Lot</code></b>\n"
                     f"💰 <b>Risk:</b> ${max_risk_usd:.0f}  ➡️  <b>Reward:</b> <b>+${expected_prof:.0f}</b>"
                 )
