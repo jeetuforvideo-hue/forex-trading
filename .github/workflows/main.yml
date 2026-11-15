@@ -19,9 +19,11 @@ jobs:
           python-version: '3.10'
 
       - name: Install Libraries
-        run: pip install yfinance pandas numpy requests
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install yfinance pandas numpy requests matplotlib
 
       - name: Run Forex Pro Bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-        run: python3 forex_bot.py
+        run: python forex_bot.py
