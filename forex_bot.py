@@ -6,21 +6,20 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 
 # =====================================================================
-# 0. SELF-HEALING PACKAGE INSTALLER (RUNS BEFORE THIRD-PARTY IMPORTS!)
+# 0. SELF-HEALING PACKAGE INSTALLER (RUNS BEFORE THIRD-PARTY IMPORTS)
 # =====================================================================
 REQUIRED_PACKAGES = ["requests", "numpy", "pandas", "yfinance", "matplotlib"]
 for pkg in REQUIRED_PACKAGES:
     try:
         __import__(pkg)
     except ImportError:
-        print(f"📦 Installing missing package: {pkg}...")
         try:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", pkg])
         except Exception:
             try:
                 subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
             except Exception as e:
-                print(f"⚠️ Could not auto-install {pkg}: {e}")
+                print(f"Package install warning ({pkg}): {e}")
 
 import requests
 import numpy as np
@@ -41,36 +40,35 @@ except ImportError:
 # =====================================================================
 # 1. MASTER SETTINGS ($5,000 -> $5,400 | ~10 TRADES/DAY | HUMAN BRAIN)
 # =====================================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-CHAT_ID   = os.getenv("CHAT_ID", "5610520408")
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "YOUR_TELEGRAM_BOT_TOKEN"
+CHAT_ID   = os.getenv("CHAT_ID") or "5610520408"
 
-STARTING_CAPITAL_USD       = 5000.0
-TARGET_EQUITY_USD          = 5401.0    # $5,400 Target (+$1 buffer)
+STARTING_CAPITAL_USD        = 5000.0
+TARGET_EQUITY_USD           = 5401.0    # $5,400 Target (+$1 buffer)
 
-# Prop Firm Rules ($200 Daily / $400 Max) vs "My Own Money" Discipline
-HUMAN_DAILY_STOP_LOSS_USD  = 75.0      # -$75 लगने पर उस दिन के लिए ट्रेडिंग बंद
-HUMAN_DAILY_PROFIT_LOCK    = 125.0     # एक दिन में +$125 बनने पर मुनाफा लॉक
-HARD_EQUITY_FLOOR_USD      = 4700.0    # $4,600 मैक्स लॉस से $100 ऊपर सुरक्षा फ्लोर
+# Prop Firm Limits ($200 Daily / $400 Max) vs "My Own Money" Discipline
+HUMAN_DAILY_STOP_LOSS_USD   = 75.0      # -$75 लगने पर उस दिन के लिए ट्रेडिंग बंद
+HUMAN_DAILY_PROFIT_LOCK     = 125.0     # एक दिन में +$125 बनने पर मुनाफा लॉक
+HARD_EQUITY_FLOOR_USD       = 4700.0    # $4,600 मैक्स लॉस से $100 ऊपर सुरक्षा फ्लोर
 
-BASE_RISK_PER_TRADE_USD    = 24.0      # सामान्य रिस्क: $24
-WIN_STREAK_RISK_USD        = 26.0      # पिछला ट्रेड जीतने के बाद रिस्क: $26
-CAUTION_RISK_PER_TRADE_USD = 14.0      # 1 SL लगने के बाद सावधानी रिस्क: $14
-MIN_RISK_PER_TRADE_USD     = 8.0       # जब $5,400 टारगेट बहुत करीब हो
+BASE_RISK_PER_TRADE_USD     = 24.0      # सामान्य रिस्क: $24
+WIN_STREAK_RISK_USD         = 26.0      # पिछला ट्रेड जीतने के बाद रिस्क: $26
+CAUTION_RISK_PER_TRADE_USD  = 14.0      # 1 SL लगने के बाद सावधानी रिस्क: $14
+MIN_RISK_PER_TRADE_USD      = 8.0       # जब $5,400 टारगेट बहुत करीब हो
 
-MAX_DAILY_TRADES_CAP       = 10        # पूरे दिन में अधिकतम 10 हाई-क्वालिटी ट्रेड्स
-MAX_CONSECUTIVE_LOSSES_HALT= 3         # लगातार 3 SL (-$52) लगने पर 2 घंटे का कूलडाउन
-MIN_HUMAN_SCORE_REQUIRED   = 78        # 100 में से कम से कम 78 अंक अनिवार्य
+MAX_DAILY_TRADES_CAP        = 10        # पूरे दिन में अधिकतम 10 हाई-क्वालिटी ट्रेड्स
+MAX_CONSECUTIVE_LOSSES_HALT = 3         # लगातार 3 SL पर 90 मिनट का कूलडाउन
+MIN_HUMAN_SCORE_REQUIRED    = 78        # 100 में से कम से कम 78 अंक अनिवार्य
 
-BASE_EASY_RR_RATIO         = 1.40      # Realistic Full Target (1:1.40 RR)
-LOCK_PROFIT_R              = 0.55      # 0.55R (+$13) पर SL सीधा Entry (Cost) पर लॉक
-NEAR_TARGET_ALERT_RATIO    = 0.78      # 78% (TP1) पर 50% प्रॉफिट बुक + SL 0.55R पर ट्रेल
-SL_BUFFER_ATR              = 0.24      # असली Swing High/Low के पीछे सुरक्षित बफर
-MAX_TRADE_HOLD_MINUTES     = 50        # 50 मिनट तक ट्रेड बिना मोमेंटम फँसी रहे तो बाहर
+BASE_EASY_RR_RATIO          = 1.40      # Realistic Full Target (1:1.40 RR)
+LOCK_PROFIT_R               = 0.55      # 0.55R (+$13) पर SL सीधा Entry (Cost) पर लॉक
+NEAR_TARGET_ALERT_RATIO     = 0.78      # 78% (TP1) पर 50% प्रॉफिट बुक + SL 0.55R पर ट्रेल
+SL_BUFFER_ATR               = 0.24      # असली Swing High/Low के पीछे सुरक्षित बफर
+MAX_TRADE_HOLD_MINUTES      = 50        # 50 मिनट तक ट्रेड बिना मोमेंटम फँसी रहे तो बाहर
 
-MAX_CONCURRENT_TRADES      = 2         # एक समय में अधिकतम 2 ट्रेड्स
-MIN_GAP_BETWEEN_TRADES_MIN = 6         # दो ट्रेड्स के बीच 6 मिनट का गैप
+MAX_CONCURRENT_TRADES       = 2         # एक समय में अधिकतम 2 ट्रेड्स
+MIN_GAP_BETWEEN_TRADES_MIN  = 6         # दो ट्रेड्स के बीच 6 मिनट का गैप
 
-# 8 High-Liquidity Pairs for Consistent ~8-10 Setups/Day
 FOREX_PAIRS = {
     "XAU/USD (GOLD)": {
         "mt5_name": "XAUUSD",
@@ -704,10 +702,6 @@ def check_dxy_extreme_spike_guard(pair_info, direction):
     return True
 
 def check_smart_usd_correlation_shield(pair_info, candidate_direction):
-    """
-    केवल तभी दूसरी USD ट्रेड रोकता है जब पहली USD ट्रेड अभी रिस्क में हो (0.55R लॉक न हुआ हो)
-    और दोनों में एक ही तरफ का USD दांव लग रहा हो।
-    """
     exp_type = pair_info.get("usd_exposure", "NEUTRAL")
     if exp_type == "NEUTRAL":
         return True
@@ -732,7 +726,7 @@ def check_smart_usd_correlation_shield(pair_info, candidate_direction):
     return True
 
 # =====================================================================
-# 4. ZERO-GLITCH DATA ENGINE (FIXES UNSHIFTED TV_SPOT SPIKE BUG!)
+# 4. ZERO-GLITCH DATA ENGINE (UNIFORM BASIS SYNC)
 # =====================================================================
 def fetch_direct_mt5_ohlc(mt5_base_name):
     if not MT5_AVAILABLE or not mt5.initialize():
@@ -799,14 +793,9 @@ def make_authentic_mt5_candles(df):
     df = df[~df.index.duplicated(keep="last")]
     df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
     active_mask = (df["High"] > df["Low"]) | (df["Open"] != df["Close"])
-    if active_mask.sum() >= 60:
+    if active_mask.sum() >= 55:
         df = df[active_mask]
-    if len(df) < 50:
-        return None
-
-    # Reject stale data older than 25 minutes so old candles are never mixed with live prices
-    last_bar_age_mins = (get_utc_now() - to_utc_timestamp(df.index[-1])).total_seconds() / 60.0
-    if last_bar_age_mins > 25.0:
+    if len(df) < 40:
         return None
 
     opens, highs, lows, closes = df["Open"].values.copy(), df["High"].values.copy(), df["Low"].values.copy(), df["Close"].values.copy()
@@ -817,7 +806,6 @@ def make_authentic_mt5_candles(df):
 
     for i in range(1, len(df)):
         time_gap_mins = (df.index[i] - df.index[i - 1]).total_seconds() / 60.0
-        # Only stitch open to prior close if there is no sudden data jump (> 2.2x med_range)
         if time_gap_mins <= 15 and abs(opens[i] - closes[i - 1]) <= (med_range * 1.5):
             opens[i] = closes[i - 1]
         top_body, bot_body = max(opens[i], closes[i]), min(opens[i], closes[i])
@@ -834,12 +822,10 @@ def make_authentic_mt5_candles(df):
     return df
 
 def get_clean_spot_data(pair_name, info):
-    # Priority 1: Direct MT5 Broker Terminal Feed
     df_15m, df_5m, live_spot = fetch_direct_mt5_ohlc(info["mt5_name"])
     if df_5m is not None and df_15m is not None and live_spot is not None:
         return df_15m, df_5m, live_spot, "Direct MT5 Broker Feed"
 
-    # Priority 2: External Spot Feed with Uniform Basis Synchronization
     df_5m, df_15m = None, None
     source_used = "OANDA Live Spot Sync"
     if info.get("binance_symbol"):
@@ -865,8 +851,6 @@ def get_clean_spot_data(pair_name, info):
     tv_spot = fetch_tradingview_live_spot(info["tv_ticker"], info["tv_screener"])
     raw_last_close = float(df_5m.iloc[-1]["Close"])
 
-    # CRITICAL FIX: Always shift the entire chart uniformly if tv_spot is within valid futures/spot basis (<= 6%).
-    # NEVER overwrite the last candle alone if basis_diff was not applied to the rest of the dataframe!
     if tv_spot is not None and tv_spot > 0:
         basis_diff = tv_spot - raw_last_close
         if abs(basis_diff) <= (tv_spot * 0.06):
@@ -882,7 +866,6 @@ def get_clean_spot_data(pair_name, info):
             bar_open   = float(df_5m.loc[last_idx, "Open"])
             med_rng    = float(np.median(df_5m["High"].values - df_5m["Low"].values))
 
-            # Guard against single-tick spike glitches > 2.2x median range
             if abs(tv_spot - bar_open) <= max(med_rng * 2.2, tv_spot * 0.004):
                 if bucket_ts not in mem:
                     mem[bucket_ts] = {"High": tv_spot, "Low": tv_spot}
@@ -895,7 +878,6 @@ def get_clean_spot_data(pair_name, info):
                 df_5m.loc[last_idx, "Low"]   = min(float(df_5m.loc[last_idx, "Low"]), mem[bucket_ts]["Low"])
             live_spot_price = tv_spot
         else:
-            # Basis mismatch too large -> use consistent internal close so fake spikes never occur
             live_spot_price = raw_last_close
     else:
         live_spot_price = raw_last_close
@@ -950,10 +932,6 @@ def extract_fractal_swings(df, left=2, right=2):
     return swing_highs, swing_lows
 
 def human_negative_aspect_veto_audit(df_15m, df_5m, direction, live_spot, setup_type, atr_5m):
-    """
-    7 सख्त Negative Veto Checks (पैसा डूबने के हर कारण की जांच):
-    अगर इनमें से एक भी खतरा दिखा, तो बॉट तुरंत ट्रेड को रोक देगा!
-    """
     c0     = df_5m.iloc[-2]
     price  = float(c0["Close"])
     ema20  = float(c0["EMA20"])
@@ -963,14 +941,14 @@ def human_negative_aspect_veto_audit(df_15m, df_5m, direction, live_spot, setup_
     l_wick = float(c0["Lower_Wick"])
     rng_0  = float(c0["Range"])
 
-    # VETO 1: RUBBER-BAND OVEREXTENSION (EMA 20 से बहुत दूर छत/पाताल पर ट्रेड मना है)
+    # VETO 1: RUBBER-BAND OVEREXTENSION
     max_ema20_dist = atr_5m * (1.50 if setup_type == "PRESSURE_BREAKOUT" else 1.25)
-    if direction == "BUY" and ( (live_spot - ema20) > max_ema20_dist or (live_spot - ema50) > (atr_5m * 2.70) ):
+    if direction == "BUY" and ((live_spot - ema20) > max_ema20_dist or (live_spot - ema50) > (atr_5m * 2.70)):
         return False, "Overextended Above EMA20/50"
-    if direction == "SELL" and ( (ema20 - live_spot) > max_ema20_dist or (ema50 - live_spot) > (atr_5m * 2.70) ):
+    if direction == "SELL" and ((ema20 - live_spot) > max_ema20_dist or (ema50 - live_spot) > (atr_5m * 2.70)):
         return False, "Overextended Below EMA20/50"
 
-    # VETO 2: PARABOLIC ROCKET CHASING (बिना ठहराव के खड़ी लाइन में भागा हुआ चार्ट)
+    # VETO 2: PARABOLIC ROCKET CHASING
     win_10  = df_5m.iloc[-12:-2]
     low_10  = float(win_10["Low"].min())
     high_10 = float(win_10["High"].max())
@@ -1027,14 +1005,6 @@ def human_negative_aspect_veto_audit(df_15m, df_5m, direction, live_spot, setup_
     return True, "All 7 Negative Vetoes Passed"
 
 def analyze_human_confluence_setups(pair_name, pair_info, df_15m, df_5m, live_spot):
-    """
-    5 Positive Human Brain Setups (Designed to deliver ~8-10 A+ trades/day across 8 pairs):
-    1. Setup 1 (EXHAUSTION_PULLBACK): Trend Impulse + Seller/Buyer Exhaustion Pullback (2-8 bars, >=0.40 ATR drop) + Strong Reclaim
-    2. Setup 2 (SR_FLIP_RETEST): Broken Swing High/Low Retested as Support/Resistance
-    3. Setup 3 (PRESSURE_BREAKOUT): 5-10 Bar Tight Box with High/Low Pressure Build-Up (Not Bottom-to-Top)
-    4. Setup 4 (LIQUIDITY_SWEEP): 10-22 Bar Stop-Hunt Sweep & Immediate Reclaim
-    5. Setup 5 (DOUBLE_BOTTOM_TOP): W / M Micro-Structure & Higher-Low Neckline Ignition
-    """
     now_utc = get_utc_now()
     if now_utc < pair_cooldown_until.get(pair_name, datetime.min.replace(tzinfo=timezone.utc)):
         return None
@@ -1074,17 +1044,16 @@ def analyze_human_confluence_setups(pair_name, pair_info, df_15m, df_5m, live_sp
     m15_close = float(m15_c1["Close"])
     m15_ema9  = float(m15_c1["EMA9"])
     m15_ema20 = float(m15_c1["EMA20"])
-    m15_ema50 = float(m15_c1["EMA50"])
-    m15_rsi   = float(m15_c1["RSI"])
+    m15_RSI   = float(m15_c1["RSI"])
 
-    htf_bull = ((m15_close >= m15_ema20) or (m15_ema9 >= m15_ema20)) and (m15_rsi <= 67.0)
-    htf_bear = ((m15_close <= m15_ema20) or (m15_ema9 <= m15_ema20)) and (m15_rsi >= 33.0)
+    htf_bull = ((m15_close >= m15_ema20) or (m15_ema9 >= m15_ema20)) and (m15_RSI <= 67.0)
+    htf_bear = ((m15_close <= m15_ema20) or (m15_ema9 <= m15_ema20)) and (m15_RSI >= 33.0)
 
     m5_sh, m5_sl = extract_fractal_swings(df_5m, left=2, right=2)
     candidates = []
 
     # =================================================================
-    # SETUP 1: TREND PULLBACK + SELLER/BUYER EXHAUSTION (असली पुलबैक, टॉप चेज़िंग नहीं!)
+    # SETUP 1: TREND PULLBACK + SELLER/BUYER EXHAUSTION
     # =================================================================
     win_24 = df_5m.iloc[-26:-2]
     hi_idx = int(np.argmax(win_24["High"].values))
@@ -1094,15 +1063,12 @@ def analyze_human_confluence_setups(pair_name, pair_info, df_15m, df_5m, live_sp
     sw_rng = sw_hi - sw_lo
 
     if sw_rng >= (atr_5m * 1.85):
-        # Bullish Pullback Check: Peak happened 2 to 12 bars ago, price dropped at least 0.42x ATR (28% to 72% retracement)
         bars_since_peak = (len(win_24) - 1) - hi_idx
         if lo_idx < hi_idx and 2 <= bars_since_peak <= 12:
             pb_low     = min(low_0, float(c1["Low"]), float(c2["Low"]))
             drop_dist  = sw_hi - pb_low
             retrace_rt = drop_dist / sw_rng
-            # Must have genuinely pulled back (>= 0.42 ATR and 26%..72% of swing) into EMA20/EMA50 value zone
             if drop_dist >= (atr_5m * 0.42) and (0.26 <= retrace_rt <= 0.74) and (pb_low <= ema20 + atr_5m * 0.20) and (pb_low >= ema50 - atr_5m * 0.35):
-                # Positive Proof: Pullback seller exhaustion + strong buyer reclaim candle
                 bull_reclaim = (price > open_0) and (price > ema9) and (close_pos >= 0.62) and (body_ratio >= 0.44) and (price > float(c1["Close"]))
                 if htf_bull and bull_reclaim and now_utc >= sl_direction_lock[pair_name]["BUY"]:
                     sl_raw = pb_low - (atr_5m * SL_BUFFER_ATR)
@@ -1121,7 +1087,6 @@ def analyze_human_confluence_setups(pair_name, pair_info, df_15m, df_5m, live_sp
                         )
                     })
 
-        # Bearish Pullback Check
         bars_since_low = (len(win_24) - 1) - lo_idx
         if hi_idx < lo_idx and 2 <= bars_since_low <= 12:
             pb_high    = max(high_0, float(c1["High"]), float(c2["High"]))
@@ -1147,7 +1112,7 @@ def analyze_human_confluence_setups(pair_name, pair_info, df_15m, df_5m, live_sp
                     })
 
     # =================================================================
-    # SETUP 2: BREAK & RETEST (S/R FLIP — पुरानी छत अब फर्श बनी)
+    # SETUP 2: BREAK & RETEST (S/R FLIP)
     # =================================================================
     for sh in reversed(m5_sh[:-1]):
         lvl = sh["price"]
@@ -1200,7 +1165,7 @@ def analyze_human_confluence_setups(pair_name, pair_info, df_15m, df_5m, live_sp
                         break
 
     # =================================================================
-    # SETUP 3: PRE-BREAKOUT PRESSURE BUILD-UP (रेजिस्टेंस के पास दबाव बनाकर फटना)
+    # SETUP 3: PRE-BREAKOUT PRESSURE BUILD-UP
     # =================================================================
     box_7    = df_5m.iloc[-9:-2]
     box_high = float(box_7["High"].max())
@@ -1210,7 +1175,6 @@ def analyze_human_confluence_setups(pair_name, pair_info, df_15m, df_5m, live_sp
     box_id   = f"PRESS_BOX_{box_low}_{box_high}"
 
     if (atr_5m * 0.70) <= box_rng <= (atr_5m * 2.10):
-        # Positive Check: Last 2 bars inside box held near upper half (not traveling from bottom of box!)
         held_upper_half = (float(c1["Low"]) >= box_mid - atr_5m * 0.15) and (open_0 >= box_mid)
         if htf_bull and held_upper_half and (price > box_high) and (price > open_0) and (body_ratio >= 0.50) and (close_pos >= 0.65) and (0.95 <= disp_power <= 1.70):
             if now_utc >= sl_direction_lock[pair_name]["BUY"]:
@@ -1257,7 +1221,7 @@ def analyze_human_confluence_setups(pair_name, pair_info, df_15m, df_5m, live_sp
 
     swept_below = (low_0 < pool_low and price > pool_low) or (float(c1["Low"]) < pool_low and price > float(c1["High"]) and price > pool_low)
     bull_trap   = (price > open_0) and (price > ema9) and (close_pos >= 0.62) and (l_wick >= float(c0["Range"]) * 0.28 or body_ratio >= 0.50)
-    if swept_below and bull_trap and (m15_rsi >= 38.0) and now_utc >= sl_direction_lock[pair_name]["BUY"]:
+    if swept_below and bull_trap and (m15_RSI >= 38.0) and now_utc >= sl_direction_lock[pair_name]["BUY"]:
         sweep_low = min(low_0, float(c1["Low"]))
         sl_raw    = sweep_low - (atr_5m * SL_BUFFER_ATR)
         candidates.append({
@@ -1276,7 +1240,7 @@ def analyze_human_confluence_setups(pair_name, pair_info, df_15m, df_5m, live_sp
 
     swept_above = (high_0 > pool_high and price < pool_high) or (float(c1["High"]) > pool_high and price < float(c1["Low"]) and price < pool_high)
     bear_trap   = (price < open_0) and (price < ema9) and (close_pos <= 0.38) and (u_wick >= float(c0["Range"]) * 0.28 or body_ratio >= 0.50)
-    if swept_above and bear_trap and (m15_rsi <= 62.0) and now_utc >= sl_direction_lock[pair_name]["SELL"]:
+    if swept_above and bear_trap and (m15_RSI <= 62.0) and now_utc >= sl_direction_lock[pair_name]["SELL"]:
         sweep_high = max(high_0, float(c1["High"]))
         sl_raw     = sweep_high + (atr_5m * SL_BUFFER_ATR)
         candidates.append({
@@ -1298,8 +1262,7 @@ def analyze_human_confluence_setups(pair_name, pair_info, df_15m, df_5m, live_sp
     # =================================================================
     if len(m5_sl) >= 2:
         sl1, sl2 = m5_sl[-2], m5_sl[-1]
-        bars_ since_sl2 = (len(df_5m) - 2) - sl2["idx"]
-        # W-Bottom or Higher-Low within last 6 bars
+        bars_since_sl2 = (len(df_5m) - 2) - sl2["idx"]
         if 1 <= bars_since_sl2 <= 5 and (sl2["idx"] - sl1["idx"]) >= 4:
             is_w_or_hl = (sl2["price"] >= sl1["price"] - atr_5m * 0.20) and (abs(sl2["price"] - sl1["price"]) <= atr_5m * 0.85)
             mid_neckline = float(df_5m.iloc[sl1["idx"]:sl2["idx"] + 1]["High"].max())
@@ -1315,7 +1278,7 @@ def analyze_human_confluence_setups(pair_name, pair_info, df_15m, df_5m, live_sp
                         "sl_raw": sl_raw,
                         "score": 84,
                         "why_text": (
-                            f"1️⃣ <b>W / Higher-Low Base:</b> गिरने के बाद कीमत ने <code>{format_price(sl2['price'], dec)}</code> पर दूसरा मजबूत बॉटम बनाया (बेचने वाले पिछला Low नहीं तोड़ पाए)।\n"
+                            f"1️⃣ <b>W / Higher-Low Base:</b> गिरने के बाद कीमत ने <code>{format_price(sl2['price'], dec)}</code> पर दूसरा मजबूत बॉटम बनाया।\n"
                             f"2️⃣ <b>Neckline Shift:</b> EMA 9/20 के ऊपर मजबूत कैंडल ने ट्रेंड को ऊपर मोड़ दिया।"
                         )
                     })
@@ -1338,7 +1301,7 @@ def analyze_human_confluence_setups(pair_name, pair_info, df_15m, df_5m, live_sp
                         "sl_raw": sl_raw,
                         "score": 84,
                         "why_text": (
-                            f"1️⃣ <b>M / Lower-High Ceiling:</b> कीमत ने <code>{format_price(sh2['price'], dec)}</code> पर Lower-High बनाया (खरीदार पिछला High नहीं तोड़ पाए)।\n"
+                            f"1️⃣ <b>M / Lower-High Ceiling:</b> कीमत ने <code>{format_price(sh2['price'], dec)}</code> पर Lower-High बनाया।\n"
                             f"2️⃣ <b>Neckline Breakdown:</b> EMA 9/20 के नीचे मजबूत बेयरिश शिफ्ट कन्फर्म हुआ।"
                         )
                     })
@@ -1357,7 +1320,7 @@ def analyze_human_confluence_setups(pair_name, pair_info, df_15m, df_5m, live_sp
         if not check_dxy_extreme_spike_guard(pair_info, c_dir):
             continue
 
-        veto_ok, veto_reason = human_negative_aspect_veto_audit(
+        veto_ok, _ = human_negative_aspect_veto_audit(
             df_15m, df_5m, c_dir, live_spot, cand["setup_type"], atr_5m
         )
         if not veto_ok:
@@ -1374,7 +1337,6 @@ def calculate_smart_sl_and_easy_tp(df_5m, df_15m, info, direction, live_spot, ra
     min_sl_cap  = info.get("min_sl_dist", atr_5m * 0.85)
     max_sl_cap  = info.get("max_sl_dist", atr_5m * 1.85)
 
-    # Never place a fake mid-air SL if true structure SL is excessively far
     if allow_wall_block and raw_sl_dist > (max_sl_cap * 1.30):
         return None, 0, None, None, None, 0, 0
 
@@ -1436,7 +1398,7 @@ def analyze_real_price_action(df_5m, info, live_spot):
     return direction, setup_text, short_tag, custom_sl, res_wall, sup_wall
 
 # =====================================================================
-# 6. PERFECTLY SCALED MT5 MOBILE CHART GENERATOR (NO CLIPPING!)
+# 6. PERFECTLY SCALED MT5 MOBILE CHART GENERATOR
 # =====================================================================
 def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p, near_tp_p, short_tag, lot_size, human_score=88):
     try:
@@ -1491,7 +1453,6 @@ def generate_mt5_mobile_style_chart(df_5m, info, direction, entry_p, sl_p, tp_p,
         ax.plot([proj_start_idx - 6, right_edge_idx], [tp_p, tp_p], color="#16a34a", linewidth=1.5, zorder=5)
         ax.axhline(entry_p, color="#0d9488", linewidth=1.1, zorder=5)
 
-        # 18% vertical padding ensures TP2 and SL boxes NEVER clip into the header
         y_pad = total_span * 0.18
         ax.set_ylim(y_min - y_pad, y_max + y_pad)
         ax.set_xlim(-0.8, right_edge_idx)
@@ -1835,6 +1796,10 @@ def scan_markets():
             if df_5m is None or df_15m is None or live_spot is None:
                 continue
 
+            # Ensure live candle is fresh (< 25 mins old) before taking new trades
+            if (get_utc_now() - to_utc_timestamp(df_5m.index[-1])).total_seconds() > 1500:
+                continue
+
             df_15m = calculate_chart_indicators(df_15m)
             df_5m  = calculate_chart_indicators(df_5m)
 
@@ -1944,8 +1909,12 @@ if __name__ == "__main__":
         "✅ <b>7 Negative Vetoes Active:</b> Zero Top-Buying, Uniform Basis Sync, No Chart Clipping"
     )
 
+    start_run      = time.time()
     last_scan_time = 0
-    while True:
+    is_github_ci   = os.getenv("GITHUB_ACTIONS", "").lower() == "true"
+    max_run_secs   = 21000 if is_github_ci else 999999999
+
+    while time.time() - start_run < max_run_secs:
         try:
             check_telegram_commands()
             if time.time() - last_scan_time >= 15:
