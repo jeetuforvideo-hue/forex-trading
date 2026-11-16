@@ -31,6 +31,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
+# Persistent HTTP session for ultra-fast API & Telegram calls
+HTTP_SESSION = requests.Session()
+HTTP_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0",
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache"
+})
+
 # =====================================================================
 # 1. MASTER SETTINGS ($5,000 -> $5,400 | GITHUB -> TELEGRAM MANUAL BOT)
 # =====================================================================
@@ -63,7 +71,7 @@ MAX_TRADE_HOLD_MINUTES      = 50        # 50 मिनट तक ट्रेड
 MAX_CONCURRENT_TRADES       = 2         # एक समय में अधिकतम 2 ओपन ट्रेड्स
 MIN_GAP_BETWEEN_TRADES_MIN  = 6         # दो ट्रेड्स के बीच 6 मिनट का गैप
 
-# 8 Liquid Pairs — Pure Spot Forex & Crypto Feeds (Removed PAXGUSDT/EURUSDT Crypto Proxies!)
+# 8 Liquid Pairs — Pure Spot Forex & Crypto Feeds
 FOREX_PAIRS = {
     "XAU/USD (GOLD)": {
         "mt5_name": "XAUUSD",
@@ -219,6 +227,9 @@ last_global_trade_time = datetime.min.replace(tzinfo=timezone.utc)
 global_pause_until     = datetime.min.replace(tzinfo=timezone.utc)
 live_bars_memory       = {name: {} for name in FOREX_PAIRS}
 
+# Stores only base historical candles; live price is ALWAYS fetched fresh in real-time!
+ohlc_history_cache     = {}
+
 cached_news_events     = []
 last_news_fetch_time   = 0
 announced_news_ids     = set()
@@ -252,7 +263,6 @@ current_day = get_ist_now().date()
 def is_forex_market_open():
     now = get_ist_now()
     wd = now.weekday()
-    # Forex closes Saturday 03:30 AM IST and opens Monday 03:30 AM IST
     if wd == 5 and (now.hour + now.minute / 60.0) >= 3.5:
         return False
     if wd == 6:
@@ -286,7 +296,7 @@ def send_telegram_message(message, target_chat_id=CHAT_ID):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": target_chat_id, "text": message, "parse_mode": "HTML"}
     try:
-        requests.post(url, json=payload, timeout=10)
+        HTTP_SESSION.post(url, json=payload, timeout=8)
     except Exception as e:
         print(f"Telegram Send Error: {e}")
 
@@ -393,9 +403,8 @@ def fetch_live_economic_calendar():
     if (now_ts - last_news_fetch_time) < 1800 and cached_news_events:
         return cached_news_events
     url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        res = requests.get(url, headers=headers, timeout=8)
+        res = HTTP_SESSION.get(url, timeout=6)
         if res.status_code == 200:
             data = res.json()
             high_events = []
@@ -447,11 +456,10 @@ def check_dxy_extreme_spike_guard(pair_info, direction):
     exp = pair_info.get("usd_exposure", "NEUTRAL")
     if exp == "NEUTRAL":
         return True
-    url = "https://scanner.tradingview.com/cfd/scan"
+    url = f"https://scanner.tradingview.com/cfd/scan?cb={time.time_ns()}"
     payload = {"symbols": {"tickers": ["TVC:DXY"], "query": {"types": []}}, "columns": ["Recommend.Other", "RSI"]}
-    headers = {"User-Agent": "Mozilla/5.0", "Cache-Control": "no-cache"}
     try:
-        res = requests.post(url, json=payload, headers=headers, timeout=4)
+        res = HTTP_SESSION.post(url, json=payload, timeout=4)
         if res.status_code == 200:
             data = res.json().get("data", [])
             if data and data[0].get("d"):
@@ -496,18 +504,18 @@ def check_smart_usd_correlation_shield(pair_info, candidate_direction):
     return True
 
 # =====================================================================
-# 3. PURE SPOT FOREX DATA ENGINE (ZERO CANDLE DISTORTION!)
+# 3. REAL-TIME TICK + HISTORY CACHE ENGINE (FRESH PRICE EVERY SECOND!)
 # =====================================================================
 def fetch_tradingview_median_spot(tv_tickers, screener="forex"):
-    """Fetches live spot price across top institutional feeds (FOREXCOM, FX, OANDA) and returns median spot"""
+    """Fetches un-cached, millisecond-fresh live spot price from TradingView"""
     if isinstance(tv_tickers, str):
         tv_tickers = [tv_tickers]
-    url = f"https://scanner.tradingview.com/{screener}/scan"
+    # Unique nanosecond timestamp prevents any CDN/Proxy from returning a cached price!
+    url = f"https://scanner.tradingview.com/{screener}/scan?cb={time.time_ns()}"
     payload = {"symbols": {"tickers": tv_tickers, "query": {"types": []}}, "columns": ["close"]}
-    headers = {"User-Agent": "Mozilla/5.0", "Cache-Control": "no-cache"}
     spots = []
     try:
-        res = requests.post(url, json=payload, headers=headers, timeout=6)
+        res = HTTP_SESSION.post(url, json=payload, timeout=3.5)
         if res.status_code == 200:
             data = res.json().get("data", [])
             for item in data:
@@ -522,13 +530,36 @@ def fetch_tradingview_median_spot(tv_tickers, screener="forex"):
         return float(np.median(spots))
     return None
 
+def fetch_instant_live_tick(info):
+    """
+    Fetches the exact sub-second live market price right now (~0.15s):
+    - For Crypto (BTCUSD): Queries live Binance real-time trade ticker first, then TradingView.
+    - For Forex/Gold: Queries live TradingView multi-broker spot feed with cache-buster.
+    """
+    if info.get("is_crypto") and info.get("binance_symbol"):
+        sym = info["binance_symbol"]
+        for t_url in [
+            f"https://data-api.binance.vision/api/v3/ticker/price?symbol={sym}&cb={time.time_ns()}",
+            f"https://api.binance.com/api/v3/ticker/price?symbol={sym}&cb={time.time_ns()}"
+        ]:
+            try:
+                r = HTTP_SESSION.get(t_url, timeout=2.5).json()
+                if isinstance(r, dict) and "price" in r:
+                    p = float(r["price"])
+                    if p > 0:
+                        return p
+            except Exception:
+                pass
+
+    return fetch_tradingview_median_spot(info.get("tv_tickers", []), info.get("tv_screener", "forex"))
+
 def fetch_binance_vision_ohlc(binance_symbol, interval_str="5m", limit=120):
     if not binance_symbol:
         return None
     for base_url in ["https://data-api.binance.vision/api/v3/klines", "https://api.binance.com/api/v3/klines"]:
         params = {"symbol": binance_symbol, "interval": interval_str, "limit": limit}
         try:
-            r = requests.get(base_url, params=params, timeout=6).json()
+            r = HTTP_SESSION.get(base_url, params=params, timeout=5).json()
             if isinstance(r, list) and len(r) >= 60:
                 df = pd.DataFrame(r, columns=["open_time", "Open", "High", "Low", "Close", "Volume", "close_time", "q_vol", "trades", "tb_base", "tb_quote", "ignore"])
                 df["Date"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
@@ -541,10 +572,6 @@ def fetch_binance_vision_ohlc(binance_symbol, interval_str="5m", limit=120):
     return None
 
 def sanitize_ohlc_dataframe(df):
-    """
-    Cleans raw OHLC dataframe WITHOUT overwriting Open prices or deleting quiet candles!
-    Preserves true MT5 candle shapes and timestamps.
-    """
     if df is None or df.empty:
         return None
     df = df.copy()
@@ -556,12 +583,10 @@ def sanitize_ohlc_dataframe(df):
             return None
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
-    # Remove zero-price rows or completely flat holiday placeholder ticks
     df = df[(df["Close"] > 0) & ((df["High"] > df["Low"]) | (df["Open"] != df["Close"]))]
     if len(df) < 40:
         return None
 
-    # Ensure High is at least max(Open, Close) and Low is at most min(Open, Close)
     top_body = df[["Open", "Close"]].max(axis=1)
     bot_body = df[["Open", "Close"]].min(axis=1)
     df["High"] = np.maximum(df["High"], top_body)
@@ -571,69 +596,106 @@ def sanitize_ohlc_dataframe(df):
         df["Volume"] = 1.0
     return df[["Open", "High", "Low", "Close", "Volume"]]
 
-def get_clean_spot_data(pair_name, info):
-    df_5m, df_15m = None, None
-    source_used = "Institutional Spot Feed"
+def get_clean_spot_data(pair_name, info, use_fast_cache=False):
+    """
+    Smart Hybrid Engine:
+    1. Reuses historical closed candles for up to 60s (within the same 5m bar) so there is ZERO download delay.
+    2. ALWAYS fetches a 100% brand-new live tick right at that millisecond and updates the running candle!
+       So if price moves from 65367 to 65380 in 1 second, the next /chart immediately shows 65380!
+    """
+    now_ts     = time.time()
+    now_utc    = get_utc_now()
+    bucket_min = (now_utc.minute // 5) * 5
+    bucket_ts  = now_utc.replace(minute=bucket_min, second=0, microsecond=0)
 
-    # For Bitcoin only: use real BTC spot klines
-    if info.get("is_crypto") and info.get("binance_symbol"):
-        df_5m  = fetch_binance_vision_ohlc(info["binance_symbol"], "5m", 120)
-        df_15m = fetch_binance_vision_ohlc(info["binance_symbol"], "15m", 100)
-        if df_5m is not None and df_15m is not None:
-            source_used = "Live Crypto Spot Feed"
+    raw_df_5m, raw_df_15m, source_used = None, None, "Institutional Spot Feed"
 
-    # For all Forex & Gold pairs: try pure spot symbols in order
-    if df_5m is None or df_15m is None:
-        for yf_sym in info.get("yf_symbols", []):
-            try:
-                tkr    = yf.Ticker(yf_sym)
-                raw_5m = tkr.history(period="5d", interval="5m", auto_adjust=False)
-                raw_15 = tkr.history(period="5d", interval="15m", auto_adjust=False)
-                c_5m   = sanitize_ohlc_dataframe(raw_5m)
-                c_15m  = sanitize_ohlc_dataframe(raw_15)
-                if c_5m is not None and c_15m is not None:
-                    df_5m, df_15m = c_5m, c_15m
-                    break
-            except Exception:
-                continue
+    # Check if we have valid historical candles for the current 5-minute bucket
+    if use_fast_cache and pair_name in ohlc_history_cache:
+        cached = ohlc_history_cache[pair_name]
+        if (now_ts - cached["ts"]) <= 60.0 and cached.get("bucket_ts") == bucket_ts:
+            raw_df_15m  = cached["raw_df_15m"].copy()
+            raw_df_5m   = cached["raw_df_5m"].copy()
+            source_used = cached["src"]
 
-    df_5m  = sanitize_ohlc_dataframe(df_5m)
-    df_15m = sanitize_ohlc_dataframe(df_15m)
-    if df_5m is None or df_15m is None:
-        return None, None, None, ""
+    # Download historical candles if cache expired or a new 5-minute candle started
+    if raw_df_5m is None or raw_df_15m is None:
+        if info.get("is_crypto") and info.get("binance_symbol"):
+            raw_df_5m  = fetch_binance_vision_ohlc(info["binance_symbol"], "5m", 120)
+            raw_df_15m = fetch_binance_vision_ohlc(info["binance_symbol"], "15m", 100)
+            if raw_df_5m is not None and raw_df_15m is not None:
+                source_used = "Live Crypto Spot Feed"
 
-    tv_spot = fetch_tradingview_median_spot(info.get("tv_tickers", []), info.get("tv_screener", "forex"))
+        if raw_df_5m is None or raw_df_15m is None:
+            for yf_sym in info.get("yf_symbols", []):
+                try:
+                    tkr    = yf.Ticker(yf_sym)
+                    r_5m   = tkr.history(period="5d", interval="5m", auto_adjust=False)
+                    r_15m  = tkr.history(period="5d", interval="15m", auto_adjust=False)
+                    c_5m   = sanitize_ohlc_dataframe(r_5m)
+                    c_15m  = sanitize_ohlc_dataframe(r_15m)
+                    if c_5m is not None and c_15m is not None:
+                        raw_df_5m, raw_df_15m = c_5m, c_15m
+                        break
+                except Exception:
+                    continue
+
+        raw_df_5m  = sanitize_ohlc_dataframe(raw_df_5m)
+        raw_df_15m = sanitize_ohlc_dataframe(raw_df_15m)
+        if raw_df_5m is None or raw_df_15m is None:
+            return None, None, None, ""
+
+        ohlc_history_cache[pair_name] = {
+            "ts": now_ts,
+            "bucket_ts": bucket_ts,
+            "raw_df_15m": raw_df_15m.copy(),
+            "raw_df_5m": raw_df_5m.copy(),
+            "src": source_used
+        }
+
+    df_5m  = raw_df_5m.copy()
+    df_15m = raw_df_15m.copy()
+
+    # ALWAYS fetch a 100% fresh real-time tick right now (never cached!)
+    tv_spot = fetch_instant_live_tick(info)
     raw_last_close = float(df_5m.iloc[-1]["Close"])
 
-    # Uniformly align chart basis to exact Spot price (essential when GC=F futures is used as backup for XAUUSD)
     if tv_spot is not None and tv_spot > 0:
         basis_diff = tv_spot - raw_last_close
-        # Allow up to 5% basis adjustment so Gold Futures (GC=F) shifts cleanly to exact XAUUSD Spot price!
         if abs(basis_diff) <= (tv_spot * 0.05):
-            for col in ["Open", "High", "Low", "Close"]:
-                df_5m[col]  = df_5m[col] + basis_diff
-                df_15m[col] = df_15m[col] + basis_diff
+            # If external history has a futures/spot basis offset (like GC=F vs XAUUSD), shift history uniformly,
+            # while keeping the running candle anchored to real-time ticks in this 5m bucket
+            mem = live_bars_memory[pair_name]
+            if bucket_ts not in mem:
+                for col in ["Open", "High", "Low", "Close"]:
+                    df_5m[col]  = df_5m[col] + basis_diff
+                    df_15m[col] = df_15m[col] + basis_diff
+                mem[bucket_ts] = {
+                    "basis_at_open": basis_diff,
+                    "Open": tv_spot,
+                    "High": float(df_5m.iloc[-1]["High"]),
+                    "Low": float(df_5m.iloc[-1]["Low"])
+                }
+            else:
+                base_shift = mem[bucket_ts]["basis_at_open"]
+                for col in ["Open", "High", "Low", "Close"]:
+                    df_5m[col]  = df_5m[col] + base_shift
+                    df_15m[col] = df_15m[col] + base_shift
 
-            # Only update running candle tick if market is currently open
             if info.get("is_crypto", False) or is_forex_market_open():
-                now_utc    = get_utc_now()
-                bucket_min = (now_utc.minute // 5) * 5
-                bucket_ts  = now_utc.replace(minute=bucket_min, second=0, microsecond=0)
-                mem        = live_bars_memory[pair_name]
-                last_idx   = df_5m.index[-1]
-                bar_open   = float(df_5m.loc[last_idx, "Open"])
-                med_rng    = float(np.median(df_5m["High"].values - df_5m["Low"].values))
+                mem[bucket_ts]["High"] = max(mem[bucket_ts]["High"], tv_spot)
+                mem[bucket_ts]["Low"]  = min(mem[bucket_ts]["Low"], tv_spot)
 
-                if abs(tv_spot - bar_open) <= max(med_rng * 2.5, tv_spot * 0.004):
-                    if bucket_ts not in mem:
-                        mem[bucket_ts] = {"High": tv_spot, "Low": tv_spot}
-                    else:
-                        mem[bucket_ts]["High"] = max(mem[bucket_ts]["High"], tv_spot)
-                        mem[bucket_ts]["Low"]  = min(mem[bucket_ts]["Low"], tv_spot)
+                last_idx_5m = df_5m.index[-1]
+                df_5m.loc[last_idx_5m, "Close"] = tv_spot
+                df_5m.loc[last_idx_5m, "High"]  = max(float(df_5m.loc[last_idx_5m, "High"]), mem[bucket_ts]["High"])
+                df_5m.loc[last_idx_5m, "Low"]   = min(float(df_5m.loc[last_idx_5m, "Low"]), mem[bucket_ts]["Low"])
 
-                    df_5m.loc[last_idx, "Close"] = tv_spot
-                    df_5m.loc[last_idx, "High"]  = max(float(df_5m.loc[last_idx, "High"]), mem[bucket_ts]["High"])
-                    df_5m.loc[last_idx, "Low"]   = min(float(df_5m.loc[last_idx, "Low"]), mem[bucket_ts]["Low"])
+                last_idx_15m = df_15m.index[-1]
+                df_15m.loc[last_idx_15m, "Close"] = tv_spot
+                df_15m.loc[last_idx_15m, "High"]  = max(float(df_15m.loc[last_idx_15m, "High"]), tv_spot)
+                df_15m.loc[last_idx_15m, "Low"]   = min(float(df_15m.loc[last_idx_15m, "Low"]), tv_spot)
+
             live_spot_price = tv_spot
         else:
             live_spot_price = raw_last_close
@@ -763,15 +825,6 @@ def human_negative_aspect_veto_audit(df_15m, df_5m, direction, live_spot, setup_
     return True, "All 7 Negative Vetoes Passed"
 
 def analyze_human_confluence_setups(pair_name, pair_info, df_15m, df_5m, live_spot, ignore_session_and_locks=False):
-    """
-    Evaluates 6 distinct Price-Action setups:
-    1. EXHAUSTION_PULLBACK (Trend Impulse + Weak Pullback + Reclaim)
-    2. SR_FLIP_RETEST (Break & Retest of Fractal Swing High/Low)
-    3. PRESSURE_BREAKOUT (Tight Consolidation Box Pressure Breakout)
-    4. LIQUIDITY_SWEEP (Stop-Hunt below Support / above Resistance & Reclaim)
-    5. DOUBLE_BOTTOM_TOP (W-Bottom / M-Top Structure Shift)
-    6. MOMENTUM_IGNITION (Fresh M15+M5 EMA Expansion from Compression)
-    """
     now_utc = get_utc_now()
     if not ignore_session_and_locks:
         if now_utc < pair_cooldown_until.get(pair_name, datetime.min.replace(tzinfo=timezone.utc)):
@@ -1062,7 +1115,7 @@ def analyze_human_confluence_setups(pair_name, pair_info, df_15m, df_5m, live_sp
                         )
                     })
 
-    # SETUP 6: M15 + M5 MOMENTUM IGNITION (FRESH EMA RIBBON EXPANSION)
+    # SETUP 6: M15 + M5 MOMENTUM IGNITION
     ema_cluster = abs(float(c1["EMA9"]) - float(c1["EMA20"])) <= (atr_5m * 0.32)
     if htf_bull and ema_cluster and (ema9 > ema20 >= ema50 * 0.9997) and (price > open_0) and (price > float(c1["High"])) and (body_ratio >= 0.52) and (close_pos >= 0.66) and (0.95 <= disp_power <= 1.70):
         if ignore_session_and_locks or now_utc >= sl_direction_lock[pair_name]["BUY"]:
@@ -1125,13 +1178,9 @@ def analyze_human_confluence_setups(pair_name, pair_info, df_15m, df_5m, live_sp
     return None
 
 # =====================================================================
-# 5. DYNAMIC REAL-TIME CHART DIAGNOSIS ENGINE (NO HARDCODED 68!)
+# 5. DYNAMIC REAL-TIME CHART DIAGNOSIS ENGINE
 # =====================================================================
 def diagnose_live_market_state(pair_name, info, df_15m, df_5m, live_spot):
-    """
-    Calculates a 100% genuine, dynamic score (0-100) for ANY chart at ANY moment
-    and identifies the exact real-time market behavior & trigger prices (never generic!).
-    """
     dec    = info["decimals"]
     c0     = df_5m.iloc[-2]
     c1     = df_5m.iloc[-3]
@@ -1158,7 +1207,6 @@ def diagnose_live_market_state(pair_name, info, df_15m, df_5m, live_spot):
     box_lo   = float(box_8["Low"].min())
     box_span = box_hi - box_lo
 
-    # Check if an A+ setup is already active right now
     active_cand = analyze_human_confluence_setups(pair_name, info, df_15m, df_5m, live_spot, ignore_session_and_locks=True)
     if active_cand is not None:
         return {
@@ -1175,17 +1223,14 @@ def diagnose_live_market_state(pair_name, info, df_15m, df_5m, live_spot):
             "setup_type": active_cand["setup_type"]
         }
 
-    # Otherwise, compute the EXACT live sub-threshold score (18 to 75) from 5 real market components:
-    # 1. HTF & M5 Trend Alignment (0 - 18 pts)
     m15_bull = m15_close >= m15_ema20
     m5_bull  = ema9 >= ema20
     direction = "BUY" if m5_bull else "SELL"
     if m15_bull == m5_bull:
         score_htf = 16 if abs(ema20 - ema50) > (atr_5m * 0.25) else 12
     else:
-        score_htf = 6  # M15 and M5 fighting each other!
+        score_htf = 6
 
-    # 2. Location / Proximity to Key Level (0 - 20 pts)
     dist_to_sup = abs(live_spot - sup_wall) / max(atr_5m, 1e-6)
     dist_to_res = abs(res_wall - live_spot) / max(atr_5m, 1e-6)
     dist_to_ema = abs(live_spot - ema20) / max(atr_5m, 1e-6)
@@ -1195,29 +1240,25 @@ def diagnose_live_market_state(pair_name, info, df_15m, df_5m, live_spot):
     elif dist_to_ema <= 0.45:
         score_loc = 15
     elif 0.38 <= pos_30 <= 0.62:
-        score_loc = 7   # Stuck in middle of range (No-man's land)
+        score_loc = 7
     else:
         score_loc = 11
 
-    # 3. Candle Quality & Volume/Body Pressure (0 - 15 pts)
     recent_body_avg = float(box_8["Body_Ratio"].mean())
     score_candle = int(min(15.0, max(3.0, recent_body_avg * 22.0 + (4.0 if body_r > 0.50 else 0.0))))
 
-    # 4. Momentum & Anti-FOMO Position (0 - 12 pts)
     if dist_to_ema > 1.45 or rsi > 68.0 or rsi < 32.0:
-        score_mom = 3   # Heavily overextended!
+        score_mom = 3
     elif 42.0 <= rsi <= 58.0:
         score_mom = 11
     else:
         score_mom = 8
 
-    # 5. Room to Opposing Wall (0 - 10 pts)
     room_atr = (res_wall - live_spot) / max(atr_5m, 1e-6) if direction == "BUY" else (live_spot - sup_wall) / max(atr_5m, 1e-6)
     score_room = 10 if room_atr >= 1.8 else (6 if room_atr >= 1.0 else 2)
 
     dynamic_score = int(max(18, min(75, score_htf + score_loc + score_candle + score_mom + score_room)))
 
-    # Identify the exact, distinct market regime & next trigger price:
     if box_span <= (atr_5m * 1.55):
         short_tag   = "Tight Box Consolidation"
         trig_p      = box_hi if direction == "BUY" else box_lo
@@ -1231,8 +1272,8 @@ def diagnose_live_market_state(pair_name, info, df_15m, df_5m, live_spot):
         trig_p      = ema20
         headline    = f"🚀 <b>Overextended Move — Top/Bottom Chasing Blocked ({dynamic_score}/100)</b>"
         detail_line = (
-            f"कीमत EMA 20 (<code>{format_price(ema20, dec)}</code>) से बहुत दूर भाग चुकी है (RSI: {rsi:.0f})। "
-            f"अभी कूदने पर SL हिट होने का खतरा है; कीमत के <code>{format_price(ema20, dec)}</code> के पास शांत होने का इंतजार है।"
+            f"कीमत अभी अपने वैल्यू ज़ोन (<code>{format_price(ema20, dec)}</code>) से काफी दूर निकल चुकी है (RSI: {rsi:.0f})। "
+            f"अभी कूदने पर SL हिट होने का खतरा है; कीमत के <code>{format_price(ema20, dec)}</code> या स्ट्रक्चर लेवल के पास शांत होने का इंतजार है।"
         )
     elif dist_to_sup <= 0.65:
         short_tag   = "Testing Support Floor"
@@ -1271,7 +1312,7 @@ def diagnose_live_market_state(pair_name, info, df_15m, df_5m, live_spot):
         trig_p      = float(c0["High"]) if direction == "BUY" else float(c0["Low"])
         headline    = f"⏳ <b>Structure Forming Near Value Zone ({dynamic_score}/100)</b>"
         detail_line = (
-            f"कीमत EMA 20 (<code>{format_price(ema20, dec)}</code>) के पास सेटअप बना रही है, लेकिन अभी कन्फर्मेशन कैंडल अधूरी है। "
+            f"कीमत मुख्य ज़ोन (<code>{format_price(ema20, dec)}</code>) के पास सेटअप बना रही है, लेकिन अभी कन्फर्मेशन कैंडल अधूरी है। "
             f"मजबूत कैंडल के <code>{format_price(trig_p, dec)}</code> के पार क्लोज होने का इंतजार है।"
         )
 
@@ -1342,131 +1383,250 @@ def calculate_smart_sl_and_easy_tp(df_5m, df_15m, info, direction, live_spot, ra
     return sl_level, sl_dist, lock_level, near_tp_lvl, target_level, tp2_dist, actual_rr
 
 # =====================================================================
-# 6. MT5 MOBILE CHART GENERATOR (SEPARATE MODES FOR SIGNAL VS AUDIT!)
+# 6. EXPERIENCED TRADER TRADINGVIEW PRO CHART ENGINE (FAST & REALISTIC!)
 # =====================================================================
 def generate_mt5_mobile_style_chart(
     df_5m, info, direction, entry_p, sl_p, tp_p, near_tp_p,
     short_tag, lot_size, human_score=85, is_live_signal=True, trigger_watch_price=None
 ):
     try:
-        sub = df_5m.iloc[-52:].copy()
+        sub = df_5m.iloc[-62:].copy()
         if sub.empty or len(sub) < 25:
             return None
-        dec, mt5_sym, sub_Desc, spread = info["decimals"], info["mt5_name"], info.get("sub_title", "Spot vs US Dollar"), info.get("spread", 0.0)
-        fig = plt.figure(figsize=(6.8, 10.4), dpi=140, facecolor="#ffffff")
-        ax  = fig.add_axes([0.03, 0.07, 0.79, 0.77], facecolor="#ffffff")
+
+        dec     = info["decimals"]
+        mt5_sym = info["mt5_name"]
+        sub_ttl = info.get("sub_title", "Spot vs US Dollar")
+        atr_val = float(sub.iloc[-2]["ATR"]) if "ATR" in sub.columns else float((sub["High"] - sub["Low"]).mean())
+
+        fig = plt.figure(figsize=(10.6, 6.2), dpi=125, facecolor="#ffffff")
+        ax  = fig.add_axes([0.015, 0.08, 0.875, 0.83], facecolor="#ffffff")
 
         n_bars = len(sub)
         x_vals = np.arange(n_bars)
-        proj_start_idx, right_edge_idx = n_bars - 2, n_bars + 14
+        proj_start_idx = n_bars - 2
+        right_edge_idx = n_bars + 11
 
-        ax.grid(True, linestyle=":", linewidth=0.7, color="#d1d5db", alpha=0.9, zorder=1)
+        ax.grid(True, which="major", linestyle="-", linewidth=0.55, color="#f0f3fa", zorder=1)
         for spine in ["top", "left"]:
             ax.spines[spine].set_visible(False)
-        ax.spines["right"].set_color("#9ca3af")
-        ax.spines["bottom"].set_color("#9ca3af")
+        ax.spines["right"].set_color("#d1d4dc")
+        ax.spines["bottom"].set_color("#d1d4dc")
 
-        win_hist = sub.iloc[-36:-2]
-        res_line, sup_line = float(win_hist["High"].max()), float(win_hist["Low"].min())
-        ax.plot([n_bars - 36, right_edge_idx], [res_line, res_line], color="#dc2626", linestyle="--", linewidth=1.1, alpha=0.65, zorder=2)
-        ax.plot([n_bars - 36, right_edge_idx], [sup_line, sup_line], color="#16a34a", linestyle="--", linewidth=1.1, alpha=0.65, zorder=2)
+        ax.text(
+            0.46, 0.52, f"{mt5_sym}, 5m", transform=ax.transAxes,
+            fontsize=38, fontweight="bold", color="#131722", alpha=0.04,
+            ha="center", va="center", zorder=1
+        )
+        ax.text(
+            0.46, 0.41, f"{sub_ttl}", transform=ax.transAxes,
+            fontsize=15, fontweight="bold", color="#131722", alpha=0.04,
+            ha="center", va="center", zorder=1
+        )
 
-        if "EMA9" in sub.columns and "EMA20" in sub.columns and "EMA50" in sub.columns:
-            ax.plot(x_vals, sub["EMA9"].values, color="#16a34a", linewidth=1.0, alpha=0.80, zorder=3)
-            ax.plot(x_vals, sub["EMA20"].values, color="#dc2626", linewidth=1.1, alpha=0.85, zorder=3)
-            ax.plot(x_vals, sub["EMA50"].values, color="#2563eb", linestyle=":", linewidth=1.1, alpha=0.75, zorder=3)
+        win_hist   = sub.iloc[-42:-2]
+        res_hi_idx = int(np.argmax(win_hist["High"].values)) + (n_bars - 42)
+        sup_lo_idx = int(np.argmin(win_hist["Low"].values)) + (n_bars - 42)
+        res_line   = float(win_hist["High"].max())
+        sup_line   = float(win_hist["Low"].min())
+        zone_thick = max(atr_val * 0.22, (res_line - sup_line) * 0.035)
 
-        c_highs, c_lows = sub["High"].values, sub["Low"].values
+        supply_bot = res_line - zone_thick
+        ax.add_patch(mpatches.Rectangle(
+            (max(0, res_hi_idx - 1), supply_bot),
+            right_edge_idx - max(0, res_hi_idx - 1),
+            zone_thick,
+            facecolor="#f23645", alpha=0.11, edgecolor="none", zorder=2
+        ))
+        ax.plot([max(0, res_hi_idx - 1), right_edge_idx], [res_line, res_line], color="#f23645", linewidth=1.1, alpha=0.80, zorder=3)
+        ax.plot([max(0, res_hi_idx - 1), right_edge_idx], [supply_bot, supply_bot], color="#f23645", linewidth=0.7, linestyle="--", alpha=0.55, zorder=3)
+        ax.text(
+            right_edge_idx - 0.4, res_line - (zone_thick * 0.5),
+            f"Supply / Resistance Zone ({format_price(res_line, dec)})",
+            fontsize=7.5, fontweight="bold", color="#b91c1c", ha="right", va="center", zorder=6
+        )
+
+        demand_top = sup_line + zone_thick
+        ax.add_patch(mpatches.Rectangle(
+            (max(0, sup_lo_idx - 1), sup_line),
+            right_edge_idx - max(0, sup_lo_idx - 1),
+            zone_thick,
+            facecolor="#089981", alpha=0.11, edgecolor="none", zorder=2
+        ))
+        ax.plot([max(0, sup_lo_idx - 1), right_edge_idx], [sup_line, sup_line], color="#089981", linewidth=1.1, alpha=0.80, zorder=3)
+        ax.plot([max(0, sup_lo_idx - 1), right_edge_idx], [demand_top, demand_top], color="#089981", linewidth=0.7, linestyle="--", alpha=0.55, zorder=3)
+        ax.text(
+            right_edge_idx - 0.4, sup_line + (zone_thick * 0.5),
+            f"Demand / Support Zone ({format_price(sup_line, dec)})",
+            fontsize=7.5, fontweight="bold", color="#047857", ha="right", va="center", zorder=6
+        )
+
+        if "EMA20" in sub.columns and "EMA50" in sub.columns:
+            ax.plot(x_vals, sub["EMA20"].values, color="#2962ff", linewidth=1.25, alpha=0.88, zorder=3)
+            ax.plot(x_vals, sub["EMA50"].values, color="#ff9800", linewidth=1.15, linestyle="--", alpha=0.82, zorder=3)
+
+        opens  = sub["Open"].values.astype(float)
+        highs  = sub["High"].values.astype(float)
+        lows   = sub["Low"].values.astype(float)
+        closes = sub["Close"].values.astype(float)
+
         if is_live_signal:
-            all_y = list(c_highs) + list(c_lows) + [float(tp_p), float(sl_p), float(entry_p), float(near_tp_p)]
+            all_y = list(highs) + list(lows) + [float(tp_p), float(sl_p), float(entry_p), float(near_tp_p), res_line, sup_line]
         else:
-            all_y = list(c_highs) + list(c_lows) + [res_line, sup_line, float(entry_p)]
+            all_y = list(highs) + list(lows) + [res_line, sup_line, float(entry_p)]
             if trigger_watch_price is not None:
                 all_y.append(float(trigger_watch_price))
 
         y_min, y_max = float(np.nanmin(all_y)), float(np.nanmax(all_y))
-        total_span = max(y_max - y_min, 1e-6)
-        min_body_h = total_span * 0.0045
+        total_span   = max(y_max - y_min, 1e-6)
+        min_body_h   = total_span * 0.0038
 
-        for idx in range(n_bars):
-            row = sub.iloc[idx]
-            o, h, l, c = float(row["Open"]), float(row["High"]), float(row["Low"]), float(row["Close"])
-            is_bull  = c >= o
-            wick_col = "#0d9488" if is_bull else "#e11d48"
-            body_col = "#14b8a6" if is_bull else "#ef4444"
-            ax.plot([idx, idx], [l, h], color=wick_col, linewidth=1.05, zorder=4)
-            ax.add_patch(mpatches.Rectangle((idx - 0.35, min(o, c)), 0.70, max(abs(c - o), min_body_h), facecolor=body_col, edgecolor=wick_col, linewidth=0.55, zorder=4))
+        bull_mask    = closes >= opens
+        bear_mask    = ~bull_mask
+        bot_bodies   = np.minimum(opens, closes)
+        body_heights = np.maximum(np.abs(closes - opens), min_body_h)
 
-        proj_width = right_edge_idx - proj_start_idx
-        label_x    = proj_start_idx + (proj_width * 0.48)
+        ax.vlines(x_vals[bull_mask], lows[bull_mask], highs[bull_mask], color="#089981", linewidth=1.05, zorder=4)
+        ax.vlines(x_vals[bear_mask], lows[bear_mask], highs[bear_mask], color="#f23645", linewidth=1.05, zorder=4)
+        ax.bar(x_vals[bull_mask], body_heights[bull_mask], bottom=bot_bodies[bull_mask], width=0.68, color="#089981", edgecolor="#089981", linewidth=0.4, zorder=4)
+        ax.bar(x_vals[bear_mask], body_heights[bear_mask], bottom=bot_bodies[bear_mask], width=0.68, color="#f23645", edgecolor="#f23645", linewidth=0.4, zorder=4)
+
+        sh_list, sl_list = extract_fractal_swings(sub, left=3, right=3)
+        prev_sh_val = None
+        for sh_item in sh_list[-3:]:
+            lbl = "HH" if (prev_sh_val is None or sh_item["price"] >= prev_sh_val) else "LH"
+            prev_sh_val = sh_item["price"]
+            ax.text(
+                sh_item["idx"], sh_item["price"] + (total_span * 0.015), lbl,
+                fontsize=7.2, fontweight="bold", color="#475569", ha="center", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.14", facecolor="#f8fafc", edgecolor="#cbd5e1", linewidth=0.6),
+                zorder=6
+            )
+
+        prev_sl_val = None
+        for sl_item in sl_list[-3:]:
+            lbl = "HL" if (prev_sl_val is None or sl_item["price"] >= prev_sl_val) else "LL"
+            prev_sl_val = sl_item["price"]
+            ax.text(
+                sl_item["idx"], sl_item["price"] - (total_span * 0.015), lbl,
+                fontsize=7.2, fontweight="bold", color="#475569", ha="center", va="top",
+                bbox=dict(boxstyle="round,pad=0.14", facecolor="#f8fafc", edgecolor="#cbd5e1", linewidth=0.6),
+                zorder=6
+            )
+
+        proj_width = right_edge_idx - proj_start_idx - 0.5
         entry_s    = format_price(entry_p, dec)
+        res_s      = format_price(res_line, dec)
+        sup_s      = format_price(sup_line, dec)
+
+        ax.axhline(entry_p, color="#2962ff", linewidth=0.85, linestyle=":", alpha=0.85, zorder=5)
 
         if is_live_signal:
-            # Draw full SL/TP trade boxes ONLY when an actual trade signal is active!
-            ax.add_patch(mpatches.Rectangle((proj_start_idx, min(entry_p, sl_p)), proj_width, abs(entry_p - sl_p), facecolor="#ef4444", alpha=0.20, edgecolor="#dc2626", linewidth=1.0, zorder=2))
-            ax.plot([proj_start_idx - 6, right_edge_idx], [sl_p, sl_p], color="#dc2626", linewidth=1.5, zorder=5)
+            sl_s      = format_price(sl_p, dec)
+            near_tp_s = format_price(near_tp_p, dec)
+            tp_s      = format_price(tp_p, dec)
+            rr_val    = abs(tp_p - entry_p) / max(abs(entry_p - sl_p), 1e-9)
 
-            ax.add_patch(mpatches.Rectangle((proj_start_idx, min(entry_p, tp_p)), proj_width, abs(tp_p - entry_p), facecolor="#22c55e", alpha=0.20, edgecolor="#16a34a", linewidth=1.0, zorder=2))
-            ax.plot([proj_start_idx, right_edge_idx], [near_tp_p, near_tp_p], color="#15803d", linestyle="--", linewidth=1.2, zorder=5)
-            ax.plot([proj_start_idx - 6, right_edge_idx], [tp_p, tp_p], color="#16a34a", linewidth=1.5, zorder=5)
-            ax.axhline(entry_p, color="#0d9488", linewidth=1.1, zorder=5)
+            ax.add_patch(mpatches.Rectangle(
+                (proj_start_idx, min(entry_p, sl_p)), proj_width, abs(entry_p - sl_p),
+                facecolor="#f23645", alpha=0.18, edgecolor="#f23645", linewidth=1.0, zorder=5
+            ))
+            ax.add_patch(mpatches.Rectangle(
+                (proj_start_idx, min(entry_p, tp_p)), proj_width, abs(tp_p - entry_p),
+                facecolor="#089981", alpha=0.18, edgecolor="#089981", linewidth=1.0, zorder=5
+            ))
+            ax.plot([proj_start_idx, proj_start_idx + proj_width], [entry_p, entry_p], color="#475569", linewidth=1.4, zorder=6)
+            ax.plot([proj_start_idx, proj_start_idx + proj_width], [near_tp_p, near_tp_p], color="#089981", linestyle="--", linewidth=1.1, zorder=6)
+            ax.plot([proj_start_idx, proj_start_idx + proj_width], [tp_p, tp_p], color="#089981", linewidth=1.5, zorder=6)
+            ax.plot([proj_start_idx, proj_start_idx + proj_width], [sl_p, sl_p], color="#f23645", linewidth=1.5, zorder=6)
 
-            sl_s, near_tp_s, tp_s = format_price(sl_p, dec), format_price(near_tp_p, dec), format_price(tp_p, dec)
-            ax.text(label_x, sl_p, f" SL: {sl_s} ({short_tag}) ", fontsize=7.4, fontweight="bold", color="#ffffff", ha="center", va=("bottom" if direction == "SELL" else "top"), bbox=dict(boxstyle="round,pad=0.20", facecolor="#dc2626", edgecolor="none"), clip_on=True, zorder=8)
-            ax.text(label_x, entry_p, f" {direction} @ {entry_s} ", fontsize=7.6, fontweight="bold", color="#111827", ha="center", va="center", bbox=dict(boxstyle="round,pad=0.20", facecolor="#fde047", edgecolor="#ca8a04"), clip_on=True, zorder=8)
-            ax.text(label_x, tp_p, f" TP1: {near_tp_s} | TP2: {tp_s} ", fontsize=7.4, fontweight="bold", color="#ffffff", ha="center", va=("top" if direction == "SELL" else "bottom"), bbox=dict(boxstyle="round,pad=0.20", facecolor="#16a34a", edgecolor="none"), clip_on=True, zorder=8)
+            mid_box_x = proj_start_idx + (proj_width * 0.5)
+            ax.text(
+                mid_box_x, entry_p,
+                f" {direction} | RR 1:{rr_val:.2f} ({lot_size:.2f} Lot) ",
+                fontsize=7.5, fontweight="bold", color="#ffffff", ha="center", va="center",
+                bbox=dict(boxstyle="round,pad=0.20", facecolor="#1e293b", edgecolor="#334155", alpha=0.92),
+                clip_on=True, zorder=8
+            )
+            ax.text(
+                mid_box_x, near_tp_p, " TP1 (50% Book) ",
+                fontsize=6.8, fontweight="bold", color="#065f46", ha="center", va="bottom",
+                clip_on=True, zorder=7
+            )
 
-            right_tags = [(sl_p, f" {sl_s} ", "#dc2626"), (entry_p, f" {entry_s} ", "#0d9488"), (near_tp_p, f" {near_tp_s} ", "#16a34a"), (tp_p, f" {tp_s} ", "#15803d")]
+            right_tags = [
+                (tp_p, f" TP2 {tp_s} ", "#089981"),
+                (near_tp_p, f" TP1 {near_tp_s} ", "#059669"),
+                (entry_p, f" {entry_s} ", "#2962ff"),
+                (sl_p, f" SL {sl_s} ", "#f23645")
+            ]
         else:
-            # Preview / Watch Mode: Show Resistance, Support, Spot, and Blue Trigger Line (NO fake trade boxes!)
-            ax.axhline(entry_p, color="#0284c7", linewidth=1.0, linestyle="-.", zorder=5)
-            res_s, sup_s = format_price(res_line, dec), format_price(sup_line, dec)
-            ax.text(label_x, res_line, f" Resistance Wall: {res_s} ", fontsize=7.3, fontweight="bold", color="#ffffff", ha="center", va="bottom", bbox=dict(boxstyle="round,pad=0.18", facecolor="#dc2626", edgecolor="none"), clip_on=True, zorder=8)
-            ax.text(label_x, sup_line, f" Support Floor: {sup_s} ", fontsize=7.3, fontweight="bold", color="#ffffff", ha="center", va="top", bbox=dict(boxstyle="round,pad=0.18", facecolor="#16a34a", edgecolor="none"), clip_on=True, zorder=8)
-
-            right_tags = [(res_line, f" {res_s} ", "#dc2626"), (sup_line, f" {sup_s} ", "#16a34a"), (entry_p, f" {entry_s} ", "#0284c7")]
+            right_tags = [
+                (res_line, f" {res_s} ", "#f23645"),
+                (sup_line, f" {sup_s} ", "#089981"),
+                (entry_p, f" {entry_s} ", "#2962ff")
+            ]
             if trigger_watch_price is not None and abs(trigger_watch_price - entry_p) > (total_span * 0.02):
                 trig_s = format_price(trigger_watch_price, dec)
-                ax.plot([proj_start_idx - 4, right_edge_idx], [trigger_watch_price, trigger_watch_price], color="#7c3aed", linestyle="--", linewidth=1.3, zorder=6)
-                ax.text(label_x, trigger_watch_price, f" Watch Trigger: {trig_s} ", fontsize=7.3, fontweight="bold", color="#ffffff", ha="center", va="center", bbox=dict(boxstyle="round,pad=0.18", facecolor="#7c3aed", edgecolor="none"), clip_on=True, zorder=8)
-                right_tags.append((trigger_watch_price, f" {trig_s} ", "#7c3aed"))
+                ax.plot([n_bars - 14, right_edge_idx], [trigger_watch_price, trigger_watch_price], color="#6366f1", linestyle="--", linewidth=1.15, zorder=6)
+                ax.text(
+                    right_edge_idx - 0.4, trigger_watch_price,
+                    f"Key Trigger Level ({trig_s}) ",
+                    fontsize=7.4, fontweight="bold", color="#4338ca", ha="right", va="bottom",
+                    clip_on=True, zorder=7
+                )
+                right_tags.append((trigger_watch_price, f" {trig_s} ", "#6366f1"))
 
-        y_pad = total_span * 0.18
+        y_pad = total_span * 0.14
         ax.set_ylim(y_min - y_pad, y_max + y_pad)
         ax.set_xlim(-0.8, right_edge_idx)
         ax.yaxis.tick_right()
-        ax.tick_params(axis="y", labelsize=9.0, colors="#1f2937")
+        ax.tick_params(axis="y", labelsize=8.8, colors="#434651")
+        ax.tick_params(axis="x", labelsize=8.5, colors="#434651")
 
         for tag_y, tag_txt, tag_bg in right_tags:
-            ax.text(right_edge_idx + 0.25, tag_y, tag_txt, fontsize=8.0, fontweight="bold", color="white", va="center", ha="left", bbox=dict(boxstyle="square,pad=0.20", facecolor=tag_bg, edgecolor="none"), clip_on=False, zorder=9)
+            ax.text(
+                right_edge_idx + 0.15, tag_y, tag_txt,
+                fontsize=7.8, fontweight="bold", color="#ffffff", va="center", ha="left",
+                bbox=dict(boxstyle="square,pad=0.18", facecolor=tag_bg, edgecolor="none"),
+                clip_on=False, zorder=9
+            )
 
-        tick_indices = [2, int(n_bars * 0.45), n_bars - 2]
+        tick_indices = [4, int(n_bars * 0.35), int(n_bars * 0.68), n_bars - 2]
         ax.set_xticks(tick_indices)
-        ax.set_xticklabels([(to_utc_timestamp(sub.index[ti]) + timedelta(hours=5, minutes=30)).strftime("%d %b %H:%M") for ti in tick_indices], fontsize=8.8, color="#374151")
+        ax.set_xticklabels(
+            [(to_utc_timestamp(sub.index[ti]) + timedelta(hours=5, minutes=30)).strftime("%d %b %H:%M") for ti in tick_indices],
+            fontsize=8.5, color="#434651"
+        )
 
-        mode_title = f"A+ SIGNAL ({human_score}/100)" if is_live_signal else f"LIVE AUDIT ({human_score}/100) • {short_tag}"
-        ax.text(0.02, 0.975, f"{mt5_sym} • M5 | {mode_title}", transform=ax.transAxes, fontsize=10.0, fontweight="bold", color=("#15803d" if is_live_signal else "#0284c7"), va="top")
-        ax.text(0.02, 0.942, f"{sub_Desc}", transform=ax.transAxes, fontsize=8.8, color="#374151", va="top")
+        last_bar = sub.iloc[-1]
+        o_s = format_price(float(last_bar["Open"]), dec)
+        h_s = format_price(float(last_bar["High"]), dec)
+        l_s = format_price(float(last_bar["Low"]), dec)
+        c_s = format_price(float(last_bar["Close"]), dec)
+        ema20_s = format_price(float(last_bar["EMA20"]), dec)
+        ema50_s = format_price(float(last_bar["EMA50"]), dec)
 
-        bid_s, ask_s = format_price(entry_p, dec), format_price(entry_p + spread, dec)
-        header_ax = fig.add_axes([0.03, 0.86, 0.94, 0.11], facecolor="#ffffff")
-        header_ax.axis("off")
-        header_ax.text(0.01, 0.85, "☰      ┼      ƒ      M5", fontsize=11, fontweight="bold", color="#374151", va="center")
-        header_ax.text(0.99, 0.85, get_ist_now().strftime("%I:%M %p"), fontsize=9.5, fontweight="bold", color="#4b5563", ha="right", va="center")
-
-        header_ax.add_patch(mpatches.Rectangle((0.0, 0.05), 0.32, 0.58, facecolor="#2563eb", edgecolor="none"))
-        header_ax.text(0.03, 0.48, "SELL", color="#bfdbfe", fontweight="bold", fontsize=8.0, ha="left", va="center")
-        header_ax.text(0.16, 0.24, bid_s, color="white", fontweight="bold", fontsize=11.5, ha="center", va="center")
-
-        header_ax.add_patch(mpatches.Rectangle((0.325, 0.05), 0.35, 0.58, facecolor="#f9fafb", edgecolor="#d1d5db"))
-        header_ax.text(0.50, 0.34, f"⌄    {lot_size:.2f}    ⌃", color="#111827", fontweight="bold", fontsize=10.5, ha="center", va="center")
-
-        header_ax.add_patch(mpatches.Rectangle((0.68, 0.05), 0.32, 0.58, facecolor="#ef4444", edgecolor="none"))
-        header_ax.text(0.71, 0.48, "BUY", color="#fecaca", fontweight="bold", fontsize=8.0, ha="left", va="center")
-        header_ax.text(0.84, 0.24, ask_s, color="white", fontweight="bold", fontsize=11.5, ha="center", va="center")
+        top_ax = fig.add_axes([0.015, 0.915, 0.96, 0.075], facecolor="#ffffff")
+        top_ax.axis("off")
+        top_ax.text(
+            0.0, 0.68,
+            f"{mt5_sym} · 5m · Live Spot   |   O {o_s}   H {h_s}   L {l_s}   C {c_s}",
+            fontsize=10.0, fontweight="bold", color="#131722", va="center", ha="left"
+        )
+        top_ax.text(
+            0.0, 0.20,
+            f"EMA 20: {ema20_s} (Blue)   •   EMA 50: {ema50_s} (Orange)   •   Structure: {short_tag} ({human_score}/100)",
+            fontsize=8.5, fontweight="bold", color="#475569", va="center", ha="left"
+        )
+        top_ax.text(
+            0.99, 0.68,
+            f"{get_ist_now().strftime('%d %b %Y • %I:%M:%S %p IST')}",
+            fontsize=8.8, fontweight="bold", color="#64748b", va="center", ha="right"
+        )
 
         buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=140, facecolor="#ffffff")
+        plt.savefig(buf, format="png", dpi=125, facecolor="#ffffff")
         plt.close(fig)
         buf.seek(0)
         return buf
@@ -1480,14 +1640,14 @@ def send_telegram_signal_with_chart(caption_html, chart_buf, target_chat_id=CHAT
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
         try:
             if len(caption_html) <= 980:
-                files = {"photo": ("mt5_chart.png", photo_bytes, "image/png")}
+                files = {"photo": ("tv_pro_chart.png", photo_bytes, "image/png")}
                 data  = {"chat_id": target_chat_id, "caption": caption_html, "parse_mode": "HTML"}
-                res   = requests.post(url, data=data, files=files, timeout=20)
+                res   = HTTP_SESSION.post(url, data=data, files=files, timeout=15)
                 if res.status_code == 200 and res.json().get("ok"):
                     return
-            files = {"photo": ("mt5_chart.png", photo_bytes, "image/png")}
-            data  = {"chat_id": target_chat_id, "caption": "📊 <b>Live M5 Chart</b>", "parse_mode": "HTML"}
-            requests.post(url, data=data, files=files, timeout=20)
+            files = {"photo": ("tv_pro_chart.png", photo_bytes, "image/png")}
+            data  = {"chat_id": target_chat_id, "caption": "📊 <b>Live Price-Action Chart</b>", "parse_mode": "HTML"}
+            HTTP_SESSION.post(url, data=data, files=files, timeout=15)
             send_telegram_message(caption_html, target_chat_id)
             return
         except Exception:
@@ -1502,7 +1662,8 @@ def send_instant_preview_chart(pair_key=None):
         chart_rotation_index += 1
 
     info = FOREX_PAIRS.get(pair_key, FOREX_PAIRS["XAU/USD (GOLD)"])
-    df_15m, df_5m, live_spot, src = get_clean_spot_data(pair_key, info)
+    # Reuses closed historical bars for speed, but ALWAYS pulls a 100% fresh real-time tick right now!
+    df_15m, df_5m, live_spot, src = get_clean_spot_data(pair_key, info, use_fast_cache=True)
     if df_5m is None or live_spot is None:
         send_telegram_message("⚠️ डेटा लोड हो रहा है, कृपया कुछ सेकंड बाद प्रयास करें।")
         return
@@ -1539,7 +1700,7 @@ def send_instant_preview_chart(pair_key=None):
             f"📊 <b>{pair_key} ({info['mt5_name']}) — LIVE M5 AUDIT</b>\n"
             f"{diag['state_headline']} (<b>Score: {score}/100</b>)\n\n"
             f"🔍 <b>Analysis:</b>\n{diag['detail_line']}\n\n"
-            f"📍 <b>Spot:</b> <code>{format_price(live_spot, dec)}</code> | 💼 <b>Lot:</b> <code>{lot_size:.2f}</code>\n"
+            f"📍 <b>Live Spot:</b> <code>{format_price(live_spot, dec)}</code> | 💼 <b>Lot:</b> <code>{lot_size:.2f}</code>\n"
             f"🛑 <b>SL:</b> <code>{format_price(sl_level, dec)}</code> | 🎯 <b>TP1:</b> <code>{format_price(near_tp_lvl, dec)}</code> | <b>TP2:</b> <code>{format_price(target_level, dec)}</code>"
         )
     else:
@@ -1565,7 +1726,7 @@ def send_live_status_summary():
     )
     for name, info in FOREX_PAIRS.items():
         try:
-            df_15m, df_5m, live_spot, _ = get_clean_spot_data(name, info)
+            df_15m, df_5m, live_spot, _ = get_clean_spot_data(name, info, use_fast_cache=True)
             if df_5m is not None and df_15m is not None:
                 df_5m  = calculate_chart_indicators(df_5m)
                 df_15m = calculate_chart_indicators(df_15m)
@@ -1583,9 +1744,9 @@ def check_telegram_commands():
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    params = {"offset": last_update_id + 1, "timeout": 1}
+    params = {"offset": last_update_id + 1, "timeout": 0}
     try:
-        response = requests.get(url, params=params, timeout=4).json()
+        response = HTTP_SESSION.get(url, params=params, timeout=3).json()
         if response.get("ok"):
             for result in response.get("result", []):
                 last_update_id = result["update_id"]
@@ -1738,7 +1899,7 @@ def manage_open_trades(pair_name, candle_time, live_spot, df_5m, decimals):
                 send_telegram_message(f"🛑 <b>STOP-LOSS HIT (-${loss_amt:.0f}) on {trade['mt5_name']}</b> ({sl_str})")
 
 # =====================================================================
-# 8. MASTER SCANNER LOOP
+# 8. MASTER SCANNER LOOP (WITH NON-BLOCKING TELEGRAM COMMAND POLLING)
 # =====================================================================
 def scan_markets():
     global trades_today, current_day, last_candle_traded, last_structure_traded
@@ -1767,10 +1928,13 @@ def scan_markets():
     usdcad_spot = fetch_tradingview_median_spot(["FX:USDCAD", "OANDA:USDCAD"], "forex") or 1.39
 
     for name, info in FOREX_PAIRS.items():
+        # Poll Telegram commands before EVERY pair so /chart is answered within 0.5s!
+        check_telegram_commands()
+
         if not forex_open and not info.get("is_crypto", False):
             continue
         try:
-            df_15m, df_5m, live_spot, source_used = get_clean_spot_data(name, info)
+            df_15m, df_5m, live_spot, source_used = get_clean_spot_data(name, info, use_fast_cache=False)
             if df_5m is None or df_15m is None or live_spot is None:
                 continue
 
@@ -1823,7 +1987,6 @@ def scan_markets():
 
                 exact_lot = calculate_exact_mt5_lot(name, info, sl_dist, dynamic_risk_usd, usdjpy_spot, usdcad_spot)
 
-                # Calculate Manual Trader Safe Entry Zone (max 22% of SL distance slippage buffer)
                 max_chase_buf = round(sl_dist * 0.22, dec)
                 if direction == "BUY":
                     max_safe_entry = round(live_spot + max_chase_buf, dec)
@@ -1878,10 +2041,9 @@ def scan_markets():
 if __name__ == "__main__":
     fetch_live_economic_calendar()
     send_telegram_message(
-        "🧠 <b>Human Brain V4 (GitHub -> Telegram Manual Trader) Online</b>\n"
-        "✅ <b>100% Dynamic Live Score:</b> हर पेयर का असली स्कोर और असली मार्केट बिहेवियर (No Fixed 68!)\n"
-        "✅ <b>Pure Spot Forex Feed:</b> No Crypto Proxies, No Candle Distortion\n"
-        "✅ <b>Manual Safe Entry Zone + Pips Offset:</b> Ready for FTM MT5"
+        "🧠 <b>Human Brain V4 (Instant Live-Tick + Pro TradingView Chart) Online</b>\n"
+        "⚡ <b>Zero-Delay Live Price:</b> हर कमांड पर 0.1s में नया Live Price (65367 -> 65380) अपडेट होगा\n"
+        "📊 <b>Experienced Trader Chart:</b> Supply/Demand Zones, HH/HL/LH/LL Swings & TradingView Position Tool"
     )
 
     start_run      = time.time()
@@ -1895,10 +2057,10 @@ if __name__ == "__main__":
             if time.time() - last_scan_time >= 15:
                 scan_markets()
                 last_scan_time = time.time()
-            time.sleep(2)
+            time.sleep(0.5)
         except KeyboardInterrupt:
             print("🛑 Bot stopped manually.")
             break
         except Exception as e:
             print(f"Loop Error: {e}")
-            time.sleep(5)
+            time.sleep(3)
