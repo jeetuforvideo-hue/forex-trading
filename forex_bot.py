@@ -2,6 +2,7 @@ import os
 import io
 import csv
 import sys
+import json
 import time
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -50,7 +51,6 @@ CHAT_ID   = os.getenv("CHAT_ID") or "5610520408"
 STARTING_CAPITAL_USD         = 5000.0
 HIGH_WATER_MARK_USD          = 5000.0
 
-# Exact PDF Section 2 Risk Rules ($5,000 Account)
 RISK_PER_TRADE_USD           = 12.50     # 0.25% of $5,000 (Max planned loss including spread/costs)
 DAILY_STOP_LOSS_USD          = 25.00     # 0.50% of $5,000 (Stop after 2 losses OR -$25 total loss)
 WEEKLY_STOP_LOSS_USD         = 75.00     # 1.50% of $5,000 (Weekly review/stop threshold)
@@ -65,12 +65,12 @@ MAX_TRADE_HOLD_MINUTES       = 90
 
 STRICT_NY_SESSION_ONLY       = True
 JOURNAL_CSV_PATH             = "trading_journal.csv"
-BACKTEST_CSV_PATH            = "backtest_full_report.csv"
+STATE_JSON_PATH              = "live_dashboard_data.json"
+WEB_DASHBOARD_PATH           = "index.html"
 
 WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 WEEKDAY_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-# PDF Section 1: Primary Market = XAUUSD, Second Market = BTCUSD
 FOREX_PAIRS = {
     "XAU/USD": {
         "mt5_name": "XAUUSD",
@@ -82,11 +82,11 @@ FOREX_PAIRS = {
         "yf_symbols": ["GC=F"],
         "currencies": ["USD"],
         "decimals": 2,
-        "spread_and_cost": 0.35,         # Realistic spread + commission + slippage in price terms
+        "spread_and_cost": 0.35,
         "unit_name": "Pts",
         "usd_exposure": "SHORT_USD_ON_BUY",
         "min_sl_dist": 2.80,
-        "max_sl_dist": 12.15,            # Above $12.15 + $0.35 cost, 0.01 lot risks > $12.50 -> Skip!
+        "max_sl_dist": 12.15,
         "min_lot": 0.01,
         "max_lot_cap": 0.05,
         "is_crypto": False
@@ -101,18 +101,18 @@ FOREX_PAIRS = {
         "yf_symbols": ["BTC-USD"],
         "currencies": ["USD"],
         "decimals": 2,
-        "spread_and_cost": 28.00,        # Realistic BTCUSD spread + commission + slippage in price terms
+        "spread_and_cost": 28.00,
         "unit_name": "Pts",
         "usd_exposure": "SHORT_USD_ON_BUY",
         "min_sl_dist": 160.0,
-        "max_sl_dist": 1200.0,           # Above $1,200 + $28 cost, 0.01 lot risks > $12.50 -> Skip!
+        "max_sl_dist": 1200.0,
         "min_lot": 0.01,
         "max_lot_cap": 0.05,
         "is_crypto": True
     }
 }
 
-# Runtime State Tracking
+# Runtime State Tracking (Starts cleanly at 0)
 last_candle_traded      = {name: None for name in FOREX_PAIRS}
 last_pre_alert_candle   = {name: None for name in FOREX_PAIRS}
 last_setup_traded       = {name: None for name in FOREX_PAIRS}
@@ -121,6 +121,7 @@ pair_cooldown_until     = {name: datetime.min.replace(tzinfo=timezone.utc) for n
 pre_alert_cooldown      = {name: datetime.min.replace(tzinfo=timezone.utc) for name in FOREX_PAIRS}
 live_bars_memory        = {name: {} for name in FOREX_PAIRS}
 ohlc_history_cache      = {}
+cached_backtest_bundle  = None
 
 cached_news_events      = []
 last_news_fetch_time    = 0
@@ -160,7 +161,6 @@ def to_utc_timestamp(ts):
     return ts.replace(tzinfo=timezone.utc)
 
 def get_ny_weekday_index(ts_utc):
-    """Returns the weekday index (0=Monday ... 6=Sunday) in New York time so session days align accurately."""
     dt_utc = to_utc_timestamp(ts_utc)
     try:
         ny_dt = dt_utc.astimezone(ZoneInfo("America/New_York"))
@@ -181,7 +181,58 @@ current_day  = get_ist_now().date()
 current_week = get_ist_now().isocalendar()[1]
 
 # =====================================================================
-# 2. NEW YORK SESSION & ECONOMIC CALENDAR ENGINE (PDF SECTION 3)
+# 2. PERSISTENT MEMORY LOADER (SO BOT RESTARTS NEVER LOSE YOUR TRADES)
+# =====================================================================
+def load_persistent_account_state():
+    """Loads saved live trades & PnL from live_dashboard_data.json if available. Starts at 0 if new."""
+    global HIGH_WATER_MARK_USD, total_account_pnl, daily_realized_pnl, weekly_realized_pnl
+    global trades_today, losses_today, journal_memory_log
+    if not os.path.isfile(STATE_JSON_PATH):
+        return
+    try:
+        with open(STATE_JSON_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        total_account_pnl   = float(data.get("total_account_pnl", 0.0))
+        HIGH_WATER_MARK_USD = max(STARTING_CAPITAL_USD, float(data.get("peak_equity", STARTING_CAPITAL_USD)))
+        saved_day           = data.get("saved_ist_date", "")
+        saved_week          = data.get("saved_iso_week", -1)
+        if saved_day == str(get_ist_now().date()):
+            daily_realized_pnl = float(data.get("day_pnl", 0.0))
+            trades_today       = int(data.get("trades_today", 0))
+            losses_today       = int(data.get("losses_today", 0))
+        if saved_week == get_ist_now().isocalendar()[1]:
+            weekly_realized_pnl = float(data.get("week_pnl", 0.0))
+        loaded_journal = data.get("raw_journal_memory", [])
+        if isinstance(loaded_journal, list):
+            journal_memory_log = loaded_journal
+    except Exception as e:
+        print(f"State Load Info: {e}")
+
+def reset_live_account_to_zero():
+    """Resets live account metrics and journal cleanly back to $5,000.00 and 0 trades."""
+    global HIGH_WATER_MARK_USD, total_account_pnl, daily_realized_pnl, weekly_realized_pnl
+    global trades_today, losses_today, daily_trades_log, journal_memory_log
+    global daily_halt_announced, weekly_halt_announced, dd_halt_announced
+    HIGH_WATER_MARK_USD   = STARTING_CAPITAL_USD
+    total_account_pnl     = 0.0
+    daily_realized_pnl    = 0.0
+    weekly_realized_pnl   = 0.0
+    trades_today          = 0
+    losses_today          = 0
+    daily_trades_log      = []
+    journal_memory_log    = []
+    daily_halt_announced  = False
+    weekly_halt_announced = False
+    dd_halt_announced     = False
+    if os.path.isfile(JOURNAL_CSV_PATH):
+        try:
+            os.remove(JOURNAL_CSV_PATH)
+        except Exception:
+            pass
+    sync_live_website_dashboard(push_to_git=True)
+
+# =====================================================================
+# 3. NEW YORK SESSION & ECONOMIC CALENDAR ENGINE (PDF SECTION 3)
 # =====================================================================
 def is_forex_market_open():
     now = get_ist_now()
@@ -259,7 +310,7 @@ def check_news_window_for_pair(pair_info):
     return True, "Clear"
 
 # =====================================================================
-# 3. $5,000 TWO-STEP RISK MANAGEMENT & JOURNAL ENGINE (PDF SEC 2 & 5)
+# 4. $5,000 TWO-STEP RISK MANAGEMENT & JOURNAL ENGINE (PDF SEC 2 & 5)
 # =====================================================================
 def get_live_account_metrics(live_prices_map=None):
     global HIGH_WATER_MARK_USD
@@ -393,8 +444,11 @@ def append_to_trading_journal(trade_record, result_r_val, net_pnl_usd, result_la
     except Exception as e:
         print(f"Journal Write Warning: {e}")
 
+    # Auto-sync live website dashboard immediately when a trade finishes!
+    sync_live_website_dashboard(push_to_git=True)
+
 # =====================================================================
-# 4. ZERO-DELAY 1H + 15M + 5M DATA ENGINE (LIVE + DEEP BACKTEST FETCH)
+# 5. ZERO-DELAY 1H + 15M + 5M DATA ENGINE (LIVE + DEEP BACKTEST FETCH)
 # =====================================================================
 def send_telegram_message(message, target_chat_id=CHAT_ID):
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
@@ -414,9 +468,10 @@ def send_telegram_document(file_bytes, filename, caption_html="", target_chat_id
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+    mime_type = "text/html" if filename.endswith(".html") else "text/csv"
     for attempt in range(2):
         try:
-            files = {"document": (filename, file_bytes, "text/csv")}
+            files = {"document": (filename, file_bytes, mime_type)}
             data  = {"chat_id": target_chat_id, "caption": caption_html[:950], "parse_mode": "HTML"}
             r = HTTP_SESSION.post(url, data=data, files=files, timeout=15) if attempt == 0 else requests.post(url, data=data, files=files, timeout=18)
             if r.status_code == 200:
@@ -474,7 +529,7 @@ def fetch_binance_vision_ohlc(binance_symbol, interval_str="5m", limit=240):
             pass
     return None
 
-def fetch_binance_paginated_5m_history(binance_symbol, total_bars=3000):
+def fetch_binance_paginated_5m_history(binance_symbol, total_bars=2500):
     if not binance_symbol:
         return None
     chunks = []
@@ -642,7 +697,7 @@ def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=False):
     return df_1h, df_15m, df_5m, live_spot_price
 
 # =====================================================================
-# 5. PRE-SESSION KEY LEVELS & 1H CONTEXT ENGINE (PDF SECTION 1)
+# 6. PRE-SESSION KEY LEVELS & 1H CONTEXT ENGINE (PDF SECTION 1)
 # =====================================================================
 def enrich_price_action_metrics(df):
     df = df.copy()
@@ -783,7 +838,7 @@ def extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, decimal
     }
 
 # =====================================================================
-# 6. ONE TESTED SETUP ENGINE: 15M SWEEP + 5M MSS + FVG/PULLBACK (PDF SEC 1)
+# 7. ONE TESTED SETUP ENGINE: 15M SWEEP + 5M MSS + FVG/PULLBACK (PDF SEC 1)
 # =====================================================================
 def detect_5m_fvg_zone(df_5m, direction, lookback=6):
     n = len(df_5m)
@@ -1037,10 +1092,10 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
     return (None, "LOCKED") if return_skip_reason else None
 
 # =====================================================================
-# 7. ALL-IN-ONE BACKTEST + DAY-WISE (MON–FRI) ANALYTICS ENGINE
+# 8. BACKTEST & DAY-WISE (MON–FRI) ANALYTICS ENGINE
 # =====================================================================
 def simulate_single_pair_backtest(pair_name, info, ny_session_only=False):
-    df_5m = fetch_binance_paginated_5m_history(info.get("binance_symbol"), total_bars=2600)
+    df_5m = fetch_binance_paginated_5m_history(info.get("binance_symbol"), total_bars=2500)
     if df_5m is None or len(df_5m) < 250:
         for yf_sym in info.get("yf_symbols", []):
             try:
@@ -1307,10 +1362,6 @@ def compute_stage6_metrics(trades_list):
     }
 
 def compute_day_wise_breakdown(trades_list):
-    """
-    Computes exact Day-of-Week performance (Monday to Friday + Weekend):
-    Tracks Trades, Wins, Breakevens, Losses, Win Rate (%), Avg R, and Net PnL ($) for each day.
-    """
     day_stats = {}
     for d_idx in range(7):
         d_trades = [t for t in trades_list if t.get("weekday_idx") == d_idx]
@@ -1344,18 +1395,300 @@ def compute_day_wise_breakdown(trades_list):
         "worst_day": worst_day
     }
 
+# =====================================================================
+# 9. 100% AUTO-SYNC MULTI-TAB WEBSITE DASHBOARD ENGINE (index.html)
+# =====================================================================
+def build_pair_backtest_html_section(title_label, res_obj):
+    if not res_obj or not res_obj.get("trades"):
+        return f"<div class='card'><div class='lbl'>{title_label}</div><div class='sub'>No historical setups in current window.</div></div>"
+
+    t_list = res_obj["trades"]
+    st     = compute_stage6_metrics(t_list)
+    dbd    = compute_day_wise_breakdown(t_list)
+
+    day_boxes = ""
+    for d_i in range(5):
+        ds = dbd["days"][d_i]
+        dc = "#10b981" if ds["net_pnl"] > 0 else ("#ef4444" if ds["net_pnl"] < 0 else "#94a3b8")
+        day_boxes += (
+            f"<div class='card'><div class='lbl'>{ds['day_name']}</div>"
+            f"<div class='val' style='color:{dc}'>${ds['net_pnl']:+.2f}</div>"
+            f"<div class='sub'>Trades: {ds['total']} (W:{ds['wins']} | BE:{ds['breakevens']} | L:{ds['losses']}) · WR: {ds['wr']:.0f}%</div></div>"
+        )
+
+    rows_html = ""
+    for idx, t in enumerate(reversed(t_list[-25:]), 1):
+        rc = "#10b981" if t["net_pnl"] > 1.0 else ("#ef4444" if t["net_pnl"] < -2.0 else "#3b82f6")
+        rows_html += (
+            f"<tr><td>#{idx}</td><td>{t['timestamp'].strftime('%d %b %I:%M %p')}<br><small>{t['day_name']}</small></td>"
+            f"<td><b>{t['market']} ({t['direction']})</b></td><td>{t['h1_bias']}</td><td>{t['level_full']}</td>"
+            f"<td><code>E:{t['entry']} | SL:{t['sl']} | TP:{t['tp']}</code></td><td>{t['lot']}</td>"
+            f"<td style='color:{rc};font-weight:700;'>{t['result_r']:+.1f}R (${t['net_pnl']:+.2f})</td></tr>"
+        )
+
+    return f"""
+    <div class="grid">
+      <div class="card"><div class="lbl">{title_label} Net PnL (After Costs)</div><div class="val" style="color:{'#10b981' if st['net_pnl_usd']>=0 else '#ef4444'}">${st['net_pnl_usd']:+.2f}</div><div class="sub">Final Equity: ${st['final_equity']:,.2f} | Costs: ${st['total_costs_usd']:.2f}</div></div>
+      <div class="card"><div class="lbl">Win Rate & Outcomes</div><div class="val" style="color:#3b82f6">{st['decisive_wr']:.1f}% WR</div><div class="sub">Total: {st['total']} (W:{st['wins']} | BE:{st['breakevens']} | L:{st['losses']})</div></div>
+      <div class="card"><div class="lbl">Profit Factor & Expectancy</div><div class="val" style="color:#f59e0b">PF: {st['profit_factor']:.2f}</div><div class="sub">Expectancy: ${st['expectancy_usd']:+.2f}/trade ({st['avg_r']:+.2f}R)</div></div>
+      <div class="card"><div class="lbl">Max Drawdown & Skipped</div><div class="val" style="color:#ec4899">${st['max_dd_usd']:.2f} ({st['max_dd_pct']:.2f}%)</div><div class="sub">Skipped (> $12.50 risk): {res_obj['skipped_risk']} | Choppy: {res_obj['skipped_chop']}</div></div>
+    </div>
+    <div class="sec-title">📅 {title_label} — Day-Wise Profitability (Monday – Friday)</div>
+    <div class="grid">{day_boxes}</div>
+    <div class="sec-title">📋 {title_label} — Recent Backtest Setups (Last 25)</div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Date / Day</th><th>Market</th><th>1H Bias</th><th>15M Level Swept</th><th>Entry / SL / 1:2 TP</th><th>Lot</th><th>Net Result</th></tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    """
+
+def sync_live_website_dashboard(refresh_backtest=False, push_to_git=True):
+    """
+    Automatically builds the complete 4-Tab Website Dashboard (index.html) and pushes it to GitHub:
+    - Tab 1: My $5,000 Live Account (Starts at 0 trades, auto-updates on every Telegram Bot signal/outcome)
+    - Tab 2: XAUUSD (Gold) Separate Backtest + Mon-Fri Day-Wise Report
+    - Tab 3: BTCUSD (Bitcoin) Separate Backtest + Mon-Fri Day-Wise Report
+    - Tab 4: Auto-Recorded 9-Column Trading Journal
+    """
+    global cached_backtest_bundle
+    if refresh_backtest or cached_backtest_bundle is None:
+        try:
+            xau_bt = simulate_single_pair_backtest("XAU/USD", FOREX_PAIRS["XAU/USD"], ny_session_only=False)
+            btc_bt = simulate_single_pair_backtest("BTC/USD", FOREX_PAIRS["BTC/USD"], ny_session_only=False)
+            cached_backtest_bundle = {"xau": xau_bt, "btc": btc_bt}
+        except Exception as e:
+            print(f"Backtest Cache Info: {e}")
+            cached_backtest_bundle = {"xau": None, "btc": None}
+
+    bal, eq, day_pnl, week_pnl = get_live_account_metrics()
+    dd_used = max(STARTING_CAPITAL_USD, HIGH_WATER_MARK_USD) - min(bal, eq)
+
+    live_trades_list = [
+        {"net_pnl": r["numeric_pnl"], "result_r": r["numeric_r"], "cost_usd": r["cost_usd"], "weekday_idx": r.get("weekday_idx", 0)}
+        for r in journal_memory_log
+    ]
+    live_stats = compute_stage6_metrics(live_trades_list)
+    live_days  = compute_day_wise_breakdown(live_trades_list)
+
+    running_list = [
+        {
+            "market": t["mt5_name"], "direction": t["direction"], "entry": t["entry"],
+            "sl": t["sl"], "tp": t["target"], "lot": t["lot_size"], "risk": t["max_risk"],
+            "swept": t.get("swept_level_name", ""), "trailed": t.get("trailed_to_cost", False)
+        }
+        for t in daily_trades_log if t.get("is_open")
+    ]
+
+    state_payload = {
+        "updated_at": get_ist_now().strftime("%Y-%m-%d %I:%M:%S %p IST"),
+        "saved_ist_date": str(get_ist_now().date()),
+        "saved_iso_week": get_ist_now().isocalendar()[1],
+        "total_account_pnl": round(total_account_pnl, 2),
+        "balance": round(bal, 2),
+        "equity": round(eq, 2),
+        "peak_equity": round(HIGH_WATER_MARK_USD, 2),
+        "day_pnl": round(day_pnl, 2),
+        "week_pnl": round(week_pnl, 2),
+        "dd_used": round(dd_used, 2),
+        "trades_today": trades_today,
+        "losses_today": losses_today,
+        "raw_journal_memory": journal_memory_log
+    }
+
+    try:
+        with open(STATE_JSON_PATH, "w", encoding="utf-8") as jf:
+            json.dump(state_payload, jf, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"State Save Warning: {e}")
+
+    running_html = ""
+    for rt in running_list:
+        be_badge = "🛡️ SL AT BREAKEVEN" if rt["trailed"] else "⚡ LIVE IN MARKET"
+        running_html += (
+            f"<div class='run-card'>🟢 <b>{rt['market']} ({rt['direction']}) — {be_badge}</b><br>"
+            f"Swept Level: <b>{rt['swept']}</b> | Lot: <b>{rt['lot']} Lot</b> | "
+            f"Entry: <code>{rt['entry']}</code> | SL: <code>{rt['sl']}</code> | 1:2 TP: <code>{rt['tp']}</code> | Planned Risk: <b>${rt['risk']:.2f}</b></div>"
+        )
+    if not running_html:
+        running_html = "<div class='run-empty'>⏸️ अभी कोई लाइव ट्रेड चालू नहीं है — जैसे ही बॉट टेलीग्राम पर नया सिग्नल देगा, वह अपने-आप यहाँ दिखेगा।</div>"
+
+    live_day_cards = ""
+    for d_i in range(5):
+        ds = live_days["days"][d_i]
+        d_col = "#10b981" if ds["net_pnl"] > 0 else ("#ef4444" if ds["net_pnl"] < 0 else "#94a3b8")
+        live_day_cards += (
+            f"<div class='card'><div class='lbl'>{ds['day_name']} (Live)</div>"
+            f"<div class='val' style='color:{d_col}'>${ds['net_pnl']:+.2f}</div>"
+            f"<div class='sub'>Trades: {ds['total']} (W:{ds['wins']} | BE:{ds['breakevens']} | L:{ds['losses']}) · WR: {ds['wr']:.0f}%</div></div>"
+        )
+
+    journal_rows_html = ""
+    for idx, r in enumerate(reversed(journal_memory_log), 1):
+        res_str = r["Result (R)"]
+        res_col = "#10b981" if "+" in res_str else ("#ef4444" if "-" in res_str else "#3b82f6")
+        journal_rows_html += (
+            f"<tr><td>#{idx}</td><td>{r['Date / time']}<br><small>{r.get('Day', '')}</small></td>"
+            f"<td><b>{r['Market']}</b></td><td>{r['1H bias']}</td><td>{r['Level / sweep']}</td>"
+            f"<td>{r['5M confirmation']}</td><td><code>{r['Entry / SL / TP']}</code></td><td>{r['Risk $']}</td>"
+            f"<td style='color:{res_col};font-weight:700;'>{res_str}</td></tr>"
+        )
+    if not journal_rows_html:
+        journal_rows_html = "<tr><td colspan='9' style='text-align:center;color:#94a3b8;padding:22px;'>अभी आपके लाइव अकाउंट में 0 ट्रेड्स हैं ($5,000.00 Start) — जैसे ही बॉट टेलीग्राम पर ट्रेड देगा और वह पूरी होगी, यहाँ अपने-आप जुड़ जाएगी।</td></tr>"
+
+    xau_tab_html = build_pair_backtest_html_section("🥇 XAUUSD (Gold Spot)", cached_backtest_bundle.get("xau"))
+    btc_tab_html = build_pair_backtest_html_section("₿ BTCUSD (Bitcoin)", cached_backtest_bundle.get("btc"))
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="45">
+<title>$5,000 Funded Bot — Auto Command Center</title>
+<style>
+  body {{ margin:0; font-family: system-ui, -apple-system, sans-serif; background:#0b0f17; color:#f8fafc; padding:14px; }}
+  .wrap {{ max-width:1200px; margin:0 auto; }}
+  .hdr {{ display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; background:#111827; padding:14px 18px; border-radius:12px; border:1px solid #1e293b; margin-bottom:12px; }}
+  .hdr h1 {{ margin:0; font-size:17px; color:#f8fafc; }}
+  .badge {{ background:#064e3b; color:#34d399; padding:5px 10px; border-radius:8px; font-size:11.5px; font-weight:700; }}
+  .tabs {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px; }}
+  .tab-btn {{ background:#111827; color:#cbd5e1; border:1px solid #1e293b; padding:10px 15px; border-radius:9px; font-size:13px; font-weight:700; cursor:pointer; }}
+  .tab-btn.active {{ background:#2563eb; color:#ffffff; border-color:#3b82f6; }}
+  .tab-pane {{ display:none; }}
+  .tab-pane.active {{ display:block; }}
+  .grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:11px; margin-bottom:14px; }}
+  .card {{ background:#111827; border:1px solid #1e293b; padding:13px; border-radius:10px; }}
+  .lbl {{ font-size:11.5px; color:#94a3b8; margin-bottom:5px; }}
+  .val {{ font-size:20px; font-weight:800; font-family:monospace; }}
+  .sub {{ font-size:11px; color:#64748b; margin-top:4px; }}
+  .sec-title {{ font-size:14.5px; font-weight:700; margin:16px 0 9px; color:#e2e8f0; border-left:4px solid #3b82f6; padding-left:10px; }}
+  .run-card {{ background:#064e3b; border:1px solid #10b981; color:#ecfdf5; padding:12px; border-radius:9px; margin-bottom:8px; font-size:13px; line-height:1.5; }}
+  .run-empty {{ background:#111827; border:1px dashed #334155; color:#94a3b8; padding:13px; border-radius:9px; font-size:13px; }}
+  .tbl-wrap {{ overflow-x:auto; background:#111827; border:1px solid #1e293b; border-radius:10px; }}
+  table {{ width:100%; border-collapse:collapse; font-size:12.2px; }}
+  th, td {{ padding:9px 11px; text-align:left; border-bottom:1px solid #1e293b; }}
+  th {{ background:#1e293b; color:#cbd5e1; font-weight:700; }}
+  code {{ background:#0f172a; padding:2px 5px; border-radius:4px; color:#93c5fd; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hdr">
+    <div>
+      <h1>🛡️ $5,000 Two-Step Funded Account — Auto-Synced Command Center</h1>
+      <div style="font-size:11.5px;color:#94a3b8;margin-top:3px;">Last Bot Sync: <b>{state_payload['updated_at']}</b> · Auto-updates on every Telegram Signal, TP & SL</div>
+    </div>
+    <span class="badge">● 100% AUTO-PILOT SYNCED</span>
+  </div>
+
+  <div class="tabs">
+    <button class="tab-btn active" onclick="openTab('tab-live', this)">1. 🛡️ My $5,000 Live Account ({live_stats['total']} Trades)</button>
+    <button class="tab-btn" onclick="openTab('tab-xau', this)">2. 🥇 XAUUSD Backtest & Days (Separate)</button>
+    <button class="tab-btn" onclick="openTab('tab-btc', this)">3. ₿ BTCUSD Backtest & Days (Separate)</button>
+    <button class="tab-btn" onclick="openTab('tab-journal', this)">4. 📒 Auto Trading Journal ({live_stats['total']})</button>
+  </div>
+
+  <!-- TAB 1: LIVE ACCOUNT -->
+  <div id="tab-live" class="tab-pane active">
+    <div class="grid">
+      <div class="card">
+        <div class="lbl">Live Account Balance / Equity</div>
+        <div class="val" style="color:{'#10b981' if eq >= 5000 else '#ef4444'}">${bal:,.2f} / ${eq:,.2f}</div>
+        <div class="sub">Start: $5,000.00 | Peak: ${HIGH_WATER_MARK_USD:,.2f}</div>
+      </div>
+      <div class="card">
+        <div class="lbl">Today's PnL (Stop Limit: -$25.00)</div>
+        <div class="val" style="color:{'#10b981' if day_pnl >= 0 else '#ef4444'}">${day_pnl:+.2f}</div>
+        <div class="sub">Trades Today: {trades_today}/2 | Losses Today: {losses_today}/2</div>
+      </div>
+      <div class="card">
+        <div class="lbl">Weekly PnL (Stop Limit: -$75.00)</div>
+        <div class="val" style="color:{'#10b981' if week_pnl >= 0 else '#ef4444'}">${week_pnl:+.2f}</div>
+        <div class="sub">Max Drawdown Used: ${dd_used:.2f} / $100.00</div>
+      </div>
+      <div class="card">
+        <div class="lbl">Live Bot Trades & Win Rate</div>
+        <div class="val" style="color:#3b82f6">{live_stats['total']} Trades ({live_stats['decisive_wr']:.0f}% WR)</div>
+        <div class="sub">Wins (+2R): {live_stats['wins']} | BE (0R): {live_stats['breakevens']} | Loss (-1R): {live_stats['losses']}</div>
+      </div>
+      <div class="card">
+        <div class="lbl">Live Profit Factor & Expectancy</div>
+        <div class="val" style="color:#f59e0b">PF: {live_stats['profit_factor']:.2f}</div>
+        <div class="sub">Expectancy: ${live_stats['expectancy_usd']:+.2f}/trade ({live_stats['avg_r']:+.2f}R)</div>
+      </div>
+    </div>
+
+    <div class="sec-title">⚡ Active Running Trade (Live from Telegram Bot)</div>
+    {running_html}
+
+    <div class="sec-title">📅 My Live Day-Wise Performance (Monday – Friday)</div>
+    <div class="grid">{live_day_cards}</div>
+  </div>
+
+  <!-- TAB 2: SEPARATE XAUUSD BACKTEST -->
+  <div id="tab-xau" class="tab-pane">
+    {xau_tab_html}
+  </div>
+
+  <!-- TAB 3: SEPARATE BTCUSD BACKTEST -->
+  <div id="tab-btc" class="tab-pane">
+    {btc_tab_html}
+  </div>
+
+  <!-- TAB 4: AUTO JOURNAL -->
+  <div id="tab-journal" class="tab-pane">
+    <div class="sec-title">📒 Auto-Recorded 9-Column Trading Journal (Every Completed Bot Trade)</div>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr><th>#</th><th>Date / Day</th><th>Market</th><th>1H Bias</th><th>15M Level Swept</th><th>5M Confirm</th><th>Entry / SL / TP</th><th>Risk $</th><th>Result (R & $)</th></tr>
+        </thead>
+        <tbody>{journal_rows_html}</tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<script>
+function openTab(tabId, btnEl) {{
+  document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+  document.getElementById(tabId).classList.add('active');
+  btnEl.classList.add('active');
+}}
+</script>
+</body>
+</html>"""
+
+    try:
+        with open(WEB_DASHBOARD_PATH, "w", encoding="utf-8") as hf:
+            hf.write(html_content)
+    except Exception as e:
+        print(f"HTML Write Warning: {e}")
+
+    if push_to_git and os.getenv("GITHUB_ACTIONS", "").lower() == "true":
+        try:
+            subprocess.run(["git", "config", "user.name", "ForexBotAutoSync"], check=False)
+            subprocess.run(["git", "config", "user.email", "bot@users.noreply.github.com"], check=False)
+            files_to_add = [WEB_DASHBOARD_PATH, STATE_JSON_PATH]
+            if os.path.isfile(JOURNAL_CSV_PATH):
+                files_to_add.append(JOURNAL_CSV_PATH)
+            subprocess.run(["git", "add"] + files_to_add, check=False)
+            subprocess.run(["git", "commit", "-m", "Auto-sync live trade dashboard [skip ci]"], check=False)
+            subprocess.run(["git", "push"], check=False)
+        except Exception as e:
+            print(f"Git Auto-Push Info: {e}")
+
+    return html_content.encode("utf-8")
+
+# =====================================================================
+# 10. VISUAL CHARTS & TELEGRAM COMMANDS
+# =====================================================================
 def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, day_breakdown):
-    """
-    Generates a 4-Panel All-in-One Visual Backtest & Day-Wise Analytics Dashboard:
-    - Panel 1 (Top Full-Width): $5,000 Equity Curve + Drawdown Limit
-    - Panel 2 (Bottom-Left): Day-Wise Net PnL & Win-Rate (Mon, Tue, Wed, Thu, Fri)
-    - Panel 3 (Bottom-Center): XAUUSD vs BTCUSD Net PnL Comparison
-    - Panel 4 (Bottom-Right): Trade Outcome Distribution (+2R Wins, 0R BE, -1R Losses)
-    """
     try:
         fig = plt.figure(figsize=(12.2, 7.0), dpi=125, facecolor="#ffffff")
 
-        # Panel 1 (Top): Equity Curve
         ax1 = fig.add_axes([0.06, 0.50, 0.90, 0.41], facecolor="#ffffff")
         eq_curve = combined_stats["equity_curve"]
         x_idx    = np.arange(len(eq_curve))
@@ -1379,7 +1712,6 @@ def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, 
         ax1.set_ylabel("Equity ($ USD)", fontsize=8.8, fontweight="bold", color="#131722")
         ax1.legend(loc="upper left", fontsize=8.0, frameon=True)
 
-        # Panel 2 (Bottom-Left): Day-Wise Net PnL (Mon - Fri)
         ax_day = fig.add_axes([0.06, 0.08, 0.34, 0.32], facecolor="#ffffff")
         for sp in ["top", "right"]:
             ax_day.spines[sp].set_visible(False)
@@ -1404,7 +1736,6 @@ def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, 
                 ha="center", va="bottom" if yv >= 0 else "top", fontsize=7.1, fontweight="bold", color="#131722"
             )
 
-        # Panel 3 (Bottom-Center): XAUUSD vs BTCUSD Comparison
         ax2 = fig.add_axes([0.46, 0.08, 0.23, 0.32], facecolor="#ffffff")
         for sp in ["top", "right"]:
             ax2.spines[sp].set_visible(False)
@@ -1427,7 +1758,6 @@ def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, 
                 ha="center", va="bottom" if y_v >= 0 else "top", fontsize=7.4, fontweight="bold", color="#131722"
             )
 
-        # Panel 4 (Bottom-Right): Outcome Distribution (+2R Wins, 0R Breakevens, -1R Losses)
         ax3 = fig.add_axes([0.74, 0.08, 0.22, 0.32], facecolor="#ffffff")
         for sp in ["top", "right"]:
             ax3.spines[sp].set_visible(False)
@@ -1456,136 +1786,43 @@ def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, 
         return None
 
 def run_and_send_master_backtest_report(target_pair=None):
-    """
-    Executes the complete PDF Stage 3, 4 & 6 Backtest + Day-Wise (Mon–Fri) Report and sends:
-    1. 4-Panel Visual Dashboard Chart (Equity Curve + Day-Wise Bar Chart + XAU vs BTC + Outcomes)
-    2. Complete All-in-One Text Report (including Day-by-Day Mon–Fri Win Rate & Net Profit)
-    3. Downloadable CSV file of every single backtested trade (with Day of Week column)
-    """
-    send_telegram_message("⏳ <b>Running Historical Backtest + Day-Wise (Mon–Fri) Profitability Analysis...</b>")
+    send_telegram_message("⏳ <b>Updating All-in-One Backtest + Auto-Syncing Live Website Dashboard...</b>")
+    html_bytes = sync_live_website_dashboard(refresh_backtest=True, push_to_git=True)
 
-    xau_res = simulate_single_pair_backtest("XAU/USD", FOREX_PAIRS["XAU/USD"], ny_session_only=False) if target_pair in [None, "XAU/USD"] else {"trades": [], "skipped_risk": 0, "skipped_chop": 0, "days_tested": 0}
-    btc_res = simulate_single_pair_backtest("BTC/USD", FOREX_PAIRS["BTC/USD"], ny_session_only=False) if target_pair in [None, "BTC/USD"] else {"trades": [], "skipped_risk": 0, "skipped_chop": 0, "days_tested": 0}
+    xau_res = cached_backtest_bundle.get("xau") if target_pair in [None, "XAU/USD"] else None
+    btc_res = cached_backtest_bundle.get("btc") if target_pair in [None, "BTC/USD"] else None
 
     xau_trades = xau_res["trades"] if xau_res else []
     btc_trades = btc_res["trades"] if btc_res else []
-
     all_trades = sorted(xau_trades + btc_trades, key=lambda x: x["timestamp"])
-    ny_trades  = [t for t in all_trades if t["in_ny_window"]]
 
     comb_stats    = compute_stage6_metrics(all_trades)
-    ny_stats      = compute_stage6_metrics(ny_trades)
     xau_stats     = compute_stage6_metrics(xau_trades)
     btc_stats     = compute_stage6_metrics(btc_trades)
     day_breakdown = compute_day_wise_breakdown(all_trades)
 
-    # Format Day-Wise (Monday to Friday + Weekend) Breakdown Text
     day_lines = ""
     for d_idx in range(5):
         ds = day_breakdown["days"][d_idx]
         icon = "🟢" if ds["net_pnl"] > 0 else ("🔴" if ds["net_pnl"] < 0 else "⚪")
-        day_lines += (
-            f"{icon} <b>{ds['day_name']}:</b> {ds['total']} trades "
-            f"(W:{ds['wins']} | BE:{ds['breakevens']} | L:{ds['losses']}) | "
-            f"WR: <b>{ds['wr']:.0f}%</b> | Net: <b><code>${ds['net_pnl']:+.2f}</code></b>\n"
-        )
-
-    # Check if any weekend BTC trades exist
-    wknd_trades = day_breakdown["days"][5]["total"] + day_breakdown["days"][6]["total"]
-    if wknd_trades > 0:
-        wknd_pnl = day_breakdown["days"][5]["net_pnl"] + day_breakdown["days"][6]["net_pnl"]
-        day_lines += f"⚪ <b>Weekend (BTC):</b> {wknd_trades} trades | Net: <b><code>${wknd_pnl:+.2f}</code></b>\n"
-
-    best_d  = day_breakdown["best_day"]
-    worst_d = day_breakdown["worst_day"]
-    best_day_str  = f"🔥 <b>Most Profitable Day:</b> <b>{best_d['day_name']} (${best_d['net_pnl']:+.2f} | {best_d['wr']:.0f}% WR)</b>" if best_d else ""
-    worst_day_str = f"⚠️ <b>Weakest Day:</b> <b>{worst_d['day_name']} (${worst_d['net_pnl']:+.2f} | {worst_d['wr']:.0f}% WR)</b>" if worst_d else ""
-
-    # Level Sweep Breakdown (PDH, PDL, LON H/L, ASIA H/L, 1H Swing)
-    level_summary = {}
-    for t in all_trades:
-        lvl_k = t["level_swept"]
-        if lvl_k not in level_summary:
-            level_summary[lvl_k] = {"count": 0, "wins": 0, "pnl": 0.0}
-        level_summary[lvl_k]["count"] += 1
-        if t["net_pnl"] > 1.0:
-            level_summary[lvl_k]["wins"] += 1
-        level_summary[lvl_k]["pnl"] += t["net_pnl"]
-
-    lvl_lines = ""
-    for lk, lv_d in sorted(level_summary.items(), key=lambda item: item[1]["pnl"], reverse=True)[:5]:
-        lvl_lines += f"• <b>{lk}:</b> {lv_d['count']} trades | Wins: {lv_d['wins']} | Net: <b>${lv_d['pnl']:+.2f}</b>\n"
-    if not lvl_lines:
-        lvl_lines = "• No completed level sweeps in sample.\n"
-
-    better_market = "XAUUSD (Gold)" if xau_stats["net_pnl_usd"] >= btc_stats["net_pnl_usd"] else "BTCUSD (Bitcoin)"
-    total_skipped_risk = (xau_res["skipped_risk"] if xau_res else 0) + (btc_res["skipped_risk"] if btc_res else 0)
-    total_skipped_chop = (xau_res["skipped_chop"] if xau_res else 0) + (btc_res["skipped_chop"] if btc_res else 0)
-    days_cov = max(xau_res["days_tested"] if xau_res else 0, btc_res["days_tested"] if btc_res else 0)
-
-    report_html = (
-        f"📊 <b>ALL-IN-ONE BACKTEST & DAY-WISE REPORT</b> 📊\n"
-        f"<i>(Sample: Last ~{days_cov:.0f} Days M5/M15/H1 | $5,000 Account | $12.50 Risk/Trade)</i>\n\n"
-        f"🏆 <b>1. OVERALL PERFORMANCE (AFTER SPREAD & COSTS):</b>\n"
-        f"• <b>Balance:</b> <code>$5,000.00</code> ➔ <b>Final Equity:</b> <b><code>${comb_stats['final_equity']:,.2f}</code></b>\n"
-        f"• <b>Net Profit / Loss:</b> <b><code>${comb_stats['net_pnl_usd']:+.2f}</code></b> (Costs Deducted: <code>${comb_stats['total_costs_usd']:.2f}</code>)\n"
-        f"• <b>Total Setups:</b> <b>{comb_stats['total']}</b> (Wins: <b>{comb_stats['wins']}</b> | BE 0R: <b>{comb_stats['breakevens']}</b> | Losses: <b>{comb_stats['losses']}</b>)\n"
-        f"• <b>Win Rate (Excl. BE):</b> <b>{comb_stats['decisive_wr']:.1f}%</b> | <b>Protected (Win+BE):</b> <b>{comb_stats['non_loss_rate']:.1f}%</b>\n"
-        f"• <b>Profit Factor:</b> <b>{comb_stats['profit_factor']:.2f}</b> | <b>Expectancy:</b> <b>${comb_stats['expectancy_usd']:+.2f}/trade ({comb_stats['avg_r']:+.2f}R)</b>\n"
-        f"• <b>Max Drawdown:</b> <b><code>${comb_stats['max_dd_usd']:.2f} ({comb_stats['max_dd_pct']:.2f}%)</code></b> <i>(Limit: $100 / 2.0%)</i>\n\n"
-        f"📅 <b>2. DAY-WISE PROFITABILITY BREAKDOWN (MON – FRI):</b>\n"
-        f"{day_lines}"
-        f"{best_day_str}\n"
-        f"{worst_day_str}\n\n"
-        f"⚖️ <b>3. MARKET COMPARISON (XAUUSD vs BTCUSD):</b>\n"
-        f"• 🥇 <b>XAUUSD:</b> {xau_stats['total']} trades | WR: <b>{xau_stats['decisive_wr']:.0f}%</b> | PF: <b>{xau_stats['profit_factor']:.2f}</b> | Net: <b>${xau_stats['net_pnl_usd']:+.2f}</b>\n"
-        f"• ₿ <b>BTCUSD:</b> {btc_stats['total']} trades | WR: <b>{btc_stats['decisive_wr']:.0f}%</b> | PF: <b>{btc_stats['profit_factor']:.2f}</b> | Net: <b>${btc_stats['net_pnl_usd']:+.2f}</b>\n"
-        f"• 🗽 <b>NY Window Only:</b> {ny_stats['total']} trades | WR: <b>{ny_stats['decisive_wr']:.0f}%</b> | Net: <b>${ny_stats['net_pnl_usd']:+.2f}</b>\n"
-        f"• 💡 <b>Best Market After Costs:</b> <b>{better_market}</b>\n\n"
-        f"🧲 <b>4. SWEPT LEVEL PERFORMANCE & SAFEGUARDS:</b>\n"
-        f"{lvl_lines}"
-        f"• 🛡️ <b>Skipped (> $12.50 Risk on 0.01 Lot):</b> {total_skipped_risk} | <b>Skipped (1H Choppy):</b> {total_skipped_chop}"
-    )
+        day_lines += f"{icon} <b>{ds['day_name']}:</b> {ds['total']} trades | WR: <b>{ds['wr']:.0f}%</b> | Net: <b><code>${ds['net_pnl']:+.2f}</code></b>\n"
 
     chart_buf = generate_visual_backtest_report_chart(comb_stats, xau_stats, btc_stats, day_breakdown)
-    send_telegram_signal_with_chart("📈 <b>4-Panel Visual Backtest & Day-Wise (Mon–Fri) Profitability Dashboard</b>", chart_buf)
-    send_telegram_message(report_html)
+    send_telegram_signal_with_chart("📈 <b>4-Panel Visual Backtest & Day-Wise Dashboard</b>", chart_buf)
 
-    if all_trades:
-        csv_buf = io.StringIO()
-        field_names = ["Date / Time (IST)", "Day of Week", "Market", "Direction", "1H Bias", "Level Swept", "5M Confirmation", "Entry", "SL", "1:2 TP", "Lot Size", "Planned Risk $", "Spread/Cost $", "Result (R)", "Net PnL $", "Outcome", "NY Session?"]
-        writer = csv.DictWriter(csv_buf, fieldnames=field_names)
-        writer.writeheader()
-        for t in all_trades:
-            writer.writerow({
-                "Date / Time (IST)": t["timestamp"].strftime("%Y-%m-%d %I:%M %p"),
-                "Day of Week": t["day_name"],
-                "Market": t["market"],
-                "Direction": t["direction"],
-                "1H Bias": t["h1_bias"],
-                "Level Swept": t["level_full"],
-                "5M Confirmation": t["mss_confirm"],
-                "Entry": t["entry"],
-                "SL": t["sl"],
-                "1:2 TP": t["tp"],
-                "Lot Size": t["lot"],
-                "Planned Risk $": f"${t['risk_usd']:.2f}",
-                "Spread/Cost $": f"${t['cost_usd']:.2f}",
-                "Result (R)": f"{t['result_r']:+.2f}R",
-                "Net PnL $": f"${t['net_pnl']:+.2f}",
-                "Outcome": t["outcome"],
-                "NY Session?": "YES" if t["in_ny_window"] else "NO"
-            })
-        csv_bytes = csv_buf.getvalue().encode("utf-8")
-        send_telegram_document(
-            csv_bytes,
-            "Backtest_All_Trades_With_Days.csv",
-            caption_html=f"📂 <b>Complete Trade-by-Trade Backtest Sheet ({len(all_trades)} Setups with Day-of-Week)</b>"
-        )
+    msg = (
+        f"📊 <b>SEPARATE MARKET & DAY-WISE SUMMARY</b>\n\n"
+        f"🥇 <b>1. XAUUSD (Gold Only):</b>\n"
+        f"• Trades: <b>{xau_stats['total']}</b> (W:{xau_stats['wins']} | BE:{xau_stats['breakevens']} | L:{xau_stats['losses']})\n"
+        f"• Win Rate: <b>{xau_stats['decisive_wr']:.1f}%</b> | PF: <b>{xau_stats['profit_factor']:.2f}</b> | Net: <b><code>${xau_stats['net_pnl_usd']:+.2f}</code></b>\n\n"
+        f"₿ <b>2. BTCUSD (Bitcoin Only):</b>\n"
+        f"• Trades: <b>{btc_stats['total']}</b> (W:{btc_stats['wins']} | BE:{btc_stats['breakevens']} | L:{btc_stats['losses']})\n"
+        f"• Win Rate: <b>{btc_stats['decisive_wr']:.1f}%</b> | PF: <b>{btc_stats['profit_factor']:.2f}</b> | Net: <b><code>${btc_stats['net_pnl_usd']:+.2f}</code></b>\n\n"
+        f"📅 <b>3. DAY-WISE PROFITABILITY (MON – FRI):</b>\n{day_lines}"
+    )
+    send_telegram_message(msg)
+    send_telegram_document(html_bytes, "Funded_Dashboard_Live.html", caption_html="🌐 <b>Auto-Updated Interactive Website Dashboard</b> — Tap to open directly in your browser!")
 
-# =====================================================================
-# 8. TRADINGVIEW LIVE CHART ENGINE (PDH/PDL, ASIAN/LONDON H/L, ENTRY SPOT)
-# =====================================================================
 def draw_tradingview_arrow(ax, x_pos, y_pos, y_span, is_up=True):
     h = y_span * 0.038
     w = 1.05
@@ -1872,9 +2109,6 @@ def send_telegram_signal_with_chart(caption_html, chart_buf, target_chat_id=CHAT
 
     send_telegram_message(caption_html, target_chat_id)
 
-# =====================================================================
-# 9. TELEGRAM COMMANDS (/backtest, /report, /days, /journal, /gold, /btc)
-# =====================================================================
 def send_instant_preview_chart(pair_key=None):
     global chart_rotation_index
     pair_names_list = list(FOREX_PAIRS.keys())
@@ -1941,7 +2175,8 @@ def send_live_status_summary():
         f"📈 <b>Today's PnL:</b> <b>${day_pnl:+.2f}</b> (Limit: -${DAILY_STOP_LOSS_USD:.2f})\n"
         f"📅 <b>Weekly PnL:</b> <b>${week_pnl:+.2f}</b> (Limit: -${WEEKLY_STOP_LOSS_USD:.2f})\n"
         f"🛡️ <b>Drawdown from Peak:</b> <b>${dd_from_peak:.2f}</b> (Review Stop: ${MAX_DRAWDOWN_REVIEW_USD:.2f})\n"
-        f"🔢 <b>Trades Today:</b> {trades_today}/{MAX_DAILY_TRADES} | <b>Losses Today:</b> {losses_today}/{MAX_DAILY_LOSS_COUNT}\n\n"
+        f"🔢 <b>Trades Today:</b> {trades_today}/{MAX_DAILY_TRADES} | <b>Losses Today:</b> {losses_today}/{MAX_DAILY_LOSS_COUNT}\n"
+        f"📒 <b>Total Logged Bot Trades:</b> {len(journal_memory_log)}\n\n"
     )
     for name, info in FOREX_PAIRS.items():
         try:
@@ -1955,54 +2190,8 @@ def send_live_status_summary():
                 report += f"🔹 <b>{info['mt5_name']}:</b> <code>{format_price(live_spot, info['decimals'])}</code> | 1H: <b>{rm['h1_bias']}</b> ({st_str})\n"
         except Exception:
             pass
-    report += "\n💡 Send <code>/backtest</code>, <code>/report</code>, or <code>/days</code> for full Day-Wise (Mon–Fri) & Stage 6 analytics."
+    report += "\n🌐 Send <code>/web</code> for Instant Dashboard File | <code>/backtest</code> for Full Report | <code>/reset</code> to Reset Account to 0."
     send_telegram_message(report)
-
-def send_trading_journal_summary():
-    if not journal_memory_log:
-        send_telegram_message(
-            "📒 <b>LIVE TRADING JOURNAL (PDF SECTION 5)</b>\n\n"
-            "No live trades completed in this session yet.\n"
-            "👉 To see the complete historical backtest + Day-Wise (Mon–Fri) profitability report right now, send: <code>/backtest</code> or <code>/days</code>"
-        )
-        return
-
-    live_trades = [
-        {"net_pnl": r["numeric_pnl"], "result_r": r["numeric_r"], "cost_usd": r["cost_usd"], "weekday_idx": r.get("weekday_idx", 0)}
-        for r in journal_memory_log
-    ]
-    st  = compute_stage6_metrics(live_trades)
-    dbd = compute_day_wise_breakdown(live_trades)
-
-    d_txt = ""
-    for i in range(5):
-        ds = dbd["days"][i]
-        if ds["total"] > 0:
-            d_txt += f"• <b>{ds['day_name']}:</b> {ds['total']} trades | WR: {ds['wr']:.0f}% | Net: <b>${ds['net_pnl']:+.2f}</b>\n"
-
-    msg = (
-        f"📒 <b>LIVE TRADING JOURNAL & STAGE 6 METRICS</b>\n\n"
-        f"• <b>Total Trades:</b> {st['total']} (Wins: {st['wins']} | BE: {st['breakevens']} | Losses: {st['losses']})\n"
-        f"• <b>Win Rate (Excl. BE):</b> <b>{st['decisive_wr']:.1f}%</b> | <b>Profit Factor:</b> <b>{st['profit_factor']:.2f}</b>\n"
-        f"• <b>Expectancy After Costs:</b> <b>${st['expectancy_usd']:+.2f}/trade ({st['avg_r']:+.2f}R)</b>\n"
-        f"• <b>Net Realized PnL:</b> <b>${st['net_pnl_usd']:+.2f}</b> | <b>Max Drawdown:</b> <b>${st['max_dd_usd']:.2f}</b>\n\n"
-        f"📅 <b>Live Day-Wise Summary:</b>\n{d_txt}\n"
-        f"<b>Recent Journal Entries:</b>\n"
-    )
-    for idx, row in enumerate(journal_memory_log[-5:], 1):
-        msg += (
-            f"<b>#{idx}. {row['Market']} ({row['Day']} · {row['Date / time']})</b>\n"
-            f"• 1H: {row['1H bias']} | Sweep: {row['Level / sweep']} | {row['5M confirmation']}\n"
-            f"• <code>{row['Entry / SL / TP']}</code> | <b>{row['Result (R)']}</b>\n\n"
-        )
-    send_telegram_message(msg)
-
-    if os.path.isfile(JOURNAL_CSV_PATH):
-        try:
-            with open(JOURNAL_CSV_PATH, "rb") as f:
-                send_telegram_document(f.read(), "Live_Trading_Journal.csv", caption_html="📒 <b>Full Live Trading Journal CSV</b>")
-        except Exception:
-            pass
 
 def check_telegram_commands():
     global last_update_id
@@ -2022,8 +2211,16 @@ def check_telegram_commands():
                     continue
                 if msg_text in ["/status", "status", "/start", "start"]:
                     send_live_status_summary()
-                elif msg_text in ["/journal", "journal"]:
-                    send_trading_journal_summary()
+                elif msg_text in ["/web", "web", "/dashboard", "dashboard", "/journal", "journal"]:
+                    html_bytes = sync_live_website_dashboard(refresh_backtest=False, push_to_git=True)
+                    send_telegram_document(
+                        html_bytes,
+                        "Funded_Dashboard_Live.html",
+                        caption_html="🌐 <b>Auto-Synced Live Website Dashboard (Tap to open in Chrome)</b>\nIncludes: Live $5,000 Account (0-Start), Separate XAUUSD & BTCUSD Backtests, Mon–Fri Day Breakdown & Journal!"
+                    )
+                elif msg_text in ["/reset", "reset"]:
+                    reset_live_account_to_zero()
+                    send_telegram_message("✅ <b>Account & Journal Reset to 0 ($5,000.00 Starting Balance).</b> Website dashboard updated automatically.")
                 elif msg_text in ["/backtest", "backtest", "/report", "report", "/days", "days"]:
                     run_and_send_master_backtest_report(None)
                 elif msg_text in ["/backtest gold", "/backtest xauusd", "/report gold"]:
@@ -2041,7 +2238,7 @@ def check_telegram_commands():
         pass
 
 # =====================================================================
-# 10. TRADE EXECUTION, LOCKED PRE-ALERTS & 1:2 MANAGEMENT
+# 11. TRADE EXECUTION, LOCKED PRE-ALERTS & AUTO-SYNC MANAGEMENT
 # =====================================================================
 def dispatch_confirmed_trade_alert(name, info, df_1h, df_15m, df_5m, live_spot, cand, closed_time):
     global trades_today, last_candle_traded, last_setup_traded
@@ -2091,6 +2288,9 @@ def dispatch_confirmed_trade_alert(name, info, df_1h, df_15m, df_5m, live_spot, 
 
     chart_buf = generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=cand)
     send_telegram_signal_with_chart(msg, chart_buf)
+
+    # Auto-sync website dashboard immediately so the Running Trade appears live!
+    sync_live_website_dashboard(refresh_backtest=False, push_to_git=True)
 
 def dispatch_pre_alert_setup(name, info, df_1h, df_15m, df_5m, live_spot, cand, closed_time):
     dec        = info["decimals"]
@@ -2203,6 +2403,7 @@ def manage_open_trades(pair_name, candle_time, live_spot, df_5m, decimals):
                         f"📍 <b>Live Price:</b> <code>{price_str}</code>\n"
                         f"👉 Move Stop-Loss to Entry (<code>{entry_str}</code>) to make this trade 100% risk-free."
                     )
+                    sync_live_website_dashboard(refresh_backtest=False, push_to_git=True)
 
             hit_type = None
             if trade["direction"] == "BUY":
@@ -2226,7 +2427,7 @@ def manage_open_trades(pair_name, candle_time, live_spot, df_5m, decimals):
                 append_to_trading_journal(trade, +2.0, net_win, "WIN")
                 send_telegram_message(
                     f"🎯 <b>1:2 FULL TARGET HIT (+${net_win:.2f} / +2R) — {trade['mt5_name']}</b>\n"
-                    f"📒 Logged in Journal. Send <code>/journal</code> or <code>/report</code> to view full metrics."
+                    f"🌐 Website Dashboard & Journal updated automatically!"
                 )
             elif hit_type == "BREAKEVEN_SL":
                 trade["is_open"] = False
@@ -2238,7 +2439,7 @@ def manage_open_trades(pair_name, candle_time, live_spot, df_5m, decimals):
                 append_to_trading_journal(trade, 0.0, be_cost, "BREAKEVEN")
                 send_telegram_message(
                     f"🛡️ <b>BREAKEVEN EXIT (0R) — {trade['mt5_name']}</b>\n"
-                    f"Capital preserved and logged in <code>/journal</code>."
+                    f"🌐 Capital preserved & synced to Website Dashboard."
                 )
             elif hit_type == "SL":
                 trade["is_open"] = False
@@ -2251,11 +2452,11 @@ def manage_open_trades(pair_name, candle_time, live_spot, df_5m, decimals):
                 append_to_trading_journal(trade, -1.0, -loss_amt, "LOSS")
                 send_telegram_message(
                     f"🛑 <b>INVALIDATION STOP-LOSS HIT (-${loss_amt:.2f} / -1R) — {trade['mt5_name']}</b> (<code>{sl_str}</code>)\n"
-                    f"Losses Today: {losses_today}/{MAX_DAILY_LOSS_COUNT}. Do NOT increase risk on the next trade."
+                    f"Losses Today: {losses_today}/{MAX_DAILY_LOSS_COUNT}. Website Dashboard updated automatically."
                 )
 
 # =====================================================================
-# 11. MASTER SCANNER LOOP
+# 12. MASTER SCANNER LOOP
 # =====================================================================
 def scan_markets():
     global trades_today, losses_today, current_day, current_week
@@ -2275,6 +2476,7 @@ def scan_markets():
         daily_halt_announced = False
         for k in live_bars_memory:
             live_bars_memory[k] = {}
+        sync_live_website_dashboard(refresh_backtest=True, push_to_git=True)
 
     if iso_week != current_week:
         current_week = iso_week
@@ -2345,14 +2547,16 @@ def scan_markets():
             print(f"Error scanning {name}: {e}")
 
 if __name__ == "__main__":
+    load_persistent_account_state()
     fetch_live_economic_calendar()
+    sync_live_website_dashboard(refresh_backtest=True, push_to_git=True)
     _, _, ny_stat, ist_win = get_ny_session_status()
     send_telegram_message(
-        f"📊 <b>$5,000 Two-Step Funded Roadmap Bot + Day-Wise Backtest Active</b>\n"
-        f"• <b>Markets:</b> XAUUSD (Primary) + BTCUSD (Secondary)\n"
-        f"• <b>Setup:</b> 1H Bias ➔ 15M Session/PDH-PDL Sweep ➔ 5M MSS Body Close (1:2 RR)\n"
-        f"• <b>Risk Rules:</b> $12.50/trade (0.25%) | Max 2 trades/day | -$25 Daily / -$75 Weekly Stop\n"
-        f"• <b>Reports:</b> Send <code>/backtest</code>, <code>/report</code>, or <code>/days</code> for full Day-Wise (Mon–Fri) & Stage 6 analytics!"
+        f"📊 <b>$5,000 Two-Step Funded Bot + Auto-Synced Website Active</b>\n"
+        f"• <b>Account Status:</b> ${STARTING_CAPITAL_USD + total_account_pnl:,.2f} ({len(journal_memory_log)} Logged Trades)\n"
+        f"• <b>Markets:</b> XAUUSD (Primary) + BTCUSD (Secondary) — Separate Backtests Built-In\n"
+        f"• <b>Auto-Sync:</b> Every trade, TP, SL & Journal entry updates <code>index.html</code> automatically\n"
+        f"• <b>Commands:</b> <code>/web</code> (Instant Dashboard), <code>/gold</code>, <code>/btc</code>, <code>/backtest</code>, <code>/reset</code>"
     )
 
     start_run      = time.time()
