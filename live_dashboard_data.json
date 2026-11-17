@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-11-17 06:46:11 PM IST",
+  "updated_at": "2026-11-17 08:35:13 PM IST",
   "saved_ist_date": "2026-11-17",
   "saved_iso_week": 47,
   "total_account_pnl": 0.0,
@@ -9,7 +9,7 @@
   "day_pnl": 0.0,
   "week_pnl": 0.0,
   "dd_used": 0.0,
-  "trades_today": 0,
+  "trades_today": 1,
   "losses_today": 0,
   "raw_journal_memory": []
 }
