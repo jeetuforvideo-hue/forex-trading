@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="45">
+<title>$5,000 Funded Bot — Auto Command Center</title>
+<style>
+  body { margin:0; font-family: system-ui, -apple-system, sans-serif; background:#0b0f17; color:#f8fafc; padding:14px; }
+  .wrap { max-width:1200px; margin:0 auto; }
+  .hdr { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; background:#111827; padding:14px 18px; border-radius:12px; border:1px solid #1e293b; margin-bottom:12px; }
+  .hdr h1 { margin:0; font-size:17px; color:#f8fafc; }
+  .badge { background:#064e3b; color:#34d399; padding:5px 10px; border-radius:8px; font-size:11.5px; font-weight:700; }
+  .tabs { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px; }
+  .tab-btn { background:#111827; color:#cbd5e1; border:1px solid #1e293b; padding:10px 15px; border-radius:9px; font-size:13px; font-weight:700; cursor:pointer; }
+  .tab-btn.active { background:#2563eb; color:#ffffff; border-color:#3b82f6; }
+  .tab-pane { display:none; }
+  .tab-pane.active { display:block; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:11px; margin-bottom:14px; }
+  .card { background:#111827; border:1px solid #1e293b; padding:13px; border-radius:10px; }
+  .lbl { font-size:11.5px; color:#94a3b8; margin-bottom:5px; }
+  .val { font-size:20px; font-weight:800; font-family:monospace; }
+  .sub { font-size:11px; color:#64748b; margin-top:4px; }
+  .sec-title { font-size:14.5px; font-weight:700; margin:16px 0 9px; color:#e2e8f0; border-left:4px solid #3b82f6; padding-left:10px; }
+  .run-card { background:#064e3b; border:1px solid #10b981; color:#ecfdf5; padding:12px; border-radius:9px; margin-bottom:8px; font-size:13px; line-height:1.5; }
+  .run-empty { background:#111827; border:1px dashed #334155; color:#94a3b8; padding:13px; border-radius:9px; font-size:13px; }
+  .tbl-wrap { overflow-x:auto; background:#111827; border:1px solid #1e293b; border-radius:10px; }
+  table { width:100%; border-collapse:collapse; font-size:12.2px; }
+  th, td { padding:9px 11px; text-align:left; border-bottom:1px solid #1e293b; }
+  th { background:#1e293b; color:#cbd5e1; font-weight:700; }
+  code { background:#0f172a; padding:2px 5px; border-radius:4px; color:#93c5fd; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hdr">
+    <div>
+      <h1>🛡️ $5,000 Two-Step Funded Account — Auto-Synced Command Center</h1>
+      <div style="font-size:11.5px;color:#94a3b8;margin-top:3px;">Last Bot Sync: <b>2026-11-17 06:01:44 PM IST</b> · Auto-updates on every Telegram Signal, TP & SL</div>
+    </div>
+    <span class="badge">● 100% AUTO-PILOT SYNCED</span>
+  </div>
+
+  <div class="tabs">
+    <button class="tab-btn active" onclick="openTab('tab-live', this)">1. 🛡️ My $5,000 Live Account (0 Trades)</button>
+    <button class="tab-btn" onclick="openTab('tab-xau', this)">2. 🥇 XAUUSD Backtest & Days (Separate)</button>
+    <button class="tab-btn" onclick="openTab('tab-btc', this)">3. ₿ BTCUSD Backtest & Days (Separate)</button>
+    <button class="tab-btn" onclick="openTab('tab-journal', this)">4. 📒 Auto Trading Journal (0)</button>
+  </div>
+
+  <!-- TAB 1: LIVE ACCOUNT -->
+  <div id="tab-live" class="tab-pane active">
+    <div class="grid">
+      <div class="card">
+        <div class="lbl">Live Account Balance / Equity</div>
+        <div class="val" style="color:#10b981">$5,000.00 / $5,000.00</div>
+        <div class="sub">Start: $5,000.00 | Peak: $5,000.00</div>
+      </div>
+      <div class="card">
+        <div class="lbl">Today's PnL (Stop Limit: -$25.00)</div>
+        <div class="val" style="color:#10b981">$+0.00</div>
+        <div class="sub">Trades Today: 0/2 | Losses Today: 0/2</div>
+      </div>
+      <div class="card">
+        <div class="lbl">Weekly PnL (Stop Limit: -$75.00)</div>
+        <div class="val" style="color:#10b981">$+0.00</div>
+        <div class="sub">Max Drawdown Used: $0.00 / $100.00</div>
+      </div>
+      <div class="card">
+        <div class="lbl">Live Bot Trades & Win Rate</div>
+        <div class="val" style="color:#3b82f6">0 Trades (0% WR)</div>
+        <div class="sub">Wins (+2R): 0 | BE (0R): 0 | Loss (-1R): 0</div>
+      </div>
+      <div class="card">
+        <div class="lbl">Live Profit Factor & Expectancy</div>
+        <div class="val" style="color:#f59e0b">PF: 0.00</div>
+        <div class="sub">Expectancy: $+0.00/trade (+0.00R)</div>
+      </div>
+    </div>
+
+    <div class="sec-title">⚡ Active Running Trade (Live from Telegram Bot)</div>
+    <div class='run-empty'>⏸️ अभी कोई लाइव ट्रेड चालू नहीं है — जैसे ही बॉट टेलीग्राम पर नया सिग्नल देगा, वह अपने-आप यहाँ दिखेगा।</div>
+
+    <div class="sec-title">📅 My Live Day-Wise Performance (Monday – Friday)</div>
+    <div class="grid"><div class='card'><div class='lbl'>Monday (Live)</div><div class='val' style='color:#94a3b8'>$+0.00</div><div class='sub'>Trades: 0 (W:0 | BE:0 | L:0) · WR: 0%</div></div><div class='card'><div class='lbl'>Tuesday (Live)</div><div class='val' style='color:#94a3b8'>$+0.00</div><div class='sub'>Trades: 0 (W:0 | BE:0 | L:0) · WR: 0%</div></div><div class='card'><div class='lbl'>Wednesday (Live)</div><div class='val' style='color:#94a3b8'>$+0.00</div><div class='sub'>Trades: 0 (W:0 | BE:0 | L:0) · WR: 0%</div></div><div class='card'><div class='lbl'>Thursday (Live)</div><div class='val' style='color:#94a3b8'>$+0.00</div><div class='sub'>Trades: 0 (W:0 | BE:0 | L:0) · WR: 0%</div></div><div class='card'><div class='lbl'>Friday (Live)</div><div class='val' style='color:#94a3b8'>$+0.00</div><div class='sub'>Trades: 0 (W:0 | BE:0 | L:0) · WR: 0%</div></div></div>
+  </div>
+
+  <!-- TAB 2: SEPARATE XAUUSD BACKTEST -->
+  <div id="tab-xau" class="tab-pane">
+    
+    <div class="grid">
+      <div class="card"><div class="lbl">🥇 XAUUSD (Gold Spot) Net PnL (After Costs)</div><div class="val" style="color:#10b981">$+14.66</div><div class="sub">Final Equity: $5,014.66 | Costs: $8.05</div></div>
+      <div class="card"><div class="lbl">Win Rate & Outcomes</div><div class="val" style="color:#3b82f6">50.0% WR</div><div class="sub">Total: 18 (W:7 | BE:4 | L:7)</div></div>
+      <div class="card"><div class="lbl">Profit Factor & Expectancy</div><div class="val" style="color:#f59e0b">PF: 1.24</div><div class="sub">Expectancy: $+0.81/trade (+0.13R)</div></div>
+      <div class="card"><div class="lbl">Max Drawdown & Skipped</div><div class="val" style="color:#ec4899">$18.49 (0.37%)</div><div class="sub">Skipped (> $12.50 risk): 36 | Choppy: 0</div></div>
+    </div>
+    <div class="sec-title">📅 🥇 XAUUSD (Gold Spot) — Day-Wise Profitability (Monday – Friday)</div>
+    <div class="grid"><div class='card'><div class='lbl'>Monday</div><div class='val' style='color:#10b981'>$+8.34</div><div class='sub'>Trades: 7 (W:3 | BE:2 | L:2) · WR: 60%</div></div><div class='card'><div class='lbl'>Tuesday</div><div class='val' style='color:#ef4444'>$-13.75</div><div class='sub'>Trades: 2 (W:0 | BE:0 | L:2) · WR: 0%</div></div><div class='card'><div class='lbl'>Wednesday</div><div class='val' style='color:#10b981'>$+17.21</div><div class='sub'>Trades: 1 (W:1 | BE:0 | L:0) · WR: 100%</div></div><div class='card'><div class='lbl'>Thursday</div><div class='val' style='color:#ef4444'>$-6.66</div><div class='sub'>Trades: 3 (W:1 | BE:0 | L:2) · WR: 33%</div></div><div class='card'><div class='lbl'>Friday</div><div class='val' style='color:#10b981'>$+4.70</div><div class='sub'>Trades: 2 (W:1 | BE:0 | L:1) · WR: 50%</div></div></div>
+    <div class="sec-title">📋 🥇 XAUUSD (Gold Spot) — Recent Backtest Setups (Last 25)</div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Date / Day</th><th>Market</th><th>1H Bias</th><th>15M Level Swept</th><th>Entry / SL / 1:2 TP</th><th>Lot</th><th>Net Result</th></tr></thead>
+        <tbody><tr><td>#1</td><td>17 Nov 09:10 AM<br><small>Monday</small></td><td><b>XAUUSD (SELL)</b></td><td>BULLISH</td><td>LON H (3873.78)</td><td><code>E:3870.01 | SL:3877.26 | TP:3855.51</code></td><td>0.01</td><td style='color:#3b82f6;font-weight:700;'>+0.0R ($-0.35)</td></tr><tr><td>#2</td><td>17 Nov 05:50 AM<br><small>Monday</small></td><td><b>XAUUSD (SELL)</b></td><td>BULLISH</td><td>ASIA H (3860.76)</td><td><code>E:3854.70 | SL:3862.02 | TP:3840.06</code></td><td>0.01</td><td style='color:#3b82f6;font-weight:700;'>+0.0R ($-0.35)</td></tr><tr><td>#3</td><td>16 Nov 03:00 PM<br><small>Monday</small></td><td><b>XAUUSD (SELL)</b></td><td>BULLISH</td><td>LON H (3863.61)</td><td><code>E:3854.55 | SL:3864.41 | TP:3834.83</code></td><td>0.01</td><td style='color:#ef4444;font-weight:700;'>-1.0R ($-10.21)</td></tr><tr><td>#4</td><td>16 Nov 05:40 AM<br><small>Sunday</small></td><td><b>XAUUSD (SELL)</b></td><td>BULLISH</td><td>PDH/ASIA H (3896.37)</td><td><code>E:3889.82 | SL:3897.57 | TP:3874.32</code></td><td>0.01</td><td style='color:#3b82f6;font-weight:700;'>+0.0R ($-0.35)</td></tr><tr><td>#5</td><td>15 Nov 02:25 PM<br><small>Sunday</small></td><td><b>XAUUSD (BUY)</b></td><td>BEARISH</td><td>LON L (3822.97)</td><td><code>E:3832.74 | SL:3822.38 | TP:3853.46</code></td><td>0.01</td><td style='color:#10b981;font-weight:700;'>+0.6R ($+5.87)</td></tr><tr><td>#6</td><td>15 Nov 01:15 PM<br><small>Sunday</small></td><td><b>XAUUSD (SELL)</b></td><td>BEARISH</td><td>LON H (3835.16)</td><td><code>E:3831.29 | SL:3835.56 | TP:3822.75</code></td><td>0.02</td><td style='color:#3b82f6;font-weight:700;'>+0.0R ($-0.70)</td></tr><tr><td>#7</td><td>14 Nov 08:20 AM<br><small>Friday</small></td><td><b>XAUUSD (BUY)</b></td><td>BEARISH</td><td>ASIA L (3874.39)</td><td><code>E:3879.80 | SL:3873.95 | TP:3891.50</code></td><td>0.02</td><td style='color:#ef4444;font-weight:700;'>-1.0R ($-12.40)</td></tr><tr><td>#8</td><td>14 Nov 06:20 AM<br><small>Friday</small></td><td><b>XAUUSD (SELL)</b></td><td>BEARISH</td><td>ASIA H/1H SH (3892.06)</td><td><code>E:3888.28 | SL:3892.38 | TP:3880.08</code></td><td>0.02</td><td style='color:#10b981;font-weight:700;'>+2.0R ($+17.10)</td></tr><tr><td>#9</td><td>13 Nov 08:50 AM<br><small>Thursday</small></td><td><b>XAUUSD (SELL)</b></td><td>BULLISH</td><td>ASIA H (3926.83)</td><td><code>E:3920.24 | SL:3927.71 | TP:3905.30</code></td><td>0.01</td><td style='color:#10b981;font-weight:700;'>+1.1R ($+8.09)</td></tr><tr><td>#10</td><td>13 Nov 06:00 AM<br><small>Thursday</small></td><td><b>XAUUSD (SELL)</b></td><td>BEARISH</td><td>ASIA H (3898.82)</td><td><code>E:3892.80 | SL:3899.45 | TP:3879.50</code></td><td>0.01</td><td style='color:#ef4444;font-weight:700;'>-1.0R ($-7.00)</td></tr><tr><td>#11</td><td>12 Nov 11:10 AM<br><small>Thursday</small></td><td><b>XAUUSD (BUY)</b></td><td>BEARISH</td><td>ASIA L/1H SL (3974.78)</td><td><code>E:3981.62 | SL:3974.22 | TP:3996.42</code></td><td>0.01</td><td style='color:#ef4444;font-weight:700;'>-1.0R ($-7.75)</td></tr><tr><td>#12</td><td>12 Nov 07:05 AM<br><small>Wednesday</small></td><td><b>XAUUSD (SELL)</b></td><td>BEARISH</td><td>ASIA H (4004.74)</td><td><code>E:3997.20 | SL:4005.63 | TP:3980.34</code></td><td>0.01</td><td style='color:#10b981;font-weight:700;'>+2.0R ($+17.21)</td></tr><tr><td>#13</td><td>11 Nov 07:35 AM<br><small>Tuesday</small></td><td><b>XAUUSD (SELL)</b></td><td>BEARISH</td><td>ASIA H (4054.88)</td><td><code>E:4047.34 | SL:4055.85 | TP:4030.32</code></td><td>0.01</td><td style='color:#ef4444;font-weight:700;'>-0.4R ($-3.84)</td></tr><tr><td>#14</td><td>11 Nov 06:20 AM<br><small>Tuesday</small></td><td><b>XAUUSD (SELL)</b></td><td>BEARISH</td><td>ASIA H (4045.49)</td><td><code>E:4036.53 | SL:4046.09 | TP:4017.41</code></td><td>0.01</td><td style='color:#ef4444;font-weight:700;'>-1.0R ($-9.91)</td></tr><tr><td>#15</td><td>10 Nov 10:10 AM<br><small>Monday</small></td><td><b>XAUUSD (BUY)</b></td><td>BULLISH</td><td>ASIA L (4106.77)</td><td><code>E:4116.33 | SL:4106.23 | TP:4136.53</code></td><td>0.01</td><td style='color:#10b981;font-weight:700;'>+0.4R ($+3.39)</td></tr><tr><td>#16</td><td>10 Nov 08:40 AM<br><small>Monday</small></td><td><b>XAUUSD (BUY)</b></td><td>BULLISH</td><td>ASIA L (4107.50)</td><td><code>E:4110.77 | SL:4106.70 | TP:4118.91</code></td><td>0.02</td><td style='color:#10b981;font-weight:700;'>+1.3R ($+10.04)</td></tr><tr><td>#17</td><td>09 Nov 11:35 PM<br><small>Monday</small></td><td><b>XAUUSD (BUY)</b></td><td>BEARISH</td><td>1H SL (4098.95)</td><td><code>E:4102.73 | SL:4098.48 | TP:4111.23</code></td><td>0.02</td><td style='color:#ef4444;font-weight:700;'>-1.0R ($-9.20)</td></tr><tr><td>#18</td><td>09 Nov 09:55 PM<br><small>Monday</small></td><td><b>XAUUSD (SELL)</b></td><td>BULLISH</td><td>1H SH (4127.36)</td><td><code>E:4116.33 | SL:4128.15 | TP:4092.69</code></td><td>0.01</td><td style='color:#10b981;font-weight:700;'>+1.3R ($+15.02)</td></tr></tbody>
+      </table>
+    </div>
+    
+  </div>
+
+  <!-- TAB 3: SEPARATE BTCUSD BACKTEST -->
+  <div id="tab-btc" class="tab-pane">
+    
+    <div class="grid">
+      <div class="card"><div class="lbl">₿ BTCUSD (Bitcoin) Net PnL (After Costs)</div><div class="val" style="color:#10b981">$+12.35</div><div class="sub">Final Equity: $5,012.35 | Costs: $12.04</div></div>
+      <div class="card"><div class="lbl">Win Rate & Outcomes</div><div class="val" style="color:#3b82f6">46.2% WR</div><div class="sub">Total: 18 (W:6 | BE:5 | L:7)</div></div>
+      <div class="card"><div class="lbl">Profit Factor & Expectancy</div><div class="val" style="color:#f59e0b">PF: 1.19</div><div class="sub">Expectancy: $+0.69/trade (+0.15R)</div></div>
+      <div class="card"><div class="lbl">Max Drawdown & Skipped</div><div class="val" style="color:#ec4899">$20.64 (0.41%)</div><div class="sub">Skipped (> $12.50 risk): 0 | Choppy: 0</div></div>
+    </div>
+    <div class="sec-title">📅 ₿ BTCUSD (Bitcoin) — Day-Wise Profitability (Monday – Friday)</div>
+    <div class="grid"><div class='card'><div class='lbl'>Monday</div><div class='val' style='color:#10b981'>$+1.76</div><div class='sub'>Trades: 6 (W:2 | BE:1 | L:3) · WR: 40%</div></div><div class='card'><div class='lbl'>Tuesday</div><div class='val' style='color:#ef4444'>$-13.35</div><div class='sub'>Trades: 2 (W:0 | BE:1 | L:1) · WR: 0%</div></div><div class='card'><div class='lbl'>Wednesday</div><div class='val' style='color:#ef4444'>$-5.54</div><div class='sub'>Trades: 2 (W:0 | BE:1 | L:1) · WR: 0%</div></div><div class='card'><div class='lbl'>Thursday</div><div class='val' style='color:#10b981'>$+12.06</div><div class='sub'>Trades: 2 (W:1 | BE:0 | L:1) · WR: 50%</div></div><div class='card'><div class='lbl'>Friday</div><div class='val' style='color:#ef4444'>$-10.06</div><div class='sub'>Trades: 2 (W:0 | BE:1 | L:1) · WR: 0%</div></div></div>
+    <div class="sec-title">📋 ₿ BTCUSD (Bitcoin) — Recent Backtest Setups (Last 25)</div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Date / Day</th><th>Market</th><th>1H Bias</th><th>15M Level Swept</th><th>Entry / SL / 1:2 TP</th><th>Lot</th><th>Net Result</th></tr></thead>
+        <tbody><tr><td>#1</td><td>17 Nov 07:10 AM<br><small>Monday</small></td><td><b>BTCUSD (BUY)</b></td><td>BEARISH</td><td>ASIA L (64419.26)</td><td><code>E:64704.04 | SL:64396.63 | TP:65318.86</code></td><td>0.03</td><td style='color:#ef4444;font-weight:700;'>-1.0R ($-10.06)</td></tr><tr><td>#2</td><td>17 Nov 05:35 AM<br><small>Monday</small></td><td><b>BTCUSD (SELL)</b></td><td>BEARISH</td><td>1H EQH (65499.66)</td><td><code>E:64704.69 | SL:65528.04 | TP:63057.99</code></td><td>0.01</td><td style='color:#3b82f6;font-weight:700;'>+0.0R ($-0.28)</td></tr><tr><td>#3</td><td>16 Nov 07:40 AM<br><small>Sunday</small></td><td><b>BTCUSD (BUY)</b></td><td>BEARISH</td><td>ASIA L (64494.84)</td><td><code>E:64936.72 | SL:64453.97 | TP:65902.22</code></td><td>0.02</td><td style='color:#3b82f6;font-weight:700;'>+0.1R ($+0.79)</td></tr><tr><td>#4</td><td>16 Nov 05:45 AM<br><small>Sunday</small></td><td><b>BTCUSD (SELL)</b></td><td>BULLISH</td><td>ASIA H (65356.73)</td><td><code>E:65035.41 | SL:65515.75 | TP:64074.73</code></td><td>0.02</td><td style='color:#10b981;font-weight:700;'>+0.6R ($+4.73)</td></tr><tr><td>#5</td><td>15 Nov 07:30 AM<br><small>Saturday</small></td><td><b>BTCUSD (BUY)</b></td><td>BEARISH</td><td>ASIA L (61970.72)</td><td><code>E:62589.72 | SL:61881.97 | TP:64005.22</code></td><td>0.01</td><td style='color:#10b981;font-weight:700;'>+2.0R ($+14.44)</td></tr><tr><td>#6</td><td>15 Nov 06:00 AM<br><small>Saturday</small></td><td><b>BTCUSD (SELL)</b></td><td>BEARISH</td><td>ASIA H (64538.99)</td><td><code>E:63711.12 | SL:64597.31 | TP:61938.74</code></td><td>0.01</td><td style='color:#10b981;font-weight:700;'>+0.9R ($+7.52)</td></tr><tr><td>#7</td><td>14 Nov 08:20 AM<br><small>Friday</small></td><td><b>BTCUSD (BUY)</b></td><td>BEARISH</td><td>ASIA L (66879.72)</td><td><code>E:67778.73 | SL:66827.41 | TP:69681.37</code></td><td>0.01</td><td style='color:#ef4444;font-weight:700;'>-1.0R ($-9.79)</td></tr><tr><td>#8</td><td>14 Nov 05:30 AM<br><small>Friday</small></td><td><b>BTCUSD (BUY)</b></td><td>BEARISH</td><td>1H SL (68067.72)</td><td><code>E:68278.72 | SL:67797.95 | TP:69240.26</code></td><td>0.02</td><td style='color:#3b82f6;font-weight:700;'>+0.0R ($-0.27)</td></tr><tr><td>#9</td><td>13 Nov 07:00 AM<br><small>Thursday</small></td><td><b>BTCUSD (BUY)</b></td><td>BEARISH</td><td>ASIA L (70652.72)</td><td><code>E:71104.73 | SL:70603.79 | TP:72106.61</code></td><td>0.02</td><td style='color:#ef4444;font-weight:700;'>-1.0R ($-10.58)</td></tr><tr><td>#10</td><td>13 Nov 05:45 AM<br><small>Thursday</small></td><td><b>BTCUSD (SELL)</b></td><td>BEARISH</td><td>ASIA H (71478.73)</td><td><code>E:71264.72 | SL:71533.84 | TP:70726.48</code></td><td>0.04</td><td style='color:#10b981;font-weight:700;'>+2.0R ($+22.64)</td></tr><tr><td>#11</td><td>12 Nov 07:40 AM<br><small>Wednesday</small></td><td><b>BTCUSD (BUY)</b></td><td>BEARISH</td><td>ASIA L (73554.32)</td><td><code>E:73750.73 | SL:73528.24 | TP:74195.71</code></td><td>0.05</td><td style='color:#3b82f6;font-weight:700;'>+0.0R ($-1.40)</td></tr><tr><td>#12</td><td>12 Nov 05:55 AM<br><small>Wednesday</small></td><td><b>BTCUSD (BUY)</b></td><td>BEARISH</td><td>LON L (73500.35)</td><td><code>E:74068.72 | SL:73413.59 | TP:75378.98</code></td><td>0.01</td><td style='color:#ef4444;font-weight:700;'>-0.6R ($-4.14)</td></tr><tr><td>#13</td><td>11 Nov 07:10 AM<br><small>Tuesday</small></td><td><b>BTCUSD (BUY)</b></td><td>BEARISH</td><td>ASIA L (73320.45)</td><td><code>E:73862.72 | SL:73293.12 | TP:75001.92</code></td><td>0.02</td><td style='color:#ef4444;font-weight:700;'>-1.0R ($-11.95)</td></tr><tr><td>#14</td><td>11 Nov 05:40 AM<br><small>Tuesday</small></td><td><b>BTCUSD (SELL)</b></td><td>BEARISH</td><td>ASIA H (73770.73)</td><td><code>E:73688.71 | SL:73848.71 | TP:73368.71</code></td><td>0.05</td><td style='color:#3b82f6;font-weight:700;'>+0.0R ($-1.40)</td></tr><tr><td>#15</td><td>10 Nov 06:55 AM<br><small>Monday</small></td><td><b>BTCUSD (SELL)</b></td><td>BEARISH</td><td>ASIA H (75406.73)</td><td><code>E:75060.73 | SL:75425.48 | TP:74331.23</code></td><td>0.03</td><td style='color:#10b981;font-weight:700;'>+0.6R ($+6.16)</td></tr><tr><td>#16</td><td>10 Nov 05:45 AM<br><small>Monday</small></td><td><b>BTCUSD (SELL)</b></td><td>BULLISH</td><td>ASIA H (75406.73)</td><td><code>E:75264.72 | SL:75424.72 | TP:74944.72</code></td><td>0.05</td><td style='color:#10b981;font-weight:700;'>+2.0R ($+17.40)</td></tr><tr><td>#17</td><td>10 Nov 01:55 AM<br><small>Monday</small></td><td><b>BTCUSD (SELL)</b></td><td>BEARISH</td><td>LON H (75068.50)</td><td><code>E:74783.51 | SL:75239.40 | TP:73871.73</code></td><td>0.02</td><td style='color:#ef4444;font-weight:700;'>-0.5R ($-4.76)</td></tr><tr><td>#18</td><td>09 Nov 09:15 PM<br><small>Monday</small></td><td><b>BTCUSD (BUY)</b></td><td>BULLISH</td><td>1H SL (74320.73)</td><td><code>E:75385.33 | SL:74258.85 | TP:77638.29</code></td><td>0.01</td><td style='color:#ef4444;font-weight:700;'>-0.6R ($-6.70)</td></tr></tbody>
+      </table>
+    </div>
+    
+  </div>
+
+  <!-- TAB 4: AUTO JOURNAL -->
+  <div id="tab-journal" class="tab-pane">
+    <div class="sec-title">📒 Auto-Recorded 9-Column Trading Journal (Every Completed Bot Trade)</div>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr><th>#</th><th>Date / Day</th><th>Market</th><th>1H Bias</th><th>15M Level Swept</th><th>5M Confirm</th><th>Entry / SL / TP</th><th>Risk $</th><th>Result (R & $)</th></tr>
+        </thead>
+        <tbody><tr><td colspan='9' style='text-align:center;color:#94a3b8;padding:22px;'>अभी आपके लाइव अकाउंट में 0 ट्रेड्स हैं ($5,000.00 Start) — जैसे ही बॉट टेलीग्राम पर ट्रेड देगा और वह पूरी होगी, यहाँ अपने-आप जुड़ जाएगी।</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<script>
+function openTab(tabId, btnEl) {
+  document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+  document.getElementById(tabId).classList.add('active');
+  btnEl.classList.add('active');
+}
+</script>
+</body>
+</html>
