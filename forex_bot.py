@@ -4,7 +4,9 @@ import csv
 import sys
 import json
 import time
+import threading
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -41,6 +43,14 @@ HTTP_SESSION.headers.update({
     "Cache-Control": "no-cache, no-store, must-revalidate",
     "Pragma": "no-cache"
 })
+
+TELEGRAM_SESSION = requests.Session()
+TELEGRAM_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0",
+    "Connection": "keep-alive"
+})
+
+DATA_EXECUTOR = ThreadPoolExecutor(max_workers=6)
 
 # =====================================================================
 # 1. PDF ROADMAP CONFIGURATION ($5,000 TWO-STEP FUNDED ACCOUNT)
@@ -112,7 +122,7 @@ FOREX_PAIRS = {
     }
 }
 
-# Runtime State Tracking (Starts cleanly at 0)
+# Runtime State Tracking (100% Zero-Start)
 last_candle_traded      = {name: None for name in FOREX_PAIRS}
 last_pre_alert_candle   = {name: None for name in FOREX_PAIRS}
 last_setup_traded       = {name: None for name in FOREX_PAIRS}
@@ -121,7 +131,6 @@ pair_cooldown_until     = {name: datetime.min.replace(tzinfo=timezone.utc) for n
 pre_alert_cooldown      = {name: datetime.min.replace(tzinfo=timezone.utc) for name in FOREX_PAIRS}
 live_bars_memory        = {name: {} for name in FOREX_PAIRS}
 ohlc_history_cache      = {}
-cached_backtest_bundle  = None
 
 cached_news_events      = []
 last_news_fetch_time    = 0
@@ -168,20 +177,11 @@ def get_ny_weekday_index(ts_utc):
         ny_dt = dt_utc - timedelta(hours=5)
     return ny_dt.weekday()
 
-def is_timestamp_in_ny_session(ts_utc):
-    dt_utc = to_utc_timestamp(ts_utc)
-    try:
-        ny_dt = dt_utc.astimezone(ZoneInfo("America/New_York"))
-    except Exception:
-        ny_dt = dt_utc - timedelta(hours=5)
-    ny_hr = ny_dt.hour + (ny_dt.minute / 60.0)
-    return 9.25 <= ny_hr <= 12.25
-
 current_day  = get_ist_now().date()
 current_week = get_ist_now().isocalendar()[1]
 
 # =====================================================================
-# 2. PERSISTENT MEMORY LOADER (SO BOT RESTARTS NEVER LOSE YOUR TRADES)
+# 2. PERSISTENT MEMORY LOADER (0-START LIVE TRADES ONLY)
 # =====================================================================
 def load_persistent_account_state():
     """Loads saved live trades & PnL from live_dashboard_data.json if available. Starts at 0 if new."""
@@ -209,7 +209,7 @@ def load_persistent_account_state():
         print(f"State Load Info: {e}")
 
 def reset_live_account_to_zero():
-    """Resets live account metrics and journal cleanly back to $5,000.00 and 0 trades."""
+    """Resets live account, website, and /backtest data cleanly back to $5,000.00 and 0 trades."""
     global HIGH_WATER_MARK_USD, total_account_pnl, daily_realized_pnl, weekly_realized_pnl
     global trades_today, losses_today, daily_trades_log, journal_memory_log
     global daily_halt_announced, weekly_halt_announced, dd_halt_announced
@@ -229,7 +229,7 @@ def reset_live_account_to_zero():
             os.remove(JOURNAL_CSV_PATH)
         except Exception:
             pass
-    sync_live_website_dashboard(push_to_git=True)
+    sync_live_website_dashboard_async(push_to_git=True)
 
 # =====================================================================
 # 3. NEW YORK SESSION & ECONOMIC CALENDAR ENGINE (PDF SECTION 3)
@@ -271,7 +271,7 @@ def fetch_live_economic_calendar():
         return cached_news_events
     url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
     try:
-        res = HTTP_SESSION.get(url, timeout=6)
+        res = HTTP_SESSION.get(url, timeout=4)
         if res.status_code == 200:
             data = res.json()
             high_events = []
@@ -420,10 +420,12 @@ def append_to_trading_journal(trade_record, result_r_val, net_pnl_usd, result_la
         "Date / time": get_ist_now().strftime("%Y-%m-%d %I:%M %p IST"),
         "Day": wd_nam,
         "Market": trade_record["mt5_name"],
+        "Direction": trade_record.get("direction", "BUY"),
         "1H bias": trade_record.get("h1_bias", "N/A"),
         "Level / sweep": trade_record.get("swept_level_name", "Key Level Sweep"),
         "5M confirmation": trade_record.get("mss_confirmation", "5M MSS + Close"),
         "Entry / SL / TP": f"E:{trade_record['entry']} | SL:{trade_record['sl']} | TP:{trade_record['target']}",
+        "Lot": trade_record.get("lot_size", 0.01),
         "Risk $": f"${trade_record['max_risk']:.2f}",
         "Result (R)": f"{result_r_val:+.2f}R (${net_pnl_usd:+.2f}) [{result_label}]",
         "Rule followed?": "YES",
@@ -444,12 +446,23 @@ def append_to_trading_journal(trade_record, result_r_val, net_pnl_usd, result_la
     except Exception as e:
         print(f"Journal Write Warning: {e}")
 
-    # Auto-sync live website dashboard immediately when a trade finishes!
-    sync_live_website_dashboard(push_to_git=True)
+    sync_live_website_dashboard_async(push_to_git=True)
 
 # =====================================================================
-# 5. ZERO-DELAY 1H + 15M + 5M DATA ENGINE (LIVE + DEEP BACKTEST FETCH)
+# 5. ULTRA-FAST PARALLEL DATA & TELEGRAM PHOTO ENGINE (ZERO DELAY)
 # =====================================================================
+def send_telegram_chat_action(action="upload_photo", target_chat_id=CHAT_ID):
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
+        return
+    try:
+        TELEGRAM_SESSION.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendChatAction",
+            json={"chat_id": target_chat_id, "action": action},
+            timeout=2.0
+        )
+    except Exception:
+        pass
+
 def send_telegram_message(message, target_chat_id=CHAT_ID):
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
         print(f"\n[TELEGRAM]:\n{message}\n")
@@ -458,7 +471,7 @@ def send_telegram_message(message, target_chat_id=CHAT_ID):
     payload = {"chat_id": target_chat_id, "text": message, "parse_mode": "HTML"}
     for attempt in range(2):
         try:
-            r = HTTP_SESSION.post(url, json=payload, timeout=8) if attempt == 0 else requests.post(url, json=payload, timeout=10)
+            r = TELEGRAM_SESSION.post(url, json=payload, timeout=6) if attempt == 0 else requests.post(url, json=payload, timeout=8)
             if r.status_code == 200:
                 return
         except Exception as e:
@@ -473,7 +486,7 @@ def send_telegram_document(file_bytes, filename, caption_html="", target_chat_id
         try:
             files = {"document": (filename, file_bytes, mime_type)}
             data  = {"chat_id": target_chat_id, "caption": caption_html[:950], "parse_mode": "HTML"}
-            r = HTTP_SESSION.post(url, data=data, files=files, timeout=15) if attempt == 0 else requests.post(url, data=data, files=files, timeout=18)
+            r = TELEGRAM_SESSION.post(url, data=data, files=files, timeout=10) if attempt == 0 else requests.post(url, data=data, files=files, timeout=12)
             if r.status_code == 200:
                 return
         except Exception as e:
@@ -492,7 +505,7 @@ def fetch_tradingview_live_candle_and_spot(tv_tickers, screener="cfd"):
     cols = ["close", "open|5", "high|5", "low|5", "close|5"]
     payload = {"symbols": {"tickers": tv_tickers, "query": {"types": []}}, "columns": cols}
     try:
-        res = HTTP_SESSION.post(url, json=payload, timeout=3.5)
+        res = HTTP_SESSION.post(url, json=payload, timeout=2.5)
         if res.status_code == 200:
             data = res.json().get("data", [])
             for item in data:
@@ -511,14 +524,14 @@ def fetch_tradingview_live_candle_and_spot(tv_tickers, screener="cfd"):
         pass
     return None
 
-def fetch_binance_vision_ohlc(binance_symbol, interval_str="5m", limit=240):
+def fetch_binance_vision_ohlc(binance_symbol, interval_str="5m", limit=220):
     if not binance_symbol:
         return None
     for base_url in ["https://data-api.binance.vision/api/v3/klines", "https://api.binance.com/api/v3/klines"]:
         params = {"symbol": binance_symbol, "interval": interval_str, "limit": limit}
         try:
-            r = HTTP_SESSION.get(base_url, params=params, timeout=5.5).json()
-            if isinstance(r, list) and len(r) >= 50:
+            r = HTTP_SESSION.get(base_url, params=params, timeout=3.5).json()
+            if isinstance(r, list) and len(r) >= 40:
                 df = pd.DataFrame(r, columns=["open_time", "Open", "High", "Low", "Close", "Volume", "close_time", "q_vol", "trades", "tb_base", "tb_quote", "ignore"])
                 df["Date"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
                 df.set_index("Date", inplace=True)
@@ -528,47 +541,6 @@ def fetch_binance_vision_ohlc(binance_symbol, interval_str="5m", limit=240):
         except Exception:
             pass
     return None
-
-def fetch_binance_paginated_5m_history(binance_symbol, total_bars=2500):
-    if not binance_symbol:
-        return None
-    chunks = []
-    end_time_ms = None
-    bars_needed = total_bars
-
-    for _ in range(max(1, (total_bars + 999) // 1000)):
-        batch_limit = min(1000, bars_needed)
-        fetched = None
-        for base_url in ["https://data-api.binance.vision/api/v3/klines", "https://api.binance.com/api/v3/klines"]:
-            params = {"symbol": binance_symbol, "interval": "5m", "limit": batch_limit}
-            if end_time_ms is not None:
-                params["endTime"] = end_time_ms
-            try:
-                r = HTTP_SESSION.get(base_url, params=params, timeout=6.0).json()
-                if isinstance(r, list) and len(r) > 0:
-                    fetched = r
-                    break
-            except Exception:
-                pass
-        if not fetched:
-            break
-        df_chunk = pd.DataFrame(fetched, columns=["open_time", "Open", "High", "Low", "Close", "Volume", "close_time", "q_vol", "trades", "tb_base", "tb_quote", "ignore"])
-        df_chunk["Date"] = pd.to_datetime(df_chunk["open_time"], unit="ms", utc=True)
-        df_chunk.set_index("Date", inplace=True)
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            df_chunk[col] = df_chunk[col].astype(float)
-        chunks.append(df_chunk[["Open", "High", "Low", "Close", "Volume"]])
-        earliest_open_ms = int(fetched[0][0])
-        end_time_ms = earliest_open_ms - 1
-        bars_needed -= len(fetched)
-        if len(fetched) < batch_limit or bars_needed <= 0:
-            break
-
-    if not chunks:
-        return None
-    full_df = pd.concat(chunks).sort_index()
-    full_df = full_df[~full_df.index.duplicated(keep="last")]
-    return sanitize_ohlc_dataframe(full_df, min_bars=100)
 
 def sanitize_ohlc_dataframe(df, min_bars=40):
     if df is None or df.empty:
@@ -595,7 +567,7 @@ def sanitize_ohlc_dataframe(df, min_bars=40):
         df["Volume"] = 1.0
     return df[["Open", "High", "Low", "Close", "Volume"]]
 
-def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=False):
+def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=True):
     now_ts     = time.time()
     now_utc    = get_utc_now()
     bucket_min = (now_utc.minute // 5) * 5
@@ -603,19 +575,28 @@ def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=False):
     hour_ts    = now_utc.replace(minute=0, second=0, microsecond=0)
 
     raw_df_1h, raw_df_15m, raw_df_5m = None, None, None
+    tv_future = DATA_EXECUTOR.submit(
+        fetch_tradingview_live_candle_and_spot,
+        info.get("tv_tickers", []),
+        info.get("tv_screener", "cfd")
+    )
 
     if use_fast_cache and pair_name in ohlc_history_cache:
         cached = ohlc_history_cache[pair_name]
-        if (now_ts - cached["ts"]) <= 60.0 and cached.get("bucket_ts") == bucket_ts:
+        if (now_ts - cached["ts"]) <= 50.0 and cached.get("bucket_ts") == bucket_ts:
             raw_df_1h  = cached["raw_df_1h"].copy()
             raw_df_15m = cached["raw_df_15m"].copy()
             raw_df_5m  = cached["raw_df_5m"].copy()
 
     if raw_df_1h is None or raw_df_15m is None or raw_df_5m is None:
         if info.get("binance_symbol"):
-            raw_df_1h  = fetch_binance_vision_ohlc(info["binance_symbol"], "1h", 160)
-            raw_df_15m = fetch_binance_vision_ohlc(info["binance_symbol"], "15m", 220)
-            raw_df_5m  = fetch_binance_vision_ohlc(info["binance_symbol"], "5m", 180)
+            sym = info["binance_symbol"]
+            f_1h  = DATA_EXECUTOR.submit(fetch_binance_vision_ohlc, sym, "1h", 140)
+            f_15m = DATA_EXECUTOR.submit(fetch_binance_vision_ohlc, sym, "15m", 180)
+            f_5m  = DATA_EXECUTOR.submit(fetch_binance_vision_ohlc, sym, "5m", 160)
+            raw_df_1h  = f_1h.result()
+            raw_df_15m = f_15m.result()
+            raw_df_5m  = f_5m.result()
 
         if raw_df_1h is None or raw_df_15m is None or raw_df_5m is None:
             for yf_sym in info.get("yf_symbols", []):
@@ -647,11 +628,10 @@ def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=False):
             "raw_df_5m": raw_df_5m.copy()
         }
 
-    df_1h  = raw_df_1h.copy()
-    df_15m = raw_df_15m.copy()
-    df_5m  = raw_df_5m.copy()
-
-    tv_data = fetch_tradingview_live_candle_and_spot(info.get("tv_tickers", []), info.get("tv_screener", "cfd"))
+    df_1h   = raw_df_1h.copy()
+    df_15m  = raw_df_15m.copy()
+    df_5m   = raw_df_5m.copy()
+    tv_data = tv_future.result()
 
     if tv_data is not None and tv_data["spot"] > 0:
         tv_spot = tv_data["spot"]
@@ -697,7 +677,7 @@ def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=False):
     return df_1h, df_15m, df_5m, live_spot_price
 
 # =====================================================================
-# 6. PRE-SESSION KEY LEVELS & 1H CONTEXT ENGINE (PDF SECTION 1)
+# 6. PRE-SESSION KEY LEVELS & 1H CONTEXT ENGINE (VECTORIZED & FAST)
 # =====================================================================
 def enrich_price_action_metrics(df):
     df = df.copy()
@@ -714,22 +694,26 @@ def enrich_price_action_metrics(df):
     df["Upper_Wick"] = df["High"] - df[["Open", "Close"]].max(axis=1)
     df["Lower_Wick"] = df[["Open", "Close"]].min(axis=1) - df["Low"]
     df["Close_Pos"]  = (df["Close"] - df["Low"]) / df["Range"]
+    if isinstance(df.index, pd.DatetimeIndex):
+        utc_idx = df.index.tz_convert("UTC") if df.index.tz is not None else df.index.tz_localize("UTC")
+        df["utc_date"] = utc_idx.date
+        df["utc_hour"] = utc_idx.hour + (utc_idx.minute / 60.0)
     return df
 
 def extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, decimals):
-    closed_1h = df_1h.iloc[:-1].copy() if len(df_1h) > 25 else df_1h.copy()
+    closed_1h = df_1h.iloc[:-1] if len(df_1h) > 25 else df_1h
     atr_1h    = float(closed_1h.iloc[-1]["ATR"])
     if np.isnan(atr_1h) or atr_1h <= 0:
         atr_1h = float((closed_1h["High"] - closed_1h["Low"]).mean())
 
-    ref_ts    = to_utc_timestamp(df_15m.index[-1])
-    today_utc = ref_ts.date()
+    df_15m_utc = df_15m.iloc[-140:]
+    if "utc_date" not in df_15m_utc.columns or "utc_hour" not in df_15m_utc.columns:
+        df_15m_utc = df_15m_utc.copy()
+        df_15m_utc["utc_date"] = [to_utc_timestamp(ts).date() for ts in df_15m_utc.index]
+        df_15m_utc["utc_hour"] = [to_utc_timestamp(ts).hour + to_utc_timestamp(ts).minute / 60.0 for ts in df_15m_utc.index]
 
-    df_15m_utc = df_15m.iloc[-140:].copy()
-    df_15m_utc["utc_date"] = [to_utc_timestamp(ts).date() for ts in df_15m_utc.index]
-    df_15m_utc["utc_hour"] = [to_utc_timestamp(ts).hour + to_utc_timestamp(ts).minute / 60.0 for ts in df_15m_utc.index]
-
-    unique_dates = sorted(df_15m_utc["utc_date"].unique())
+    today_utc    = df_15m_utc["utc_date"].iloc[-1]
+    unique_dates = sorted(pd.unique(df_15m_utc["utc_date"]))
     prev_dates   = [d for d in unique_dates if d < today_utc]
     prev_day     = prev_dates[-1] if prev_dates else unique_dates[0]
 
@@ -870,6 +854,19 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
         if get_utc_now() < pair_cooldown_until.get(pair_name, datetime.min.replace(tzinfo=timezone.utc)):
             return (None, "COOLDOWN") if return_skip_reason else None
 
+    m5_c0   = df_5m.iloc[-2]
+    atr_5m  = float(m5_c0["ATR"])
+    body_r  = float(m5_c0["Body_Ratio"])
+    close_p = float(m5_c0["Close_Pos"])
+    rng_5   = float(m5_c0["Range"])
+
+    if np.isnan(atr_5m) or atr_5m <= 0:
+        return (None, "INVALID_ATR") if return_skip_reason else None
+    if body_r < 0.40:
+        return (None, "WEAK_BODY") if return_skip_reason else None
+    if rng_5 > (atr_5m * 1.85):
+        return (None, "EXTENDED_CLIMAX_CANDLE") if return_skip_reason else None
+
     dec     = info["decimals"]
     roadmap = extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, dec)
     h1_bias = roadmap["h1_bias"]
@@ -881,25 +878,12 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
     m15_recent = df_15m.iloc[-6:-1] if len(df_15m) >= 7 else df_15m.iloc[-5:]
     m15_c0     = df_15m.iloc[-2] if len(df_15m) >= 2 else df_15m.iloc[-1]
 
-    m5_c0 = df_5m.iloc[-2]
     m5_c1 = df_5m.iloc[-3]
     m5_c2 = df_5m.iloc[-4]
     m5_c3 = df_5m.iloc[-5]
 
     p_close = float(m5_c0["Close"])
     p_open  = float(m5_c0["Open"])
-    p_high  = float(m5_c0["High"])
-    p_low   = float(m5_c0["Low"])
-    atr_5m  = float(m5_c0["ATR"])
-    body_r  = float(m5_c0["Body_Ratio"])
-    close_p = float(m5_c0["Close_Pos"])
-    rng_5   = float(m5_c0["Range"])
-
-    if np.isnan(atr_5m) or atr_5m <= 0:
-        return (None, "INVALID_ATR") if return_skip_reason else None
-
-    if rng_5 > (atr_5m * 1.85):
-        return (None, "EXTENDED_CLIMAX_CANDLE") if return_skip_reason else None
 
     candidates = []
     skipped_for_risk = False
@@ -1092,199 +1076,8 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
     return (None, "LOCKED") if return_skip_reason else None
 
 # =====================================================================
-# 8. BACKTEST & DAY-WISE (MON–FRI) ANALYTICS ENGINE
+# 8. ZERO-START LIVE PERFORMANCE & DAY-WISE (MON–FRI) ENGINE
 # =====================================================================
-def simulate_single_pair_backtest(pair_name, info, ny_session_only=False):
-    df_5m = fetch_binance_paginated_5m_history(info.get("binance_symbol"), total_bars=2500)
-    if df_5m is None or len(df_5m) < 250:
-        for yf_sym in info.get("yf_symbols", []):
-            try:
-                tkr  = yf.Ticker(yf_sym)
-                r_5m = tkr.history(period="30d", interval="5m", auto_adjust=False)
-                c_5m = sanitize_ohlc_dataframe(r_5m, min_bars=250)
-                if c_5m is not None:
-                    df_5m = c_5m
-                    break
-            except Exception:
-                continue
-
-    if df_5m is None or len(df_5m) < 250:
-        return None
-
-    tv_data = fetch_tradingview_live_candle_and_spot(info.get("tv_tickers", []), info.get("tv_screener", "cfd"))
-    if tv_data is not None and tv_data["spot"] > 0:
-        shift = tv_data["spot"] - float(df_5m.iloc[-1]["Close"])
-        if abs(shift) <= (tv_data["spot"] * 0.05):
-            for col in ["Open", "High", "Low", "Close"]:
-                df_5m[col] = df_5m[col] + shift
-
-    df_15m = df_5m.resample("15min").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
-    df_1h  = df_5m.resample("1h").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
-
-    df_5m  = enrich_price_action_metrics(df_5m)
-    df_15m = enrich_price_action_metrics(df_15m)
-    df_1h  = enrich_price_action_metrics(df_1h)
-
-    dec          = info["decimals"]
-    trades_list  = []
-    skipped_risk = 0
-    skipped_chop = 0
-
-    idx_5m  = 180
-    n_5m    = len(df_5m)
-    day_trades_map = {}
-    day_losses_map = {}
-
-    while idx_5m < (n_5m - 20):
-        curr_ts  = df_5m.index[idx_5m]
-        curr_day = to_utc_timestamp(curr_ts).date()
-
-        if ny_session_only and not is_timestamp_in_ny_session(curr_ts):
-            idx_5m += 1
-            continue
-
-        if day_trades_map.get(curr_day, 0) >= MAX_DAILY_TRADES or day_losses_map.get(curr_day, 0) >= MAX_DAILY_LOSS_COUNT:
-            idx_5m += 1
-            continue
-
-        sub_5m  = df_5m.iloc[max(0, idx_5m - 90) : idx_5m + 1]
-        sub_15m = df_15m[df_15m.index <= curr_ts].iloc[-90:]
-        sub_1h  = df_1h[df_1h.index <= curr_ts].iloc[-60:]
-
-        if len(sub_15m) < 25 or len(sub_1h) < 20:
-            idx_5m += 1
-            continue
-
-        spot_now = float(sub_5m.iloc[-1]["Close"])
-        cand, reason = evaluate_roadmap_sweep_mss_setup(
-            pair_name, info, sub_1h, sub_15m, sub_5m, spot_now,
-            ignore_locks=True, return_skip_reason=True
-        )
-
-        if reason == "SKIPPED_SL_EXCEEDS_12_50_RISK":
-            skipped_risk += 1
-            idx_5m += 3
-            continue
-
-        if cand is None or cand["stage"] != "CONFIRMED_BREAKOUT":
-            idx_5m += 1
-            continue
-
-        if cand["h1_bias"] == "RANGING":
-            skipped_chop += 1
-            idx_5m += 3
-            continue
-
-        direction  = cand["direction"]
-        entry_p    = cand["entry_spot"]
-        sl_p       = cand["sl_price"]
-        tp1_p      = cand["tp1_price"]
-        tp2_p      = cand["tp2_price"]
-        risk_usd   = cand["planned_risk_usd"]
-        cost_usd   = cand["cost_usd"]
-        reward_usd = round((risk_usd * PRIMARY_RR_TARGET) - cost_usd, 2)
-
-        trailed_be  = False
-        outcome_lbl = "TIME_EXIT"
-        net_r       = 0.0
-        net_pnl     = -cost_usd
-        exit_ts     = df_5m.index[min(idx_5m + 18, n_5m - 1)]
-
-        for f_idx in range(idx_5m + 1, min(idx_5m + 19, n_5m)):
-            f_bar   = df_5m.iloc[f_idx]
-            f_hi    = float(f_bar["High"])
-            f_lo    = float(f_bar["Low"])
-            exit_ts = df_5m.index[f_idx]
-
-            if direction == "BUY":
-                if f_lo <= sl_p:
-                    if trailed_be:
-                        outcome_lbl = "BREAKEVEN (0R)"
-                        net_r       = 0.0
-                        net_pnl     = -cost_usd
-                    else:
-                        outcome_lbl = "LOSS (-1R)"
-                        net_r       = -1.0
-                        net_pnl     = -risk_usd
-                    idx_5m = f_idx + 3
-                    break
-                if f_hi >= tp2_p:
-                    outcome_lbl = "WIN (+2R)"
-                    net_r       = +2.0
-                    net_pnl     = reward_usd
-                    idx_5m = f_idx + 3
-                    break
-                if not trailed_be and f_hi >= tp1_p:
-                    trailed_be = True
-                    sl_p       = entry_p
-            else:
-                if f_hi >= sl_p:
-                    if trailed_be:
-                        outcome_lbl = "BREAKEVEN (0R)"
-                        net_r       = 0.0
-                        net_pnl     = -cost_usd
-                    else:
-                        outcome_lbl = "LOSS (-1R)"
-                        net_r       = -1.0
-                        net_pnl     = -risk_usd
-                    idx_5m = f_idx + 3
-                    break
-                if f_lo <= tp2_p:
-                    outcome_lbl = "WIN (+2R)"
-                    net_r       = +2.0
-                    net_pnl     = reward_usd
-                    idx_5m = f_idx + 3
-                    break
-                if not trailed_be and f_lo <= tp1_p:
-                    trailed_be = True
-                    sl_p       = entry_p
-        else:
-            last_c      = float(df_5m.iloc[min(idx_5m + 18, n_5m - 1)]["Close"])
-            raw_r       = (last_c - entry_p) / cand["sl_dist"] if direction == "BUY" else (entry_p - last_c) / cand["sl_dist"]
-            net_r       = round(max(-1.0, min(2.0, raw_r)), 2)
-            net_pnl     = round((net_r * (risk_usd - cost_usd)) - cost_usd, 2)
-            outcome_lbl = f"TIME_EXIT ({net_r:+.1f}R)"
-            idx_5m += 18
-
-        day_trades_map[curr_day] = day_trades_map.get(curr_day, 0) + 1
-        if net_r < -0.5:
-            day_losses_map[curr_day] = day_losses_map.get(curr_day, 0) + 1
-
-        wd_idx = get_ny_weekday_index(curr_ts)
-
-        trades_list.append({
-            "timestamp": to_utc_timestamp(curr_ts) + timedelta(hours=5, minutes=30),
-            "exit_timestamp": to_utc_timestamp(exit_ts) + timedelta(hours=5, minutes=30),
-            "weekday_idx": wd_idx,
-            "day_name": WEEKDAY_NAMES[wd_idx],
-            "day_short": WEEKDAY_SHORT[wd_idx],
-            "market": info["mt5_name"],
-            "direction": direction,
-            "h1_bias": cand["h1_bias"],
-            "level_swept": cand["swept_level_short"],
-            "level_full": cand["swept_level_name"],
-            "mss_confirm": cand["mss_confirmation"],
-            "entry": format_price(entry_p, dec),
-            "sl": format_price(cand["sl_price"], dec),
-            "tp": format_price(tp2_p, dec),
-            "lot": cand["lot_size"],
-            "risk_usd": risk_usd,
-            "cost_usd": cost_usd,
-            "result_r": net_r,
-            "net_pnl": round(net_pnl, 2),
-            "outcome": outcome_lbl,
-            "in_ny_window": is_timestamp_in_ny_session(curr_ts)
-        })
-
-    return {
-        "market": info["mt5_name"],
-        "bars_tested": n_5m,
-        "days_tested": round(n_5m / 288.0, 1),
-        "trades": trades_list,
-        "skipped_risk": skipped_risk,
-        "skipped_chop": skipped_chop
-    }
-
 def compute_stage6_metrics(trades_list):
     total = len(trades_list)
     if total == 0:
@@ -1396,72 +1189,9 @@ def compute_day_wise_breakdown(trades_list):
     }
 
 # =====================================================================
-# 9. 100% AUTO-SYNC MULTI-TAB WEBSITE DASHBOARD ENGINE (index.html)
+# 9. LIVE-ONLY WEBSITE DASHBOARD ENGINE (0-START)
 # =====================================================================
-def build_pair_backtest_html_section(title_label, res_obj):
-    if not res_obj or not res_obj.get("trades"):
-        return f"<div class='card'><div class='lbl'>{title_label}</div><div class='sub'>No historical setups in current window.</div></div>"
-
-    t_list = res_obj["trades"]
-    st     = compute_stage6_metrics(t_list)
-    dbd    = compute_day_wise_breakdown(t_list)
-
-    day_boxes = ""
-    for d_i in range(5):
-        ds = dbd["days"][d_i]
-        dc = "#10b981" if ds["net_pnl"] > 0 else ("#ef4444" if ds["net_pnl"] < 0 else "#94a3b8")
-        day_boxes += (
-            f"<div class='card'><div class='lbl'>{ds['day_name']}</div>"
-            f"<div class='val' style='color:{dc}'>${ds['net_pnl']:+.2f}</div>"
-            f"<div class='sub'>Trades: {ds['total']} (W:{ds['wins']} | BE:{ds['breakevens']} | L:{ds['losses']}) · WR: {ds['wr']:.0f}%</div></div>"
-        )
-
-    rows_html = ""
-    for idx, t in enumerate(reversed(t_list[-25:]), 1):
-        rc = "#10b981" if t["net_pnl"] > 1.0 else ("#ef4444" if t["net_pnl"] < -2.0 else "#3b82f6")
-        rows_html += (
-            f"<tr><td>#{idx}</td><td>{t['timestamp'].strftime('%d %b %I:%M %p')}<br><small>{t['day_name']}</small></td>"
-            f"<td><b>{t['market']} ({t['direction']})</b></td><td>{t['h1_bias']}</td><td>{t['level_full']}</td>"
-            f"<td><code>E:{t['entry']} | SL:{t['sl']} | TP:{t['tp']}</code></td><td>{t['lot']}</td>"
-            f"<td style='color:{rc};font-weight:700;'>{t['result_r']:+.1f}R (${t['net_pnl']:+.2f})</td></tr>"
-        )
-
-    return f"""
-    <div class="grid">
-      <div class="card"><div class="lbl">{title_label} Net PnL (After Costs)</div><div class="val" style="color:{'#10b981' if st['net_pnl_usd']>=0 else '#ef4444'}">${st['net_pnl_usd']:+.2f}</div><div class="sub">Final Equity: ${st['final_equity']:,.2f} | Costs: ${st['total_costs_usd']:.2f}</div></div>
-      <div class="card"><div class="lbl">Win Rate & Outcomes</div><div class="val" style="color:#3b82f6">{st['decisive_wr']:.1f}% WR</div><div class="sub">Total: {st['total']} (W:{st['wins']} | BE:{st['breakevens']} | L:{st['losses']})</div></div>
-      <div class="card"><div class="lbl">Profit Factor & Expectancy</div><div class="val" style="color:#f59e0b">PF: {st['profit_factor']:.2f}</div><div class="sub">Expectancy: ${st['expectancy_usd']:+.2f}/trade ({st['avg_r']:+.2f}R)</div></div>
-      <div class="card"><div class="lbl">Max Drawdown & Skipped</div><div class="val" style="color:#ec4899">${st['max_dd_usd']:.2f} ({st['max_dd_pct']:.2f}%)</div><div class="sub">Skipped (> $12.50 risk): {res_obj['skipped_risk']} | Choppy: {res_obj['skipped_chop']}</div></div>
-    </div>
-    <div class="sec-title">📅 {title_label} — Day-Wise Profitability (Monday – Friday)</div>
-    <div class="grid">{day_boxes}</div>
-    <div class="sec-title">📋 {title_label} — Recent Backtest Setups (Last 25)</div>
-    <div class="tbl-wrap">
-      <table>
-        <thead><tr><th>#</th><th>Date / Day</th><th>Market</th><th>1H Bias</th><th>15M Level Swept</th><th>Entry / SL / 1:2 TP</th><th>Lot</th><th>Net Result</th></tr></thead>
-        <tbody>{rows_html}</tbody>
-      </table>
-    </div>
-    """
-
-def sync_live_website_dashboard(refresh_backtest=False, push_to_git=True):
-    """
-    Automatically builds the complete 4-Tab Website Dashboard (index.html) and pushes it to GitHub:
-    - Tab 1: My $5,000 Live Account (Starts at 0 trades, auto-updates on every Telegram Bot signal/outcome)
-    - Tab 2: XAUUSD (Gold) Separate Backtest + Mon-Fri Day-Wise Report
-    - Tab 3: BTCUSD (Bitcoin) Separate Backtest + Mon-Fri Day-Wise Report
-    - Tab 4: Auto-Recorded 9-Column Trading Journal
-    """
-    global cached_backtest_bundle
-    if refresh_backtest or cached_backtest_bundle is None:
-        try:
-            xau_bt = simulate_single_pair_backtest("XAU/USD", FOREX_PAIRS["XAU/USD"], ny_session_only=False)
-            btc_bt = simulate_single_pair_backtest("BTC/USD", FOREX_PAIRS["BTC/USD"], ny_session_only=False)
-            cached_backtest_bundle = {"xau": xau_bt, "btc": btc_bt}
-        except Exception as e:
-            print(f"Backtest Cache Info: {e}")
-            cached_backtest_bundle = {"xau": None, "btc": None}
-
+def sync_live_website_dashboard(push_to_git=True):
     bal, eq, day_pnl, week_pnl = get_live_account_metrics()
     dd_used = max(STARTING_CAPITAL_USD, HIGH_WATER_MARK_USD) - min(bal, eq)
 
@@ -1537,27 +1267,19 @@ def sync_live_website_dashboard(refresh_backtest=False, push_to_git=True):
     if not journal_rows_html:
         journal_rows_html = "<tr><td colspan='9' style='text-align:center;color:#94a3b8;padding:22px;'>अभी आपके लाइव अकाउंट में 0 ट्रेड्स हैं ($5,000.00 Start) — जैसे ही बॉट टेलीग्राम पर ट्रेड देगा और वह पूरी होगी, यहाँ अपने-आप जुड़ जाएगी।</td></tr>"
 
-    xau_tab_html = build_pair_backtest_html_section("🥇 XAUUSD (Gold Spot)", cached_backtest_bundle.get("xau"))
-    btc_tab_html = build_pair_backtest_html_section("₿ BTCUSD (Bitcoin)", cached_backtest_bundle.get("btc"))
-
     html_content = f"""<!DOCTYPE html>
 <html lang="hi">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta http-equiv="refresh" content="45">
-<title>$5,000 Funded Bot — Auto Command Center</title>
+<title>$5,000 Funded Bot — Live Account & Journal</title>
 <style>
   body {{ margin:0; font-family: system-ui, -apple-system, sans-serif; background:#0b0f17; color:#f8fafc; padding:14px; }}
   .wrap {{ max-width:1200px; margin:0 auto; }}
-  .hdr {{ display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; background:#111827; padding:14px 18px; border-radius:12px; border:1px solid #1e293b; margin-bottom:12px; }}
+  .hdr {{ display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; background:#111827; padding:14px 18px; border-radius:12px; border:1px solid #1e293b; margin-bottom:14px; }}
   .hdr h1 {{ margin:0; font-size:17px; color:#f8fafc; }}
   .badge {{ background:#064e3b; color:#34d399; padding:5px 10px; border-radius:8px; font-size:11.5px; font-weight:700; }}
-  .tabs {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px; }}
-  .tab-btn {{ background:#111827; color:#cbd5e1; border:1px solid #1e293b; padding:10px 15px; border-radius:9px; font-size:13px; font-weight:700; cursor:pointer; }}
-  .tab-btn.active {{ background:#2563eb; color:#ffffff; border-color:#3b82f6; }}
-  .tab-pane {{ display:none; }}
-  .tab-pane.active {{ display:block; }}
   .grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:11px; margin-bottom:14px; }}
   .card {{ background:#111827; border:1px solid #1e293b; padding:13px; border-radius:10px; }}
   .lbl {{ font-size:11.5px; color:#94a3b8; margin-bottom:5px; }}
@@ -1577,87 +1299,56 @@ def sync_live_website_dashboard(refresh_backtest=False, push_to_git=True):
 <div class="wrap">
   <div class="hdr">
     <div>
-      <h1>🛡️ $5,000 Two-Step Funded Account — Auto-Synced Command Center</h1>
-      <div style="font-size:11.5px;color:#94a3b8;margin-top:3px;">Last Bot Sync: <b>{state_payload['updated_at']}</b> · Auto-updates on every Telegram Signal, TP & SL</div>
+      <h1>🛡️ $5,000 Two-Step Funded Account — Live Tracker (0-Start)</h1>
+      <div style="font-size:11.5px;color:#94a3b8;margin-top:3px;">Last Bot Sync: <b>{state_payload['updated_at']}</b> · Tracks Only Live Telegram Bot Trades</div>
     </div>
-    <span class="badge">● 100% AUTO-PILOT SYNCED</span>
+    <span class="badge">● LIVE ACCOUNT SYNCED</span>
   </div>
 
-  <div class="tabs">
-    <button class="tab-btn active" onclick="openTab('tab-live', this)">1. 🛡️ My $5,000 Live Account ({live_stats['total']} Trades)</button>
-    <button class="tab-btn" onclick="openTab('tab-xau', this)">2. 🥇 XAUUSD Backtest & Days (Separate)</button>
-    <button class="tab-btn" onclick="openTab('tab-btc', this)">3. ₿ BTCUSD Backtest & Days (Separate)</button>
-    <button class="tab-btn" onclick="openTab('tab-journal', this)">4. 📒 Auto Trading Journal ({live_stats['total']})</button>
-  </div>
-
-  <!-- TAB 1: LIVE ACCOUNT -->
-  <div id="tab-live" class="tab-pane active">
-    <div class="grid">
-      <div class="card">
-        <div class="lbl">Live Account Balance / Equity</div>
-        <div class="val" style="color:{'#10b981' if eq >= 5000 else '#ef4444'}">${bal:,.2f} / ${eq:,.2f}</div>
-        <div class="sub">Start: $5,000.00 | Peak: ${HIGH_WATER_MARK_USD:,.2f}</div>
-      </div>
-      <div class="card">
-        <div class="lbl">Today's PnL (Stop Limit: -$25.00)</div>
-        <div class="val" style="color:{'#10b981' if day_pnl >= 0 else '#ef4444'}">${day_pnl:+.2f}</div>
-        <div class="sub">Trades Today: {trades_today}/2 | Losses Today: {losses_today}/2</div>
-      </div>
-      <div class="card">
-        <div class="lbl">Weekly PnL (Stop Limit: -$75.00)</div>
-        <div class="val" style="color:{'#10b981' if week_pnl >= 0 else '#ef4444'}">${week_pnl:+.2f}</div>
-        <div class="sub">Max Drawdown Used: ${dd_used:.2f} / $100.00</div>
-      </div>
-      <div class="card">
-        <div class="lbl">Live Bot Trades & Win Rate</div>
-        <div class="val" style="color:#3b82f6">{live_stats['total']} Trades ({live_stats['decisive_wr']:.0f}% WR)</div>
-        <div class="sub">Wins (+2R): {live_stats['wins']} | BE (0R): {live_stats['breakevens']} | Loss (-1R): {live_stats['losses']}</div>
-      </div>
-      <div class="card">
-        <div class="lbl">Live Profit Factor & Expectancy</div>
-        <div class="val" style="color:#f59e0b">PF: {live_stats['profit_factor']:.2f}</div>
-        <div class="sub">Expectancy: ${live_stats['expectancy_usd']:+.2f}/trade ({live_stats['avg_r']:+.2f}R)</div>
-      </div>
+  <div class="grid">
+    <div class="card">
+      <div class="lbl">Live Account Balance / Equity</div>
+      <div class="val" style="color:{'#10b981' if eq >= 5000 else '#ef4444'}">${bal:,.2f} / ${eq:,.2f}</div>
+      <div class="sub">Start: $5,000.00 | Peak: ${HIGH_WATER_MARK_USD:,.2f}</div>
     </div>
-
-    <div class="sec-title">⚡ Active Running Trade (Live from Telegram Bot)</div>
-    {running_html}
-
-    <div class="sec-title">📅 My Live Day-Wise Performance (Monday – Friday)</div>
-    <div class="grid">{live_day_cards}</div>
-  </div>
-
-  <!-- TAB 2: SEPARATE XAUUSD BACKTEST -->
-  <div id="tab-xau" class="tab-pane">
-    {xau_tab_html}
-  </div>
-
-  <!-- TAB 3: SEPARATE BTCUSD BACKTEST -->
-  <div id="tab-btc" class="tab-pane">
-    {btc_tab_html}
-  </div>
-
-  <!-- TAB 4: AUTO JOURNAL -->
-  <div id="tab-journal" class="tab-pane">
-    <div class="sec-title">📒 Auto-Recorded 9-Column Trading Journal (Every Completed Bot Trade)</div>
-    <div class="tbl-wrap">
-      <table>
-        <thead>
-          <tr><th>#</th><th>Date / Day</th><th>Market</th><th>1H Bias</th><th>15M Level Swept</th><th>5M Confirm</th><th>Entry / SL / TP</th><th>Risk $</th><th>Result (R & $)</th></tr>
-        </thead>
-        <tbody>{journal_rows_html}</tbody>
-      </table>
+    <div class="card">
+      <div class="lbl">Today's PnL (Stop Limit: -$25.00)</div>
+      <div class="val" style="color:{'#10b981' if day_pnl >= 0 else '#ef4444'}">${day_pnl:+.2f}</div>
+      <div class="sub">Trades Today: {trades_today}/2 | Losses Today: {losses_today}/2</div>
     </div>
+    <div class="card">
+      <div class="lbl">Weekly PnL (Stop Limit: -$75.00)</div>
+      <div class="val" style="color:{'#10b981' if week_pnl >= 0 else '#ef4444'}">${week_pnl:+.2f}</div>
+      <div class="sub">Max Drawdown Used: ${dd_used:.2f} / $100.00</div>
+    </div>
+    <div class="card">
+      <div class="lbl">Live Bot Trades & Win Rate</div>
+      <div class="val" style="color:#3b82f6">{live_stats['total']} Trades ({live_stats['decisive_wr']:.0f}% WR)</div>
+      <div class="sub">Wins (+2R): {live_stats['wins']} | BE (0R): {live_stats['breakevens']} | Loss (-1R): {live_stats['losses']}</div>
+    </div>
+    <div class="card">
+      <div class="lbl">Live Profit Factor & Expectancy</div>
+      <div class="val" style="color:#f59e0b">PF: {live_stats['profit_factor']:.2f}</div>
+      <div class="sub">Expectancy: ${live_stats['expectancy_usd']:+.2f}/trade ({live_stats['avg_r']:+.2f}R)</div>
+    </div>
+  </div>
+
+  <div class="sec-title">⚡ Active Running Trade (Live from Telegram Bot)</div>
+  {running_html}
+
+  <div class="sec-title">📅 My Live Day-Wise Performance (Monday – Friday)</div>
+  <div class="grid">{live_day_cards}</div>
+
+  <div class="sec-title">📒 Auto-Recorded 9-Column Trading Journal ({live_stats['total']} Completed Live Trades)</div>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr><th>#</th><th>Date / Day</th><th>Market</th><th>1H Bias</th><th>15M Level Swept</th><th>5M Confirm</th><th>Entry / SL / TP</th><th>Risk $</th><th>Result (R & $)</th></tr>
+      </thead>
+      <tbody>{journal_rows_html}</tbody>
+    </table>
   </div>
 </div>
-<script>
-function openTab(tabId, btnEl) {{
-  document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'));
-  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
-  document.getElementById(tabId).classList.add('active');
-  btnEl.classList.add('active');
-}}
-</script>
 </body>
 </html>"""
 
@@ -1682,16 +1373,21 @@ function openTab(tabId, btnEl) {{
 
     return html_content.encode("utf-8")
 
+def sync_live_website_dashboard_async(push_to_git=True):
+    threading.Thread(target=sync_live_website_dashboard, kwargs={"push_to_git": push_to_git}, daemon=True).start()
+
 # =====================================================================
-# 10. VISUAL CHARTS & TELEGRAM COMMANDS
+# 10. FAST VISUAL CHARTS & 0-START /backtest REPORT (LIVE TRADES ONLY)
 # =====================================================================
 def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, day_breakdown):
     try:
-        fig = plt.figure(figsize=(12.2, 7.0), dpi=125, facecolor="#ffffff")
+        fig = plt.figure(figsize=(11.5, 6.5), dpi=105, facecolor="#ffffff")
 
         ax1 = fig.add_axes([0.06, 0.50, 0.90, 0.41], facecolor="#ffffff")
         eq_curve = combined_stats["equity_curve"]
-        x_idx    = np.arange(len(eq_curve))
+        if len(eq_curve) == 1:
+            eq_curve = [STARTING_CAPITAL_USD, STARTING_CAPITAL_USD]
+        x_idx = np.arange(len(eq_curve))
 
         ax1.grid(True, linestyle="-", linewidth=0.5, color="#f0f3fa")
         for sp in ["top", "right"]:
@@ -1706,10 +1402,10 @@ def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, 
         ax1.fill_between(x_idx, STARTING_CAPITAL_USD, eq_curve, where=(np.array(eq_curve) < STARTING_CAPITAL_USD), facecolor="#f23645", alpha=0.12)
 
         ax1.set_title(
-            f"$5,000 Two-Step Funded Account — Equity Curve (Final: ${combined_stats['final_equity']:,.2f} | Net: ${combined_stats['net_pnl_usd']:+.2f} | PF: {combined_stats['profit_factor']:.2f})",
-            fontsize=10.5, fontweight="bold", color="#131722", pad=8
+            f"$5,000 Live Forward-Test Equity Curve (0-Start | Trades: {combined_stats['total']} | Final: ${combined_stats['final_equity']:,.2f} | Net: ${combined_stats['net_pnl_usd']:+.2f})",
+            fontsize=10.0, fontweight="bold", color="#131722", pad=8
         )
-        ax1.set_ylabel("Equity ($ USD)", fontsize=8.8, fontweight="bold", color="#131722")
+        ax1.set_ylabel("Equity ($ USD)", fontsize=8.6, fontweight="bold", color="#131722")
         ax1.legend(loc="upper left", fontsize=8.0, frameon=True)
 
         ax_day = fig.add_axes([0.06, 0.08, 0.34, 0.32], facecolor="#ffffff")
@@ -1724,16 +1420,16 @@ def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, 
 
         d_bars = ax_day.bar(d_labels, d_pnls, width=0.55, color=d_cols, alpha=0.88)
         ax_day.axhline(0, color="#475569", linewidth=0.8)
-        ax_day.set_title("Day-Wise Net Profit ($ Mon – Fri)", fontsize=9.0, fontweight="bold", color="#131722")
-        ax_day.set_ylabel("Net Profit ($)", fontsize=8.2, color="#131722")
+        ax_day.set_title("Day-Wise Net Profit ($ Mon – Fri)", fontsize=8.8, fontweight="bold", color="#131722")
+        ax_day.set_ylabel("Net Profit ($)", fontsize=8.0, color="#131722")
 
         for b, wr_val in zip(d_bars, d_wrs):
             yv = b.get_height()
             ax_day.text(
                 b.get_x() + b.get_width() / 2.0,
-                yv + (1.2 if yv >= 0 else -4.5),
+                yv + (0.5 if yv >= 0 else -2.5),
                 f"${yv:+.0f}\n({wr_val:.0f}%)",
-                ha="center", va="bottom" if yv >= 0 else "top", fontsize=7.1, fontweight="bold", color="#131722"
+                ha="center", va="bottom" if yv >= 0 else "top", fontsize=7.0, fontweight="bold", color="#131722"
             )
 
         ax2 = fig.add_axes([0.46, 0.08, 0.23, 0.32], facecolor="#ffffff")
@@ -1747,15 +1443,15 @@ def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, 
 
         bars = ax2.bar(markets, pnls, width=0.48, color=colors, alpha=0.88)
         ax2.axhline(0, color="#475569", linewidth=0.8)
-        ax2.set_title("XAUUSD vs BTCUSD", fontsize=9.0, fontweight="bold", color="#131722")
+        ax2.set_title("XAUUSD vs BTCUSD", fontsize=8.8, fontweight="bold", color="#131722")
 
         for b, st in zip(bars, [xau_stats, btc_stats]):
             y_v = b.get_height()
             ax2.text(
                 b.get_x() + b.get_width() / 2.0,
-                y_v + (1.2 if y_v >= 0 else -4.5),
+                y_v + (0.5 if y_v >= 0 else -2.5),
                 f"${y_v:+.0f}\n({st['decisive_wr']:.0f}%)",
-                ha="center", va="bottom" if y_v >= 0 else "top", fontsize=7.4, fontweight="bold", color="#131722"
+                ha="center", va="bottom" if y_v >= 0 else "top", fontsize=7.2, fontweight="bold", color="#131722"
             )
 
         ax3 = fig.add_axes([0.74, 0.08, 0.22, 0.32], facecolor="#ffffff")
@@ -1770,14 +1466,14 @@ def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, 
         b3 = ax3.bar(outcomes, counts, width=0.50, color=o_cols, alpha=0.88)
         ax3.set_title(
             f"Outcomes (Max DD: ${combined_stats['max_dd_usd']:.0f})",
-            fontsize=9.0, fontweight="bold", color="#131722"
+            fontsize=8.8, fontweight="bold", color="#131722"
         )
         for b in b3:
             h_v = int(b.get_height())
-            ax3.text(b.get_x() + b.get_width() / 2.0, h_v + 0.15, str(h_v), ha="center", va="bottom", fontsize=8.2, fontweight="bold", color="#131722")
+            ax3.text(b.get_x() + b.get_width() / 2.0, h_v + 0.05, str(h_v), ha="center", va="bottom", fontsize=8.0, fontweight="bold", color="#131722")
 
         buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=125, facecolor="#ffffff")
+        plt.savefig(buf, format="png", dpi=105, facecolor="#ffffff")
         plt.close(fig)
         buf.seek(0)
         return buf
@@ -1786,15 +1482,39 @@ def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, 
         return None
 
 def run_and_send_master_backtest_report(target_pair=None):
-    send_telegram_message("⏳ <b>Updating All-in-One Backtest + Auto-Syncing Live Website Dashboard...</b>")
-    html_bytes = sync_live_website_dashboard(refresh_backtest=True, push_to_git=True)
+    """
+    100% ZERO-START REPORT (/backtest, /report, /days):
+    Does NOT load any old historical candles! Starts cleanly at 0 trades ($5,000.00) and only counts
+    real live trades taken by the bot after the code starts running (resets to 0 on /reset).
+    """
+    send_telegram_chat_action("upload_photo")
 
-    xau_res = cached_backtest_bundle.get("xau") if target_pair in [None, "XAU/USD"] else None
-    btc_res = cached_backtest_bundle.get("btc") if target_pair in [None, "BTC/USD"] else None
+    xau_trades = []
+    btc_trades = []
+    for r in journal_memory_log:
+        t_obj = {
+            "market": r.get("Market", ""),
+            "weekday_idx": int(r.get("weekday_idx", 0)),
+            "result_r": float(r.get("numeric_r", 0.0)),
+            "net_pnl": float(r.get("numeric_pnl", 0.0)),
+            "cost_usd": float(r.get("cost_usd", 0.35))
+        }
+        if t_obj["market"] == "XAUUSD" and target_pair in [None, "XAU/USD"]:
+            xau_trades.append(t_obj)
+        elif t_obj["market"] == "BTCUSD" and target_pair in [None, "BTC/USD"]:
+            btc_trades.append(t_obj)
 
-    xau_trades = xau_res["trades"] if xau_res else []
-    btc_trades = btc_res["trades"] if btc_res else []
-    all_trades = sorted(xau_trades + btc_trades, key=lambda x: x["timestamp"])
+    all_trades = [
+        {
+            "market": r.get("Market", ""),
+            "weekday_idx": int(r.get("weekday_idx", 0)),
+            "result_r": float(r.get("numeric_r", 0.0)),
+            "net_pnl": float(r.get("numeric_pnl", 0.0)),
+            "cost_usd": float(r.get("cost_usd", 0.35))
+        }
+        for r in journal_memory_log
+        if (target_pair is None) or (target_pair == "XAU/USD" and r.get("Market") == "XAUUSD") or (target_pair == "BTC/USD" and r.get("Market") == "BTCUSD")
+    ]
 
     comb_stats    = compute_stage6_metrics(all_trades)
     xau_stats     = compute_stage6_metrics(xau_trades)
@@ -1807,21 +1527,27 @@ def run_and_send_master_backtest_report(target_pair=None):
         icon = "🟢" if ds["net_pnl"] > 0 else ("🔴" if ds["net_pnl"] < 0 else "⚪")
         day_lines += f"{icon} <b>{ds['day_name']}:</b> {ds['total']} trades | WR: <b>{ds['wr']:.0f}%</b> | Net: <b><code>${ds['net_pnl']:+.2f}</code></b>\n"
 
-    chart_buf = generate_visual_backtest_report_chart(comb_stats, xau_stats, btc_stats, day_breakdown)
-    send_telegram_signal_with_chart("📈 <b>4-Panel Visual Backtest & Day-Wise Dashboard</b>", chart_buf)
+    status_note = (
+        "✨ <i>0-Start Active: Only trades taken AFTER bot start are recorded here (0 old trades).</i>"
+        if comb_stats["total"] == 0 else
+        f"✅ <i>Live Forward-Test Record: {comb_stats['total']} completed trades since 0-Start.</i>"
+    )
 
     msg = (
-        f"📊 <b>SEPARATE MARKET & DAY-WISE SUMMARY</b>\n\n"
-        f"🥇 <b>1. XAUUSD (Gold Only):</b>\n"
-        f"• Trades: <b>{xau_stats['total']}</b> (W:{xau_stats['wins']} | BE:{xau_stats['breakevens']} | L:{xau_stats['losses']})\n"
-        f"• Win Rate: <b>{xau_stats['decisive_wr']:.1f}%</b> | PF: <b>{xau_stats['profit_factor']:.2f}</b> | Net: <b><code>${xau_stats['net_pnl_usd']:+.2f}</code></b>\n\n"
-        f"₿ <b>2. BTCUSD (Bitcoin Only):</b>\n"
-        f"• Trades: <b>{btc_stats['total']}</b> (W:{btc_stats['wins']} | BE:{btc_stats['breakevens']} | L:{btc_stats['losses']})\n"
-        f"• Win Rate: <b>{btc_stats['decisive_wr']:.1f}%</b> | PF: <b>{btc_stats['profit_factor']:.2f}</b> | Net: <b><code>${btc_stats['net_pnl_usd']:+.2f}</code></b>\n\n"
+        f"📊 <b>0-START LIVE BACKTEST & DAY-WISE REPORT</b>\n"
+        f"{status_note}\n\n"
+        f"💰 <b>Account Equity:</b> <code>$5,000.00</code> ➔ <b><code>${comb_stats['final_equity']:,.2f}</code></b> (Net: <b><code>${comb_stats['net_pnl_usd']:+.2f}</code></b>)\n"
+        f"🏆 <b>Total Trades:</b> <b>{comb_stats['total']}</b> (Wins: <b>{comb_stats['wins']}</b> | BE: <b>{comb_stats['breakevens']}</b> | Losses: <b>{comb_stats['losses']}</b>)\n"
+        f"📈 <b>Win Rate:</b> <b>{comb_stats['decisive_wr']:.1f}%</b> | <b>PF:</b> <b>{comb_stats['profit_factor']:.2f}</b> | <b>Max DD:</b> <b><code>${comb_stats['max_dd_usd']:.2f}</code></b>\n\n"
+        f"🥇 <b>1. XAUUSD (Gold Only — 0-Start):</b>\n"
+        f"• Trades: <b>{xau_stats['total']}</b> (W:{xau_stats['wins']} | BE:{xau_stats['breakevens']} | L:{xau_stats['losses']}) | WR: <b>{xau_stats['decisive_wr']:.1f}%</b> | Net: <b><code>${xau_stats['net_pnl_usd']:+.2f}</code></b>\n\n"
+        f"₿ <b>2. BTCUSD (Bitcoin Only — 0-Start):</b>\n"
+        f"• Trades: <b>{btc_stats['total']}</b> (W:{btc_stats['wins']} | BE:{btc_stats['breakevens']} | L:{btc_stats['losses']}) | WR: <b>{btc_stats['decisive_wr']:.1f}%</b> | Net: <b><code>${btc_stats['net_pnl_usd']:+.2f}</code></b>\n\n"
         f"📅 <b>3. DAY-WISE PROFITABILITY (MON – FRI):</b>\n{day_lines}"
     )
-    send_telegram_message(msg)
-    send_telegram_document(html_bytes, "Funded_Dashboard_Live.html", caption_html="🌐 <b>Auto-Updated Interactive Website Dashboard</b> — Tap to open directly in your browser!")
+
+    chart_buf = generate_visual_backtest_report_chart(comb_stats, xau_stats, btc_stats, day_breakdown)
+    send_telegram_signal_with_chart(msg, chart_buf)
 
 def draw_tradingview_arrow(ax, x_pos, y_pos, y_span, is_up=True):
     h = y_span * 0.038
@@ -1866,7 +1592,7 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         h1_bias = roadmap["h1_bias"]
         levels  = roadmap["levels"]
 
-        fig = plt.figure(figsize=(11.0, 6.2), dpi=120, facecolor="#ffffff")
+        fig = plt.figure(figsize=(10.5, 5.8), dpi=105, facecolor="#ffffff")
         ax  = fig.add_axes([0.015, 0.08, 0.880, 0.83], facecolor="#ffffff")
 
         n_bars = len(sub)
@@ -1881,7 +1607,7 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
 
         ax.text(
             0.45, 0.50, f"{mt5_sym} · 1H ➔ 15M ➔ 5M", transform=ax.transAxes,
-            fontsize=32, fontweight="bold", color="#131722", alpha=0.07,
+            fontsize=30, fontweight="bold", color="#131722", alpha=0.07,
             ha="center", va="center", zorder=1
         )
 
@@ -1921,7 +1647,7 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         ax.bar(x_vals[bull_mask], body_heights[bull_mask], bottom=bot_bodies[bull_mask], width=0.68, color="#089981", edgecolor="#089981", linewidth=0.40, zorder=4)
         ax.bar(x_vals[bear_mask], body_heights[bear_mask], bottom=bot_bodies[bear_mask], width=0.68, color="#f23645", edgecolor="#f23645", linewidth=0.40, zorder=4)
 
-        for idx, lv in enumerate(visible_levels):
+        for lv in visible_levels:
             z_top = lv["top"]
             z_mid = lv["price"]
             z_bot = lv["bot"]
@@ -2070,7 +1796,7 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         fig.text(0.015, 0.018, "TradingView · $5,000 Two-Step Roadmap", fontsize=9.0, fontweight="bold", color="#131722")
 
         buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=120, facecolor="#ffffff")
+        plt.savefig(buf, format="png", dpi=105, facecolor="#ffffff")
         plt.close(fig)
         buf.seek(0)
         return buf
@@ -2083,34 +1809,34 @@ def send_telegram_signal_with_chart(caption_html, chart_buf, target_chat_id=CHAT
         photo_bytes = chart_buf.getvalue()
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
 
-        if len(caption_html) <= 1000:
+        if len(caption_html) <= 1020:
             for attempt in range(2):
                 try:
                     files = {"photo": ("chart.png", photo_bytes, "image/png")}
                     data  = {"chat_id": target_chat_id, "caption": caption_html, "parse_mode": "HTML"}
-                    res   = HTTP_SESSION.post(url, data=data, files=files, timeout=15) if attempt == 0 else requests.post(url, data=data, files=files, timeout=18)
+                    res   = TELEGRAM_SESSION.post(url, data=data, files=files, timeout=8) if attempt == 0 else requests.post(url, data=data, files=files, timeout=10)
                     if res.status_code == 200 and res.json().get("ok"):
                         return
                 except Exception as e:
                     print(f"Photo Attempt {attempt + 1} Warning: {e}")
-                    time.sleep(0.4)
 
         for attempt in range(2):
             try:
                 files = {"photo": ("chart.png", photo_bytes, "image/png")}
                 data  = {"chat_id": target_chat_id}
-                res   = requests.post(url, data=data, files=files, timeout=18)
+                res   = TELEGRAM_SESSION.post(url, data=data, files=files, timeout=8) if attempt == 0 else requests.post(url, data=data, files=files, timeout=10)
                 if res.status_code == 200 and res.json().get("ok"):
                     send_telegram_message(caption_html, target_chat_id)
                     return
             except Exception as e:
                 print(f"Fallback Photo Attempt {attempt + 1} Warning: {e}")
-                time.sleep(0.4)
 
     send_telegram_message(caption_html, target_chat_id)
 
 def send_instant_preview_chart(pair_key=None):
     global chart_rotation_index
+    send_telegram_chat_action("upload_photo")
+
     pair_names_list = list(FOREX_PAIRS.keys())
     if pair_key is None:
         pair_key = pair_names_list[chart_rotation_index % len(pair_names_list)]
@@ -2169,14 +1895,14 @@ def send_live_status_summary():
     today_name                 = WEEKDAY_NAMES[get_ny_weekday_index(get_utc_now())]
 
     report = (
-        f"📊 <b>$5,000 TWO-STEP FUNDED ROADMAP STATUS</b>\n\n"
+        f"📊 <b>$5,000 TWO-STEP FUNDED ROADMAP STATUS (0-START)</b>\n\n"
         f"📅 <b>Day:</b> <b>{today_name}</b> | 🕒 <b>Session:</b> {ny_status_txt}\n"
         f"💰 <b>Balance / Equity:</b> <b>${bal:.2f} / ${eq:.2f}</b> (Peak: ${HIGH_WATER_MARK_USD:.2f})\n"
         f"📈 <b>Today's PnL:</b> <b>${day_pnl:+.2f}</b> (Limit: -${DAILY_STOP_LOSS_USD:.2f})\n"
         f"📅 <b>Weekly PnL:</b> <b>${week_pnl:+.2f}</b> (Limit: -${WEEKLY_STOP_LOSS_USD:.2f})\n"
         f"🛡️ <b>Drawdown from Peak:</b> <b>${dd_from_peak:.2f}</b> (Review Stop: ${MAX_DRAWDOWN_REVIEW_USD:.2f})\n"
         f"🔢 <b>Trades Today:</b> {trades_today}/{MAX_DAILY_TRADES} | <b>Losses Today:</b> {losses_today}/{MAX_DAILY_LOSS_COUNT}\n"
-        f"📒 <b>Total Logged Bot Trades:</b> {len(journal_memory_log)}\n\n"
+        f"📒 <b>Total Live Trades Since 0-Start:</b> {len(journal_memory_log)}\n\n"
     )
     for name, info in FOREX_PAIRS.items():
         try:
@@ -2190,8 +1916,19 @@ def send_live_status_summary():
                 report += f"🔹 <b>{info['mt5_name']}:</b> <code>{format_price(live_spot, info['decimals'])}</code> | 1H: <b>{rm['h1_bias']}</b> ({st_str})\n"
         except Exception:
             pass
-    report += "\n🌐 Send <code>/web</code> for Instant Dashboard File | <code>/backtest</code> for Full Report | <code>/reset</code> to Reset Account to 0."
+    report += "\n⚡ Commands: <code>/gold</code>, <code>/btc</code>, <code>/backtest</code>, <code>/reset</code>"
     send_telegram_message(report)
+
+def flush_old_telegram_updates():
+    global last_update_id
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
+        return
+    try:
+        res = TELEGRAM_SESSION.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates", params={"timeout": 0}, timeout=3).json()
+        if res.get("ok") and res.get("result"):
+            last_update_id = res["result"][-1]["update_id"]
+    except Exception:
+        pass
 
 def check_telegram_commands():
     global last_update_id
@@ -2200,7 +1937,7 @@ def check_telegram_commands():
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
     params = {"offset": last_update_id + 1, "timeout": 0}
     try:
-        response = HTTP_SESSION.get(url, params=params, timeout=3).json()
+        response = TELEGRAM_SESSION.get(url, params=params, timeout=2.5).json()
         if response.get("ok"):
             for result in response.get("result", []):
                 last_update_id = result["update_id"]
@@ -2212,15 +1949,15 @@ def check_telegram_commands():
                 if msg_text in ["/status", "status", "/start", "start"]:
                     send_live_status_summary()
                 elif msg_text in ["/web", "web", "/dashboard", "dashboard", "/journal", "journal"]:
-                    html_bytes = sync_live_website_dashboard(refresh_backtest=False, push_to_git=True)
+                    html_bytes = sync_live_website_dashboard(push_to_git=False)
                     send_telegram_document(
                         html_bytes,
-                        "Funded_Dashboard_Live.html",
-                        caption_html="🌐 <b>Auto-Synced Live Website Dashboard (Tap to open in Chrome)</b>\nIncludes: Live $5,000 Account (0-Start), Separate XAUUSD & BTCUSD Backtests, Mon–Fri Day Breakdown & Journal!"
+                        "Funded_Live_Account.html",
+                        caption_html="🌐 <b>Live $5,000 Account & Journal (0-Start, Live Trades Only)</b>"
                     )
                 elif msg_text in ["/reset", "reset"]:
                     reset_live_account_to_zero()
-                    send_telegram_message("✅ <b>Account & Journal Reset to 0 ($5,000.00 Starting Balance).</b> Website dashboard updated automatically.")
+                    send_telegram_message("✅ <b>Account, Website & /backtest Reset to 0 ($5,000.00 Starting Balance).</b>")
                 elif msg_text in ["/backtest", "backtest", "/report", "report", "/days", "days"]:
                     run_and_send_master_backtest_report(None)
                 elif msg_text in ["/backtest gold", "/backtest xauusd", "/report gold"]:
@@ -2288,9 +2025,7 @@ def dispatch_confirmed_trade_alert(name, info, df_1h, df_15m, df_5m, live_spot, 
 
     chart_buf = generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=cand)
     send_telegram_signal_with_chart(msg, chart_buf)
-
-    # Auto-sync website dashboard immediately so the Running Trade appears live!
-    sync_live_website_dashboard(refresh_backtest=False, push_to_git=True)
+    sync_live_website_dashboard_async(push_to_git=True)
 
 def dispatch_pre_alert_setup(name, info, df_1h, df_15m, df_5m, live_spot, cand, closed_time):
     dec        = info["decimals"]
@@ -2403,7 +2138,7 @@ def manage_open_trades(pair_name, candle_time, live_spot, df_5m, decimals):
                         f"📍 <b>Live Price:</b> <code>{price_str}</code>\n"
                         f"👉 Move Stop-Loss to Entry (<code>{entry_str}</code>) to make this trade 100% risk-free."
                     )
-                    sync_live_website_dashboard(refresh_backtest=False, push_to_git=True)
+                    sync_live_website_dashboard_async(push_to_git=True)
 
             hit_type = None
             if trade["direction"] == "BUY":
@@ -2427,7 +2162,7 @@ def manage_open_trades(pair_name, candle_time, live_spot, df_5m, decimals):
                 append_to_trading_journal(trade, +2.0, net_win, "WIN")
                 send_telegram_message(
                     f"🎯 <b>1:2 FULL TARGET HIT (+${net_win:.2f} / +2R) — {trade['mt5_name']}</b>\n"
-                    f"🌐 Website Dashboard & Journal updated automatically!"
+                    f"📒 Saved to 0-Start Live Journal & <code>/backtest</code>!"
                 )
             elif hit_type == "BREAKEVEN_SL":
                 trade["is_open"] = False
@@ -2439,7 +2174,7 @@ def manage_open_trades(pair_name, candle_time, live_spot, df_5m, decimals):
                 append_to_trading_journal(trade, 0.0, be_cost, "BREAKEVEN")
                 send_telegram_message(
                     f"🛡️ <b>BREAKEVEN EXIT (0R) — {trade['mt5_name']}</b>\n"
-                    f"🌐 Capital preserved & synced to Website Dashboard."
+                    f"📒 Capital preserved & logged in 0-Start <code>/backtest</code>."
                 )
             elif hit_type == "SL":
                 trade["is_open"] = False
@@ -2452,7 +2187,7 @@ def manage_open_trades(pair_name, candle_time, live_spot, df_5m, decimals):
                 append_to_trading_journal(trade, -1.0, -loss_amt, "LOSS")
                 send_telegram_message(
                     f"🛑 <b>INVALIDATION STOP-LOSS HIT (-${loss_amt:.2f} / -1R) — {trade['mt5_name']}</b> (<code>{sl_str}</code>)\n"
-                    f"Losses Today: {losses_today}/{MAX_DAILY_LOSS_COUNT}. Website Dashboard updated automatically."
+                    f"Losses Today: {losses_today}/{MAX_DAILY_LOSS_COUNT}. Logged in 0-Start <code>/backtest</code>."
                 )
 
 # =====================================================================
@@ -2476,7 +2211,7 @@ def scan_markets():
         daily_halt_announced = False
         for k in live_bars_memory:
             live_bars_memory[k] = {}
-        sync_live_website_dashboard(refresh_backtest=True, push_to_git=True)
+        sync_live_website_dashboard_async(push_to_git=True)
 
     if iso_week != current_week:
         current_week = iso_week
@@ -2508,7 +2243,7 @@ def scan_markets():
         if not is_forex_market_open() and not info.get("is_crypto", False):
             continue
         try:
-            df_1h, df_15m, df_5m, live_spot = get_roadmap_3tf_spot_data(name, info, use_fast_cache=False)
+            df_1h, df_15m, df_5m, live_spot = get_roadmap_3tf_spot_data(name, info, use_fast_cache=True)
             if df_1h is None or df_15m is None or df_5m is None or live_spot is None:
                 continue
 
@@ -2548,15 +2283,16 @@ def scan_markets():
 
 if __name__ == "__main__":
     load_persistent_account_state()
-    fetch_live_economic_calendar()
-    sync_live_website_dashboard(refresh_backtest=True, push_to_git=True)
-    _, _, ny_stat, ist_win = get_ny_session_status()
+    flush_old_telegram_updates()
+    threading.Thread(target=fetch_live_economic_calendar, daemon=True).start()
+    sync_live_website_dashboard_async(push_to_git=True)
+
     send_telegram_message(
-        f"📊 <b>$5,000 Two-Step Funded Bot + Auto-Synced Website Active</b>\n"
-        f"• <b>Account Status:</b> ${STARTING_CAPITAL_USD + total_account_pnl:,.2f} ({len(journal_memory_log)} Logged Trades)\n"
-        f"• <b>Markets:</b> XAUUSD (Primary) + BTCUSD (Secondary) — Separate Backtests Built-In\n"
-        f"• <b>Auto-Sync:</b> Every trade, TP, SL & Journal entry updates <code>index.html</code> automatically\n"
-        f"• <b>Commands:</b> <code>/web</code> (Instant Dashboard), <code>/gold</code>, <code>/btc</code>, <code>/backtest</code>, <code>/reset</code>"
+        f"⚡ <b>$5,000 Two-Step Funded Bot Active (100% Zero-Start Mode)</b>\n"
+        f"• <b>Live Balance:</b> ${STARTING_CAPITAL_USD + total_account_pnl:,.2f} ({len(journal_memory_log)} Recorded Live Trades)\n"
+        f"• <b>/backtest & Website:</b> 100% Zero-Start (Only records live trades taken AFTER bot starts)\n"
+        f"• <b>Instant Photo Engine:</b> Zero-delay parallel chart rendering active\n"
+        f"• <b>Commands:</b> <code>/gold</code>, <code>/btc</code>, <code>/backtest</code>, <code>/status</code>, <code>/reset</code>"
     )
 
     start_run      = time.time()
@@ -2570,10 +2306,10 @@ if __name__ == "__main__":
             if time.time() - last_scan_time >= 10:
                 scan_markets()
                 last_scan_time = time.time()
-            time.sleep(0.5)
+            time.sleep(0.3)
         except KeyboardInterrupt:
             print("Stopped manually.")
             break
         except Exception as e:
             print(f"Loop Error: {e}")
-            time.sleep(3)
+            time.sleep(2)
