@@ -891,7 +891,7 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
     if not ignore_locks:
         check_sweep_proximity_radar(pair_name, info, roadmap, live_spot, atr_5m)
 
-    if h1_bias == "RANGING" and not ignore_locks:
+    if h1_bias == "RANGING":
         return (None, "1H_RANGING_CHOPPY") if return_skip_reason else None
 
     m15_recent = df_15m.iloc[-6:-1] if len(df_15m) >= 7 else df_15m.iloc[-5:]
@@ -910,7 +910,7 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
     buf_5m = round(max(atr_5m * 0.12, spread_cost_now * 0.5), dec)
 
     # -----------------------------------------------------------------
-    # STRATEGY 1 ONLY: 15M LIQUIDITY SWEEP + 5M MSS
+    # STRATEGY 1 ONLY: 15M LIQUIDITY SWEEP + 5M MSS (STRICT 1H BIAS MATCH)
     # -----------------------------------------------------------------
     for lv in levels:
         lvl_price = lv["price"]
@@ -918,7 +918,7 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
         lvl_short = lv["short"]
         lvl_type  = lv["type"]
 
-        if (h1_bias == "BULLISH" or ignore_locks) and lvl_type == "LOW_POOL":
+        if h1_bias == "BULLISH" and lvl_type == "LOW_POOL":
             m15_min_low    = float(m15_recent["Low"].min())
             m15_last_close = float(m15_c0["Close"])
             swept_on_15m   = (m15_min_low <= lvl_price + atr_5m * 0.25) and (m15_min_low >= lvl_price - atr_5m * 2.20) and (m15_last_close >= lvl_price - atr_5m * 0.10)
@@ -998,7 +998,7 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
                             )
                         })
 
-        if (h1_bias == "BEARISH" or ignore_locks) and lvl_type == "HIGH_POOL":
+        if h1_bias == "BEARISH" and lvl_type == "HIGH_POOL":
             m15_max_high   = float(m15_recent["High"].max())
             m15_last_close = float(m15_c0["Close"])
             swept_on_15m   = (m15_max_high >= lvl_price - atr_5m * 0.25) and (m15_max_high <= lvl_price + atr_5m * 2.20) and (m15_last_close <= lvl_price + atr_5m * 0.10)
@@ -1185,7 +1185,7 @@ def compute_day_wise_breakdown(trades_list):
     return {"days": day_stats, "best_day": best_day, "worst_day": worst_day}
 
 # =====================================================================
-# 9. HIGH-SPEED CLEAN CHARTS & TELEGRAM REPORTS
+# 9. HIGH-SPEED CLEAN CHARTS (NO BOS / FVG / OB) & TELEGRAM REPORTS
 # =====================================================================
 def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, day_breakdown):
     try:
@@ -1621,6 +1621,7 @@ def send_telegram_signal_with_chart(caption_html, chart_buf, target_chat_id=CHAT
     send_telegram_message(caption_html, target_chat_id)
 
 def send_instant_preview_chart(pair_key=None):
+    """Shows live chart and current market map only (/gold or /btc); auto-trades come automatically when setup forms."""
     global chart_rotation_index
     send_telegram_chat_action("upload_photo")
 
@@ -1641,39 +1642,25 @@ def send_instant_preview_chart(pair_key=None):
     dec    = info["decimals"]
 
     roadmap = extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, dec)
-    cand    = pending_pre_alerts.get(pair_key) or evaluate_roadmap_sweep_mss_setup(pair_key, info, df_1h, df_15m, df_5m, live_spot, ignore_locks=True)
 
-    chart_buf = generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=cand)
+    # Preview chart shows live market structure without triggering or displaying manual trade signals
+    chart_buf = generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None)
     _, _, sess_status_txt, _ = get_active_sessions_info()
     _, spread_status_txt     = check_low_spread_window(info)
 
-    if cand is not None:
-        stage_lbl = "🚨 ENTER NOW (CONFIRMED)" if cand.get("stage") == "CONFIRMED_BREAKOUT" else "⏳ PRE-ALERT LOCKED"
-        caption = (
-            f"📊 <b>{info['mt5_name']} • 1H ➔ 15M ➔ 5M SETUP</b>\n"
-            f"🔔 <b>Status:</b> <b>{stage_lbl}</b> | 💧 <b>Spread:</b> {spread_status_txt}\n\n"
-            f"🧭 <b>1H Context:</b> <b>{roadmap['h1_bias']}</b> | 📢 <b>Action:</b> <b>{cand['action']}</b>\n"
-            f"🧲 <b>Swept Level:</b> {cand['swept_level_name']}\n"
-            f"📍 <b>Live Price:</b> <code>{format_price(live_spot, dec)}</code>\n"
-            f"🎯 <b>ENTRY SPOT:</b> <b><code>{format_price(cand['entry_spot'], dec)}</code></b>\n"
-            f"💼 <b>Lot Size ($12.50 Risk):</b> <code>{cand['lot_size']:.2f} Lot</code> (Risk: ${cand['planned_risk_usd']:.2f})\n"
-            f"🛑 <b>Invalidation SL:</b> <code>{format_price(cand['sl_price'], dec)}</code>\n"
-            f"🛡️ <b>1:1 Lock (TP1):</b> <code>{format_price(cand['tp1_price'], dec)}</code> | 🎯 <b>1:2 Target (TP2):</b> <code>{format_price(cand['tp2_price'], dec)}</code>"
-        )
-    else:
-        no_trade_note = "⚠️ <b>1H is RANGING/CHOPPY — Stand Aside!</b>\n" if roadmap["h1_bias"] == "RANGING" else ""
-        caption = (
-            f"📊 <b>{info['mt5_name']} • PAIR LEVEL RADAR MAP</b>\n"
-            f"🕒 <b>Session:</b> {sess_status_txt}\n"
-            f"💧 <b>Spread Window:</b> {spread_status_txt}\n"
-            f"🧭 <b>1H Context:</b> <b>{roadmap['h1_bias']}</b> | 📍 <b>Live:</b> <code>{format_price(live_spot, dec)}</code>\n"
-            f"{no_trade_note}\n"
-            f"📌 <b>Nearby Pair Levels:</b>\n"
-            f"• <b>PDH / PDL:</b> <code>{format_price(roadmap['pdh'], dec)}</code> / <code>{format_price(roadmap['pdl'], dec)}</code>\n"
-            f"• <b>London H / L:</b> <code>{format_price(roadmap['london_high'], dec)}</code> / <code>{format_price(roadmap['london_low'], dec)}</code>\n"
-            f"• <b>Asian H / L:</b> <code>{format_price(roadmap['asian_high'], dec)}</code> / <code>{format_price(roadmap['asian_low'], dec)}</code>\n\n"
-            f"⏳ <b>Active Rule:</b> 1H Bias + 15M Level Sweep + 5M MSS (Strategy 1 Only)."
-        )
+    no_trade_note = "⚠️ <b>1H is RANGING/CHOPPY — Stand Aside!</b>\n" if roadmap["h1_bias"] == "RANGING" else ""
+    caption = (
+        f"📊 <b>{info['mt5_name']} • LIVE MARKET CHART</b>\n"
+        f"🕒 <b>Session:</b> {sess_status_txt}\n"
+        f"💧 <b>Spread Window:</b> {spread_status_txt}\n"
+        f"🧭 <b>1H Context:</b> <b>{roadmap['h1_bias']}</b> | 📍 <b>Live:</b> <code>{format_price(live_spot, dec)}</code>\n"
+        f"{no_trade_note}\n"
+        f"📌 <b>Nearby Pair Levels:</b>\n"
+        f"• <b>PDH / PDL:</b> <code>{format_price(roadmap['pdh'], dec)}</code> / <code>{format_price(roadmap['pdl'], dec)}</code>\n"
+        f"• <b>London H / L:</b> <code>{format_price(roadmap['london_high'], dec)}</code> / <code>{format_price(roadmap['london_low'], dec)}</code>\n"
+        f"• <b>Asian H / L:</b> <code>{format_price(roadmap['asian_high'], dec)}</code> / <code>{format_price(roadmap['asian_low'], dec)}</code>\n\n"
+        f"🤖 <b>Auto-Trade Mode:</b> Bot automatically sends alerts when 1H Bias + 15M Sweep + 5M MSS forms."
+    )
 
     send_telegram_signal_with_chart(caption, chart_buf)
 
