@@ -2,7 +2,6 @@ import os
 import io
 import csv
 import sys
-import json
 import time
 import threading
 import subprocess
@@ -73,10 +72,8 @@ BREAKEVEN_LOCK_R             = 1.00      # Lock SL to Entry at 1:1 (+1R) to prot
 PRE_ALERT_EXPIRY_MINUTES     = 25
 MAX_TRADE_HOLD_MINUTES       = 90
 
-STRICT_NY_SESSION_ONLY       = True
+STRICT_SESSION_ONLY          = True      # London + New York active windows
 JOURNAL_CSV_PATH             = "trading_journal.csv"
-STATE_JSON_PATH              = "live_dashboard_data.json"
-WEB_DASHBOARD_PATH           = "index.html"
 
 WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 WEEKDAY_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -126,6 +123,7 @@ FOREX_PAIRS = {
 last_candle_traded      = {name: None for name in FOREX_PAIRS}
 last_pre_alert_candle   = {name: None for name in FOREX_PAIRS}
 last_setup_traded       = {name: None for name in FOREX_PAIRS}
+last_radar_key          = {name: None for name in FOREX_PAIRS}
 pending_pre_alerts      = {name: None for name in FOREX_PAIRS}
 pair_cooldown_until     = {name: datetime.min.replace(tzinfo=timezone.utc) for name in FOREX_PAIRS}
 pre_alert_cooldown      = {name: datetime.min.replace(tzinfo=timezone.utc) for name in FOREX_PAIRS}
@@ -181,38 +179,13 @@ current_day  = get_ist_now().date()
 current_week = get_ist_now().isocalendar()[1]
 
 # =====================================================================
-# 2. PERSISTENT MEMORY LOADER (0-START LIVE TRADES ONLY)
+# 2. TELEGRAM-ONLY RESET & MEMORY ENGINE (0-START)
 # =====================================================================
-def load_persistent_account_state():
-    """Loads saved live trades & PnL from live_dashboard_data.json if available. Starts at 0 if new."""
-    global HIGH_WATER_MARK_USD, total_account_pnl, daily_realized_pnl, weekly_realized_pnl
-    global trades_today, losses_today, journal_memory_log
-    if not os.path.isfile(STATE_JSON_PATH):
-        return
-    try:
-        with open(STATE_JSON_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        total_account_pnl   = float(data.get("total_account_pnl", 0.0))
-        HIGH_WATER_MARK_USD = max(STARTING_CAPITAL_USD, float(data.get("peak_equity", STARTING_CAPITAL_USD)))
-        saved_day           = data.get("saved_ist_date", "")
-        saved_week          = data.get("saved_iso_week", -1)
-        if saved_day == str(get_ist_now().date()):
-            daily_realized_pnl = float(data.get("day_pnl", 0.0))
-            trades_today       = int(data.get("trades_today", 0))
-            losses_today       = int(data.get("losses_today", 0))
-        if saved_week == get_ist_now().isocalendar()[1]:
-            weekly_realized_pnl = float(data.get("week_pnl", 0.0))
-        loaded_journal = data.get("raw_journal_memory", [])
-        if isinstance(loaded_journal, list):
-            journal_memory_log = loaded_journal
-    except Exception as e:
-        print(f"State Load Info: {e}")
-
 def reset_live_account_to_zero():
-    """Resets live account, website, and /backtest data cleanly back to $5,000.00 and 0 trades."""
+    """Resets live account and /backtest data cleanly back to $5,000.00 and 0 trades."""
     global HIGH_WATER_MARK_USD, total_account_pnl, daily_realized_pnl, weekly_realized_pnl
     global trades_today, losses_today, daily_trades_log, journal_memory_log
-    global daily_halt_announced, weekly_halt_announced, dd_halt_announced
+    global daily_halt_announced, weekly_halt_announced, dd_halt_announced, last_radar_key
     HIGH_WATER_MARK_USD   = STARTING_CAPITAL_USD
     total_account_pnl     = 0.0
     daily_realized_pnl    = 0.0
@@ -221,6 +194,7 @@ def reset_live_account_to_zero():
     losses_today          = 0
     daily_trades_log      = []
     journal_memory_log    = []
+    last_radar_key        = {name: None for name in FOREX_PAIRS}
     daily_halt_announced  = False
     weekly_halt_announced = False
     dd_halt_announced     = False
@@ -229,10 +203,9 @@ def reset_live_account_to_zero():
             os.remove(JOURNAL_CSV_PATH)
         except Exception:
             pass
-    sync_live_website_dashboard_async(push_to_git=True)
 
 # =====================================================================
-# 3. NEW YORK SESSION & ECONOMIC CALENDAR ENGINE (PDF SECTION 3)
+# 3. LONDON + NEW YORK SESSION & ECONOMIC CALENDAR ENGINE
 # =====================================================================
 def is_forex_market_open():
     now = get_ist_now()
@@ -245,24 +218,31 @@ def is_forex_market_open():
         return False
     return True
 
-def get_ny_session_status():
+def get_active_sessions_info():
+    """Returns (is_trading_allowed, is_pre_session, status_label, sessions_summary)."""
+    sessions_str = "London (12:30–4:30 PM IST) + New York (6:30–10:30 PM IST)"
     if not is_forex_market_open():
-        return False, False, "Weekend Closed", ""
+        return False, False, "Weekend Closed", sessions_str
 
-    ny_now = get_ny_now()
-    ny_hr  = ny_now.hour + (ny_now.minute / 60.0)
-    is_dst = bool(ny_now.dst())
-    ist_window_str = "7:00 PM – 9:30 PM IST (EDT)" if is_dst else "8:00 PM – 10:30 PM IST (EST)"
+    utc_now = get_utc_now()
+    utc_hr  = utc_now.hour + (utc_now.minute / 60.0)
 
-    is_pre_session = (9.20 <= ny_hr < 9.50)
-    is_ny_active   = (9.25 <= ny_hr <= 12.25)
+    in_london = (7.0 <= utc_hr <= 11.0)
+    in_ny     = (13.0 <= utc_hr <= 17.0)
+    is_pre_london = (6.75 <= utc_hr < 7.0)
+    is_pre_ny     = (12.75 <= utc_hr < 13.0)
 
-    if is_ny_active:
-        return True, is_pre_session, f"🟢 NY Session Active ({ist_window_str})", ist_window_str
-    else:
-        if STRICT_NY_SESSION_ONLY:
-            return False, is_pre_session, f"⏸️ Waiting for NY Session ({ist_window_str})", ist_window_str
-        return True, is_pre_session, f"🟢 24H Mode Active (NY Core: {ist_window_str})", ist_window_str
+    if in_london and in_ny:
+        return True, False, "🟢 London + NY Overlap Active", sessions_str
+    if in_london:
+        return True, False, "🟢 London Session Active", sessions_str
+    if in_ny:
+        return True, False, "🟢 NY Session Active", sessions_str
+
+    if not STRICT_SESSION_ONLY:
+        return True, (is_pre_london or is_pre_ny), f"🟢 24H Mode ({sessions_str})", sessions_str
+
+    return False, (is_pre_london or is_pre_ny), f"⏸️ Waiting ({sessions_str})", sessions_str
 
 def fetch_live_economic_calendar():
     global cached_news_events, last_news_fetch_time
@@ -271,7 +251,7 @@ def fetch_live_economic_calendar():
         return cached_news_events
     url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
     try:
-        res = HTTP_SESSION.get(url, timeout=4)
+        res = HTTP_SESSION.get(url, timeout=3.5)
         if res.status_code == 200:
             data = res.json()
             high_events = []
@@ -310,7 +290,7 @@ def check_news_window_for_pair(pair_info):
     return True, "Clear"
 
 # =====================================================================
-# 4. $5,000 TWO-STEP RISK MANAGEMENT & JOURNAL ENGINE (PDF SEC 2 & 5)
+# 4. $5,000 TWO-STEP RISK MANAGEMENT & JOURNAL ENGINE
 # =====================================================================
 def get_live_account_metrics(live_prices_map=None):
     global HIGH_WATER_MARK_USD
@@ -326,6 +306,8 @@ def get_live_account_metrics(live_prices_map=None):
                 if spot is not None and t["sl_dist"] > 0:
                     r_move = (spot - t["entry"]) / t["sl_dist"] if t["direction"] == "BUY" else (t["entry"] - spot) / t["sl_dist"]
                     floating_pnl += (r_move * t["max_risk"])
+                    t["max_r_seen"] = round(max(float(t.get("max_r_seen", 0.0)), r_move), 2)
+                    t["min_r_seen"] = round(min(float(t.get("min_r_seen", 0.0)), r_move), 2)
 
     live_equity = closed_balance + floating_pnl
     if live_equity > HIGH_WATER_MARK_USD:
@@ -345,7 +327,7 @@ def check_funded_account_risk_rules(live_prices_map=None):
             send_telegram_message(
                 f"🛑 <b>DRAWDOWN REVIEW THRESHOLD REACHED (-${current_dd:.2f} / 2.0%)</b>\n"
                 f"Peak/Starting Balance: <code>${reference_peak:.2f}</code> | Current Equity: <code>${eq:.2f}</code>\n"
-                f"Per Roadmap Section 2: Trading is paused to review the journal and rule compliance."
+                f"Trading paused to review rule compliance."
             )
         return False, 0.0, "Max Drawdown Review Threshold (-$100)"
 
@@ -354,7 +336,7 @@ def check_funded_account_risk_rules(live_prices_map=None):
             weekly_halt_announced = True
             send_telegram_message(
                 f"🛑 <b>WEEKLY STOP REACHED (-${abs(week_net_pnl):.2f} / 1.5%)</b>\n"
-                f"Per Roadmap Section 2: Weekly loss reached -$75. Live/Evaluation trading stopped for the week."
+                f"Weekly loss reached -$75. Trading stopped for the week."
             )
         return False, 0.0, "Weekly Stop Reached (-$75)"
 
@@ -363,7 +345,7 @@ def check_funded_account_risk_rules(live_prices_map=None):
             daily_halt_announced = True
             send_telegram_message(
                 f"🛡️ <b>DAILY STOP TRIGGERED (Today: ${day_net_pnl:+.2f} | Losses: {losses_today}/2)</b>\n"
-                f"Per Roadmap Section 2: Maximum daily stop (-$25 or 2 losses) reached. Done for today."
+                f"Maximum daily stop (-$25 or 2 losses) reached. Done for today."
             )
         return False, 0.0, "Daily Stop Reached (-$25 / 2 Losses)"
 
@@ -416,6 +398,8 @@ def calculate_roadmap_position_size(pair_name, pair_info, sl_dist, max_risk_usd=
 def append_to_trading_journal(trade_record, result_r_val, net_pnl_usd, result_label):
     wd_idx = get_ny_weekday_index(trade_record.get("entry_candle_time", get_utc_now()))
     wd_nam = WEEKDAY_NAMES[wd_idx]
+    mfe_r  = float(trade_record.get("max_r_seen", max(0.0, result_r_val)))
+    mae_r  = float(trade_record.get("min_r_seen", min(0.0, result_r_val)))
     row = {
         "Date / time": get_ist_now().strftime("%Y-%m-%d %I:%M %p IST"),
         "Day": wd_nam,
@@ -427,7 +411,7 @@ def append_to_trading_journal(trade_record, result_r_val, net_pnl_usd, result_la
         "Entry / SL / TP": f"E:{trade_record['entry']} | SL:{trade_record['sl']} | TP:{trade_record['target']}",
         "Lot": trade_record.get("lot_size", 0.01),
         "Risk $": f"${trade_record['max_risk']:.2f}",
-        "Result (R)": f"{result_r_val:+.2f}R (${net_pnl_usd:+.2f}) [{result_label}]",
+        "Result (R)": f"{result_r_val:+.2f}R (${net_pnl_usd:+.2f}) [{result_label} · Peak:{mfe_r:+.1f}R/Dip:{mae_r:+.1f}R]",
         "Rule followed?": "YES",
         "weekday_idx": wd_idx,
         "numeric_r": float(result_r_val),
@@ -435,21 +419,23 @@ def append_to_trading_journal(trade_record, result_r_val, net_pnl_usd, result_la
         "cost_usd": float(trade_record.get("cost_usd", 0.35))
     }
     journal_memory_log.append(row)
-    file_exists = os.path.isfile(JOURNAL_CSV_PATH)
     csv_cols = ["Date / time", "Day", "Market", "1H bias", "Level / sweep", "5M confirmation", "Entry / SL / TP", "Risk $", "Result (R)", "Rule followed?"]
-    try:
-        with open(JOURNAL_CSV_PATH, mode="a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=csv_cols)
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow({k: row[k] for k in csv_cols})
-    except Exception as e:
-        print(f"Journal Write Warning: {e}")
 
-    sync_live_website_dashboard_async(push_to_git=True)
+    def _write_csv():
+        file_exists = os.path.isfile(JOURNAL_CSV_PATH)
+        try:
+            with open(JOURNAL_CSV_PATH, mode="a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=csv_cols)
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow({k: row[k] for k in csv_cols})
+        except Exception as e:
+            print(f"Journal Write Warning: {e}")
+
+    threading.Thread(target=_write_csv, daemon=True).start()
 
 # =====================================================================
-# 5. ULTRA-FAST PARALLEL DATA & TELEGRAM PHOTO ENGINE (ZERO DELAY)
+# 5. HIGH-SPEED PARALLEL DATA & TELEGRAM PHOTO ENGINE
 # =====================================================================
 def send_telegram_chat_action(action="upload_photo", target_chat_id=CHAT_ID):
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
@@ -458,7 +444,7 @@ def send_telegram_chat_action(action="upload_photo", target_chat_id=CHAT_ID):
         TELEGRAM_SESSION.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendChatAction",
             json={"chat_id": target_chat_id, "action": action},
-            timeout=2.0
+            timeout=1.5
         )
     except Exception:
         pass
@@ -471,26 +457,11 @@ def send_telegram_message(message, target_chat_id=CHAT_ID):
     payload = {"chat_id": target_chat_id, "text": message, "parse_mode": "HTML"}
     for attempt in range(2):
         try:
-            r = TELEGRAM_SESSION.post(url, json=payload, timeout=6) if attempt == 0 else requests.post(url, json=payload, timeout=8)
+            r = TELEGRAM_SESSION.post(url, json=payload, timeout=5) if attempt == 0 else requests.post(url, json=payload, timeout=7)
             if r.status_code == 200:
                 return
         except Exception as e:
             print(f"Telegram Send Error ({attempt}): {e}")
-
-def send_telegram_document(file_bytes, filename, caption_html="", target_chat_id=CHAT_ID):
-    if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
-        return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
-    mime_type = "text/html" if filename.endswith(".html") else "text/csv"
-    for attempt in range(2):
-        try:
-            files = {"document": (filename, file_bytes, mime_type)}
-            data  = {"chat_id": target_chat_id, "caption": caption_html[:950], "parse_mode": "HTML"}
-            r = TELEGRAM_SESSION.post(url, data=data, files=files, timeout=10) if attempt == 0 else requests.post(url, data=data, files=files, timeout=12)
-            if r.status_code == 200:
-                return
-        except Exception as e:
-            print(f"Document Send Warning ({attempt}): {e}")
 
 def format_price(price, decimals):
     return f"{price:.{decimals}f}"
@@ -505,7 +476,7 @@ def fetch_tradingview_live_candle_and_spot(tv_tickers, screener="cfd"):
     cols = ["close", "open|5", "high|5", "low|5", "close|5"]
     payload = {"symbols": {"tickers": tv_tickers, "query": {"types": []}}, "columns": cols}
     try:
-        res = HTTP_SESSION.post(url, json=payload, timeout=2.5)
+        res = HTTP_SESSION.post(url, json=payload, timeout=2.0)
         if res.status_code == 200:
             data = res.json().get("data", [])
             for item in data:
@@ -530,7 +501,7 @@ def fetch_binance_vision_ohlc(binance_symbol, interval_str="5m", limit=220):
     for base_url in ["https://data-api.binance.vision/api/v3/klines", "https://api.binance.com/api/v3/klines"]:
         params = {"symbol": binance_symbol, "interval": interval_str, "limit": limit}
         try:
-            r = HTTP_SESSION.get(base_url, params=params, timeout=3.5).json()
+            r = HTTP_SESSION.get(base_url, params=params, timeout=3.0).json()
             if isinstance(r, list) and len(r) >= 40:
                 df = pd.DataFrame(r, columns=["open_time", "Open", "High", "Low", "Close", "Volume", "close_time", "q_vol", "trades", "tb_base", "tb_quote", "ignore"])
                 df["Date"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
@@ -583,7 +554,7 @@ def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=True):
 
     if use_fast_cache and pair_name in ohlc_history_cache:
         cached = ohlc_history_cache[pair_name]
-        if (now_ts - cached["ts"]) <= 50.0 and cached.get("bucket_ts") == bucket_ts:
+        if (now_ts - cached["ts"]) <= 45.0 and cached.get("bucket_ts") == bucket_ts:
             raw_df_1h  = cached["raw_df_1h"].copy()
             raw_df_15m = cached["raw_df_15m"].copy()
             raw_df_5m  = cached["raw_df_5m"].copy()
@@ -677,7 +648,7 @@ def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=True):
     return df_1h, df_15m, df_5m, live_spot_price
 
 # =====================================================================
-# 6. PRE-SESSION KEY LEVELS & 1H CONTEXT ENGINE (VECTORIZED & FAST)
+# 6. PRE-SESSION KEY LEVELS & 1H CONTEXT ENGINE
 # =====================================================================
 def enrich_price_action_metrics(df):
     df = df.copy()
@@ -822,32 +793,148 @@ def extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, decimal
     }
 
 # =====================================================================
-# 7. ONE TESTED SETUP ENGINE: 15M SWEEP + 5M MSS + FVG/PULLBACK (PDF SEC 1)
+# 7. SETUP ENGINES: (A) 15M SWEEP + 5M MSS  |  (B) HTF PULLBACK TO OB/FVG AFTER BOS
 # =====================================================================
-def detect_5m_fvg_zone(df_5m, direction, lookback=6):
+def detect_5m_fvg_zone(df_5m, direction, lookback=8):
     n = len(df_5m)
-    if n < lookback + 3:
+    if n < lookback + 4:
         return None
-    for idx in range(n - 2, n - 2 - lookback, -1):
+    for idx in range(n - 2, max(2, n - 2 - lookback), -1):
         c_curr  = df_5m.iloc[idx]
         c_prev2 = df_5m.iloc[idx - 2]
         if direction == "BUY":
             gap_bot = float(c_prev2["High"])
             gap_top = float(c_curr["Low"])
             if gap_top > gap_bot:
-                return {"top": gap_top, "bot": gap_bot, "mid": (gap_top + gap_bot) / 2.0}
+                return {"top": gap_top, "bot": gap_bot, "mid": (gap_top + gap_bot) / 2.0, "x_idx": idx - 2}
         else:
             gap_top = float(c_prev2["Low"])
             gap_bot = float(c_curr["High"])
             if gap_top > gap_bot:
-                return {"top": gap_top, "bot": gap_bot, "mid": (gap_top + gap_bot) / 2.0}
+                return {"top": gap_top, "bot": gap_bot, "mid": (gap_top + gap_bot) / 2.0, "x_idx": idx - 2}
     return None
+
+def detect_5m_bos_and_order_block(df_5m, direction, decimals):
+    """
+    Detects recent 5M Break of Structure (BOS) and the origin Order Block (OB) + FVG
+    for HTF-aligned pullback entries.
+    """
+    n = len(df_5m)
+    if n < 14:
+        return None
+
+    highs = df_5m["High"].values.astype(float)
+    lows  = df_5m["Low"].values.astype(float)
+    opens = df_5m["Open"].values.astype(float)
+    close_last = float(df_5m.iloc[-2]["Close"])
+
+    if direction == "BUY":
+        # Look for recent swing high broken by a closed candle (Bullish BOS)
+        best_bos = None
+        for b_idx in range(n - 2, max(5, n - 14), -1):
+            prior_high = float(np.max(highs[max(0, b_idx - 7):b_idx - 1]))
+            if float(highs[b_idx]) > prior_high and float(df_5m.iloc[b_idx]["Close"]) > prior_high:
+                # Find last bearish candle before the bullish impulse
+                ob_idx = None
+                for k in range(b_idx - 1, max(0, b_idx - 7), -1):
+                    if float(df_5m.iloc[k]["Close"]) < opens[k]:
+                        ob_idx = k
+                        break
+                if ob_idx is not None:
+                    ob_top = round(float(max(opens[ob_idx], float(df_5m.iloc[ob_idx]["Close"]), highs[ob_idx])), decimals)
+                    ob_bot = round(float(lows[ob_idx]), decimals)
+                    best_bos = {
+                        "bos_price": round(prior_high, decimals),
+                        "bos_x": b_idx,
+                        "ob": {"top": ob_top, "bot": ob_bot, "mid": round((ob_top + ob_bot) / 2.0, decimals), "x_idx": ob_idx}
+                    }
+                    break
+        if not best_bos:
+            return None
+        fvg = detect_5m_fvg_zone(df_5m, "BUY", lookback=8)
+        zone = best_bos["ob"]
+        # Check pullback into OB or FVG zone
+        in_ob  = (close_last <= zone["top"] * 1.0005) and (close_last >= zone["bot"] * 0.9985)
+        in_fvg = (fvg is not None) and (close_last <= fvg["top"]) and (close_last >= fvg["bot"])
+        if in_ob or in_fvg:
+            return {
+                "bos_price": best_bos["bos_price"],
+                "bos_x": best_bos["bos_x"],
+                "ob_zone": best_bos["ob"],
+                "fvg_zone": fvg,
+                "active_zone": fvg if (in_fvg and not in_ob) else best_bos["ob"],
+                "zone_name": "5M FVG" if (in_fvg and not in_ob) else "5M Bullish OB"
+            }
+        return None
+
+    else:
+        best_bos = None
+        for b_idx in range(n - 2, max(5, n - 14), -1):
+            prior_low = float(np.min(lows[max(0, b_idx - 7):b_idx - 1]))
+            if float(lows[b_idx]) < prior_low and float(df_5m.iloc[b_idx]["Close"]) < prior_low:
+                ob_idx = None
+                for k in range(b_idx - 1, max(0, b_idx - 7), -1):
+                    if float(df_5m.iloc[k]["Close"]) > opens[k]:
+                        ob_idx = k
+                        break
+                if ob_idx is not None:
+                    ob_bot = round(float(min(opens[ob_idx], float(df_5m.iloc[ob_idx]["Close"]), lows[ob_idx])), decimals)
+                    ob_top = round(float(highs[ob_idx]), decimals)
+                    best_bos = {
+                        "bos_price": round(prior_low, decimals),
+                        "bos_x": b_idx,
+                        "ob": {"top": ob_top, "bot": ob_bot, "mid": round((ob_top + ob_bot) / 2.0, decimals), "x_idx": ob_idx}
+                    }
+                    break
+        if not best_bos:
+            return None
+        fvg = detect_5m_fvg_zone(df_5m, "SELL", lookback=8)
+        zone = best_bos["ob"]
+        in_ob  = (close_last >= zone["bot"] * 0.9995) and (close_last <= zone["top"] * 1.0015)
+        in_fvg = (fvg is not None) and (close_last >= fvg["bot"]) and (close_last <= fvg["top"])
+        if in_ob or in_fvg:
+            return {
+                "bos_price": best_bos["bos_price"],
+                "bos_x": best_bos["bos_x"],
+                "ob_zone": best_bos["ob"],
+                "fvg_zone": fvg,
+                "active_zone": fvg if (in_fvg and not in_ob) else best_bos["ob"],
+                "zone_name": "5M FVG" if (in_fvg and not in_ob) else "5M Bearish OB"
+            }
+        return None
+
+def check_sweep_proximity_radar(pair_name, info, roadmap, live_spot, atr_5m):
+    if roadmap["h1_bias"] == "RANGING" or atr_5m <= 0:
+        return
+    ny_ok, _, _, _ = get_active_sessions_info()
+    if not ny_ok:
+        return
+    if pending_pre_alerts.get(pair_name) is not None:
+        return
+
+    prox_band = atr_5m * 0.35
+    for lv in roadmap["levels"]:
+        aligned = (roadmap["h1_bias"] == "BULLISH" and lv["type"] == "LOW_POOL") or \
+                  (roadmap["h1_bias"] == "BEARISH" and lv["type"] == "HIGH_POOL")
+        if not aligned:
+            continue
+        if abs(live_spot - lv["price"]) <= prox_band:
+            radar_key = f"{lv['short']}_{lv['price']}"
+            if last_radar_key.get(pair_name) != radar_key:
+                last_radar_key[pair_name] = radar_key
+                dec = info["decimals"]
+                send_telegram_message(
+                    f"📡 <b>SWEEP RADAR — {info['mt5_name']} APPROACHING LEVEL</b>\n"
+                    f"🧭 <b>1H Bias:</b> <b>{roadmap['h1_bias']}</b> | 🧲 <b>Level:</b> <b>{lv['short']} (<code>{format_price(lv['price'], dec)}</code>)</b>\n"
+                    f"📍 <b>Live Price:</b> <code>{format_price(live_spot, dec)}</code> — Watch for sweep + MSS or BOS pullback."
+                )
+            break
 
 def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot, ignore_locks=False, return_skip_reason=False):
     if not ignore_locks:
-        ny_ok, _, _, _ = get_ny_session_status()
-        if not ny_ok:
-            return (None, "OUTSIDE_NY_SESSION") if return_skip_reason else None
+        sess_ok, _, _, _ = get_active_sessions_info()
+        if not sess_ok:
+            return (None, "OUTSIDE_ACTIVE_SESSION") if return_skip_reason else None
         news_ok, _ = check_news_window_for_pair(info)
         if not news_ok:
             return (None, "HIGH_IMPACT_NEWS") if return_skip_reason else None
@@ -872,6 +959,9 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
     h1_bias = roadmap["h1_bias"]
     levels  = roadmap["levels"]
 
+    if not ignore_locks:
+        check_sweep_proximity_radar(pair_name, info, roadmap, live_spot, atr_5m)
+
     if h1_bias == "RANGING" and not ignore_locks:
         return (None, "1H_RANGING_CHOPPY") if return_skip_reason else None
 
@@ -889,13 +979,15 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
     skipped_for_risk = False
     buf_5m = round(max(atr_5m * 0.12, info["spread_and_cost"] * 0.5), dec)
 
+    # -----------------------------------------------------------------
+    # STRATEGY A: 15M LIQUIDITY SWEEP + 5M MSS + FVG
+    # -----------------------------------------------------------------
     for lv in levels:
         lvl_price = lv["price"]
         lvl_name  = lv["name"]
         lvl_short = lv["short"]
         lvl_type  = lv["type"]
 
-        # BULLISH SETUP (1H BULLISH + LOW_POOL SWEEP + 5M MSS UP)
         if (h1_bias == "BULLISH" or ignore_locks) and lvl_type == "LOW_POOL":
             m15_min_low    = float(m15_recent["Low"].min())
             m15_last_close = float(m15_c0["Close"])
@@ -923,6 +1015,10 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
 
                 if mss_body_confirmed or mss_pre_forming:
                     fvg_zone = detect_5m_fvg_zone(df_5m, "BUY", lookback=5)
+                    ob_info  = detect_5m_bos_and_order_block(df_5m, "BUY", dec)
+                    ob_zone  = ob_info["ob_zone"] if ob_info else None
+                    bos_line = ob_info["bos_price"] if ob_info else round(mss_neck_high, dec)
+
                     if mss_body_confirmed:
                         entry_spot = round(p_close, dec)
                         mss_desc   = "5M Bullish MSS Body Close + FVG" if fvg_zone else "5M Bullish MSS Body Close"
@@ -969,16 +1065,17 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
                             "planned_risk_usd": planned_risk_usd,
                             "cost_usd": cost_usd,
                             "fvg_zone": fvg_zone,
+                            "ob_zone": ob_zone,
+                            "bos_line": bos_line,
                             "rr": PRIMARY_RR_TARGET,
                             "score": 90 if mss_body_confirmed else 84,
                             "why_text": (
                                 f"1️⃣ <b>1H Context:</b> <b>{h1_bias}</b> structure aligned.\n"
                                 f"2️⃣ <b>15M Level Sweep:</b> Swept <b>{lvl_name} (<code>{format_price(lvl_price, dec)}</code>)</b> and closed back above.\n"
-                                f"3️⃣ <b>5M Confirmation:</b> <b>{mss_desc}</b> with invalidation SL below sweep low (<code>{format_price(invalidation_sl, dec)}</code>)."
+                                f"3️⃣ <b>5M Confirmation:</b> <b>{mss_desc}</b> with SL below sweep low (<code>{format_price(invalidation_sl, dec)}</code>)."
                             )
                         })
 
-        # BEARISH SETUP (1H BEARISH + HIGH_POOL SWEEP + 5M MSS DOWN)
         if (h1_bias == "BEARISH" or ignore_locks) and lvl_type == "HIGH_POOL":
             m15_max_high   = float(m15_recent["High"].max())
             m15_last_close = float(m15_c0["Close"])
@@ -1006,6 +1103,10 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
 
                 if mss_body_confirmed or mss_pre_forming:
                     fvg_zone = detect_5m_fvg_zone(df_5m, "SELL", lookback=5)
+                    ob_info  = detect_5m_bos_and_order_block(df_5m, "SELL", dec)
+                    ob_zone  = ob_info["ob_zone"] if ob_info else None
+                    bos_line = ob_info["bos_price"] if ob_info else round(mss_neck_low, dec)
+
                     if mss_body_confirmed:
                         entry_spot = round(p_close, dec)
                         mss_desc   = "5M Bearish MSS Body Close + FVG" if fvg_zone else "5M Bearish MSS Body Close"
@@ -1052,14 +1153,117 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
                             "planned_risk_usd": planned_risk_usd,
                             "cost_usd": cost_usd,
                             "fvg_zone": fvg_zone,
+                            "ob_zone": ob_zone,
+                            "bos_line": bos_line,
                             "rr": PRIMARY_RR_TARGET,
                             "score": 90 if mss_body_confirmed else 84,
                             "why_text": (
                                 f"1️⃣ <b>1H Context:</b> <b>{h1_bias}</b> structure aligned.\n"
                                 f"2️⃣ <b>15M Level Sweep:</b> Swept <b>{lvl_name} (<code>{format_price(lvl_price, dec)}</code>)</b> and closed back below.\n"
-                                f"3️⃣ <b>5M Confirmation:</b> <b>{mss_desc}</b> with invalidation SL above sweep high (<code>{format_price(invalidation_sl, dec)}</code>)."
+                                f"3️⃣ <b>5M Confirmation:</b> <b>{mss_desc}</b> with SL above sweep high (<code>{format_price(invalidation_sl, dec)}</code>)."
                             )
                         })
+
+    # -----------------------------------------------------------------
+    # STRATEGY B: HTF PULLBACK TO ORDER BLOCK / FVG AFTER 5M BOS
+    # -----------------------------------------------------------------
+    if h1_bias in ["BULLISH", "BEARISH"]:
+        pb_info = detect_5m_bos_and_order_block(df_5m, "BUY" if h1_bias == "BULLISH" else "SELL", dec)
+        if pb_info is not None:
+            az = pb_info["active_zone"]
+            ob_z = pb_info["ob_zone"]
+            fvg_z = pb_info["fvg_zone"]
+            if h1_bias == "BULLISH" and p_close > p_open and close_p >= 0.55:
+                entry_spot = round(p_close, dec)
+                invalidation_sl = round(min(float(df_5m.iloc[-6:-1]["Low"].min()), az["bot"]) - (atr_5m * 0.20), dec)
+                sl_dist = round(abs(entry_spot - invalidation_sl), dec)
+                if sl_dist < info["min_sl_dist"]:
+                    sl_dist = info["min_sl_dist"]
+                    invalidation_sl = round(entry_spot - sl_dist, dec)
+                lot_size, planned_risk_usd, cost_usd = calculate_roadmap_position_size(pair_name, info, sl_dist, RISK_PER_TRADE_USD)
+                if lot_size is None or sl_dist > info["max_sl_dist"]:
+                    skipped_for_risk = True
+                else:
+                    tp1_price = round(entry_spot + (sl_dist * BREAKEVEN_LOCK_R), dec)
+                    tp2_price = round(entry_spot + (sl_dist * PRIMARY_RR_TARGET), dec)
+                    candidates.append({
+                        "stage": "CONFIRMED_BREAKOUT",
+                        "direction": "BUY",
+                        "action": "BUY (LONG) 🟢",
+                        "h1_bias": h1_bias,
+                        "swept_level_name": f"5M BOS ({format_price(pb_info['bos_price'], dec)}) ➔ {pb_info['zone_name']}",
+                        "swept_level_short": f"BOS➔{pb_info['zone_name']}",
+                        "swept_level_price": pb_info["bos_price"],
+                        "mss_confirmation": f"HTF Pullback to {pb_info['zone_name']} After 5M BOS",
+                        "short_tag": f"1H BULL + 5M BOS + {pb_info['zone_name']}",
+                        "setup_id": f"BOS_PB_BUY_{pb_info['bos_price']}",
+                        "entry_spot": entry_spot,
+                        "sl_price": invalidation_sl,
+                        "sl_dist": sl_dist,
+                        "lock_level": tp1_price,
+                        "tp1_price": tp1_price,
+                        "tp2_price": tp2_price,
+                        "tp2_dist": round(sl_dist * PRIMARY_RR_TARGET, dec),
+                        "lot_size": lot_size,
+                        "planned_risk_usd": planned_risk_usd,
+                        "cost_usd": cost_usd,
+                        "fvg_zone": fvg_z,
+                        "ob_zone": ob_z,
+                        "bos_line": pb_info["bos_price"],
+                        "rr": PRIMARY_RR_TARGET,
+                        "score": 88,
+                        "why_text": (
+                            f"1️⃣ <b>1H Context:</b> <b>BULLISH</b> trend aligned.\n"
+                            f"2️⃣ <b>5M BOS:</b> Broke structure above <code>{format_price(pb_info['bos_price'], dec)}</code>.\n"
+                            f"3️⃣ <b>Pullback Entry:</b> Rejected from <b>{pb_info['zone_name']}</b> with SL at <code>{format_price(invalidation_sl, dec)}</code>."
+                        )
+                    })
+
+            elif h1_bias == "BEARISH" and p_close < p_open and close_p <= 0.45:
+                entry_spot = round(p_close, dec)
+                invalidation_sl = round(max(float(df_5m.iloc[-6:-1]["High"].max()), az["top"]) + (atr_5m * 0.20), dec)
+                sl_dist = round(abs(invalidation_sl - entry_spot), dec)
+                if sl_dist < info["min_sl_dist"]:
+                    sl_dist = info["min_sl_dist"]
+                    invalidation_sl = round(entry_spot + sl_dist, dec)
+                lot_size, planned_risk_usd, cost_usd = calculate_roadmap_position_size(pair_name, info, sl_dist, RISK_PER_TRADE_USD)
+                if lot_size is None or sl_dist > info["max_sl_dist"]:
+                    skipped_for_risk = True
+                else:
+                    tp1_price = round(entry_spot - (sl_dist * BREAKEVEN_LOCK_R), dec)
+                    tp2_price = round(entry_spot - (sl_dist * PRIMARY_RR_TARGET), dec)
+                    candidates.append({
+                        "stage": "CONFIRMED_BREAKOUT",
+                        "direction": "SELL",
+                        "action": "SELL (SHORT) 🔴",
+                        "h1_bias": h1_bias,
+                        "swept_level_name": f"5M BOS ({format_price(pb_info['bos_price'], dec)}) ➔ {pb_info['zone_name']}",
+                        "swept_level_short": f"BOS➔{pb_info['zone_name']}",
+                        "swept_level_price": pb_info["bos_price"],
+                        "mss_confirmation": f"HTF Pullback to {pb_info['zone_name']} After 5M BOS",
+                        "short_tag": f"1H BEAR + 5M BOS + {pb_info['zone_name']}",
+                        "setup_id": f"BOS_PB_SELL_{pb_info['bos_price']}",
+                        "entry_spot": entry_spot,
+                        "sl_price": invalidation_sl,
+                        "sl_dist": sl_dist,
+                        "lock_level": tp1_price,
+                        "tp1_price": tp1_price,
+                        "tp2_price": tp2_price,
+                        "tp2_dist": round(sl_dist * PRIMARY_RR_TARGET, dec),
+                        "lot_size": lot_size,
+                        "planned_risk_usd": planned_risk_usd,
+                        "cost_usd": cost_usd,
+                        "fvg_zone": fvg_z,
+                        "ob_zone": ob_z,
+                        "bos_line": pb_info["bos_price"],
+                        "rr": PRIMARY_RR_TARGET,
+                        "score": 88,
+                        "why_text": (
+                            f"1️⃣ <b>1H Context:</b> <b>BEARISH</b> trend aligned.\n"
+                            f"2️⃣ <b>5M BOS:</b> Broke structure below <code>{format_price(pb_info['bos_price'], dec)}</code>.\n"
+                            f"3️⃣ <b>Pullback Entry:</b> Rejected from <b>{pb_info['zone_name']}</b> with SL at <code>{format_price(invalidation_sl, dec)}</code>."
+                        )
+                    })
 
     if not candidates:
         reason = "SKIPPED_SL_EXCEEDS_12_50_RISK" if skipped_for_risk else "NO_SETUP"
@@ -1133,25 +1337,14 @@ def compute_stage6_metrics(trades_list):
     max_dd_pct = (max_dd / STARTING_CAPITAL_USD) * 100.0
 
     return {
-        "total": total,
-        "wins": win_cnt,
-        "losses": loss_cnt,
-        "breakevens": be_cnt,
-        "win_rate": round(win_rate, 1),
-        "decisive_wr": round(decisive_wr, 1),
-        "non_loss_rate": round(non_loss_rate, 1),
-        "avg_win_usd": round(avg_win_usd, 2),
-        "avg_loss_usd": round(avg_loss_usd, 2),
-        "avg_r": round(avg_r, 2),
-        "expectancy_usd": round(expectancy_usd, 2),
-        "profit_factor": round(profit_factor, 2),
-        "net_pnl_usd": round(net_pnl_usd, 2),
-        "total_costs_usd": round(total_costs, 2),
-        "max_dd_usd": round(max_dd, 2),
-        "max_dd_pct": round(max_dd_pct, 2),
-        "final_equity": round(curr_eq, 2),
-        "equity_curve": eq_curve,
-        "dd_curve": dd_curve
+        "total": total, "wins": win_cnt, "losses": loss_cnt, "breakevens": be_cnt,
+        "win_rate": round(win_rate, 1), "decisive_wr": round(decisive_wr, 1),
+        "non_loss_rate": round(non_loss_rate, 1), "avg_win_usd": round(avg_win_usd, 2),
+        "avg_loss_usd": round(avg_loss_usd, 2), "avg_r": round(avg_r, 2),
+        "expectancy_usd": round(expectancy_usd, 2), "profit_factor": round(profit_factor, 2),
+        "net_pnl_usd": round(net_pnl_usd, 2), "total_costs_usd": round(total_costs, 2),
+        "max_dd_usd": round(max_dd, 2), "max_dd_pct": round(max_dd_pct, 2),
+        "final_equity": round(curr_eq, 2), "equity_curve": eq_curve, "dd_curve": dd_curve
     }
 
 def compute_day_wise_breakdown(trades_list):
@@ -1167,221 +1360,23 @@ def compute_day_wise_breakdown(trades_list):
         avg_r    = round(sum(t["result_r"] for t in d_trades) / len(d_trades), 2) if d_trades else 0.0
 
         day_stats[d_idx] = {
-            "day_name": WEEKDAY_NAMES[d_idx],
-            "day_short": WEEKDAY_SHORT[d_idx],
-            "total": len(d_trades),
-            "wins": wins,
-            "breakevens": bes,
-            "losses": losses,
-            "wr": round(wr_pct, 0),
-            "avg_r": avg_r,
-            "net_pnl": net_pnl
+            "day_name": WEEKDAY_NAMES[d_idx], "day_short": WEEKDAY_SHORT[d_idx],
+            "total": len(d_trades), "wins": wins, "breakevens": bes, "losses": losses,
+            "wr": round(wr_pct, 0), "avg_r": avg_r, "net_pnl": net_pnl
         }
 
     active_weekdays = [day_stats[i] for i in range(5) if day_stats[i]["total"] > 0]
     best_day  = max(active_weekdays, key=lambda x: x["net_pnl"]) if active_weekdays else None
     worst_day = min(active_weekdays, key=lambda x: x["net_pnl"]) if active_weekdays else None
 
-    return {
-        "days": day_stats,
-        "best_day": best_day,
-        "worst_day": worst_day
-    }
+    return {"days": day_stats, "best_day": best_day, "worst_day": worst_day}
 
 # =====================================================================
-# 9. LIVE-ONLY WEBSITE DASHBOARD ENGINE (0-START)
-# =====================================================================
-def sync_live_website_dashboard(push_to_git=True):
-    bal, eq, day_pnl, week_pnl = get_live_account_metrics()
-    dd_used = max(STARTING_CAPITAL_USD, HIGH_WATER_MARK_USD) - min(bal, eq)
-
-    live_trades_list = [
-        {"net_pnl": r["numeric_pnl"], "result_r": r["numeric_r"], "cost_usd": r["cost_usd"], "weekday_idx": r.get("weekday_idx", 0)}
-        for r in journal_memory_log
-    ]
-    live_stats = compute_stage6_metrics(live_trades_list)
-    live_days  = compute_day_wise_breakdown(live_trades_list)
-
-    running_list = [
-        {
-            "market": t["mt5_name"], "direction": t["direction"], "entry": t["entry"],
-            "sl": t["sl"], "tp": t["target"], "lot": t["lot_size"], "risk": t["max_risk"],
-            "swept": t.get("swept_level_name", ""), "trailed": t.get("trailed_to_cost", False)
-        }
-        for t in daily_trades_log if t.get("is_open")
-    ]
-
-    state_payload = {
-        "updated_at": get_ist_now().strftime("%Y-%m-%d %I:%M:%S %p IST"),
-        "saved_ist_date": str(get_ist_now().date()),
-        "saved_iso_week": get_ist_now().isocalendar()[1],
-        "total_account_pnl": round(total_account_pnl, 2),
-        "balance": round(bal, 2),
-        "equity": round(eq, 2),
-        "peak_equity": round(HIGH_WATER_MARK_USD, 2),
-        "day_pnl": round(day_pnl, 2),
-        "week_pnl": round(week_pnl, 2),
-        "dd_used": round(dd_used, 2),
-        "trades_today": trades_today,
-        "losses_today": losses_today,
-        "raw_journal_memory": journal_memory_log
-    }
-
-    try:
-        with open(STATE_JSON_PATH, "w", encoding="utf-8") as jf:
-            json.dump(state_payload, jf, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"State Save Warning: {e}")
-
-    running_html = ""
-    for rt in running_list:
-        be_badge = "🛡️ SL AT BREAKEVEN" if rt["trailed"] else "⚡ LIVE IN MARKET"
-        running_html += (
-            f"<div class='run-card'>🟢 <b>{rt['market']} ({rt['direction']}) — {be_badge}</b><br>"
-            f"Swept Level: <b>{rt['swept']}</b> | Lot: <b>{rt['lot']} Lot</b> | "
-            f"Entry: <code>{rt['entry']}</code> | SL: <code>{rt['sl']}</code> | 1:2 TP: <code>{rt['tp']}</code> | Planned Risk: <b>${rt['risk']:.2f}</b></div>"
-        )
-    if not running_html:
-        running_html = "<div class='run-empty'>⏸️ अभी कोई लाइव ट्रेड चालू नहीं है — जैसे ही बॉट टेलीग्राम पर नया सिग्नल देगा, वह अपने-आप यहाँ दिखेगा।</div>"
-
-    live_day_cards = ""
-    for d_i in range(5):
-        ds = live_days["days"][d_i]
-        d_col = "#10b981" if ds["net_pnl"] > 0 else ("#ef4444" if ds["net_pnl"] < 0 else "#94a3b8")
-        live_day_cards += (
-            f"<div class='card'><div class='lbl'>{ds['day_name']} (Live)</div>"
-            f"<div class='val' style='color:{d_col}'>${ds['net_pnl']:+.2f}</div>"
-            f"<div class='sub'>Trades: {ds['total']} (W:{ds['wins']} | BE:{ds['breakevens']} | L:{ds['losses']}) · WR: {ds['wr']:.0f}%</div></div>"
-        )
-
-    journal_rows_html = ""
-    for idx, r in enumerate(reversed(journal_memory_log), 1):
-        res_str = r["Result (R)"]
-        res_col = "#10b981" if "+" in res_str else ("#ef4444" if "-" in res_str else "#3b82f6")
-        journal_rows_html += (
-            f"<tr><td>#{idx}</td><td>{r['Date / time']}<br><small>{r.get('Day', '')}</small></td>"
-            f"<td><b>{r['Market']}</b></td><td>{r['1H bias']}</td><td>{r['Level / sweep']}</td>"
-            f"<td>{r['5M confirmation']}</td><td><code>{r['Entry / SL / TP']}</code></td><td>{r['Risk $']}</td>"
-            f"<td style='color:{res_col};font-weight:700;'>{res_str}</td></tr>"
-        )
-    if not journal_rows_html:
-        journal_rows_html = "<tr><td colspan='9' style='text-align:center;color:#94a3b8;padding:22px;'>अभी आपके लाइव अकाउंट में 0 ट्रेड्स हैं ($5,000.00 Start) — जैसे ही बॉट टेलीग्राम पर ट्रेड देगा और वह पूरी होगी, यहाँ अपने-आप जुड़ जाएगी।</td></tr>"
-
-    html_content = f"""<!DOCTYPE html>
-<html lang="hi">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="refresh" content="45">
-<title>$5,000 Funded Bot — Live Account & Journal</title>
-<style>
-  body {{ margin:0; font-family: system-ui, -apple-system, sans-serif; background:#0b0f17; color:#f8fafc; padding:14px; }}
-  .wrap {{ max-width:1200px; margin:0 auto; }}
-  .hdr {{ display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; background:#111827; padding:14px 18px; border-radius:12px; border:1px solid #1e293b; margin-bottom:14px; }}
-  .hdr h1 {{ margin:0; font-size:17px; color:#f8fafc; }}
-  .badge {{ background:#064e3b; color:#34d399; padding:5px 10px; border-radius:8px; font-size:11.5px; font-weight:700; }}
-  .grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:11px; margin-bottom:14px; }}
-  .card {{ background:#111827; border:1px solid #1e293b; padding:13px; border-radius:10px; }}
-  .lbl {{ font-size:11.5px; color:#94a3b8; margin-bottom:5px; }}
-  .val {{ font-size:20px; font-weight:800; font-family:monospace; }}
-  .sub {{ font-size:11px; color:#64748b; margin-top:4px; }}
-  .sec-title {{ font-size:14.5px; font-weight:700; margin:16px 0 9px; color:#e2e8f0; border-left:4px solid #3b82f6; padding-left:10px; }}
-  .run-card {{ background:#064e3b; border:1px solid #10b981; color:#ecfdf5; padding:12px; border-radius:9px; margin-bottom:8px; font-size:13px; line-height:1.5; }}
-  .run-empty {{ background:#111827; border:1px dashed #334155; color:#94a3b8; padding:13px; border-radius:9px; font-size:13px; }}
-  .tbl-wrap {{ overflow-x:auto; background:#111827; border:1px solid #1e293b; border-radius:10px; }}
-  table {{ width:100%; border-collapse:collapse; font-size:12.2px; }}
-  th, td {{ padding:9px 11px; text-align:left; border-bottom:1px solid #1e293b; }}
-  th {{ background:#1e293b; color:#cbd5e1; font-weight:700; }}
-  code {{ background:#0f172a; padding:2px 5px; border-radius:4px; color:#93c5fd; }}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="hdr">
-    <div>
-      <h1>🛡️ $5,000 Two-Step Funded Account — Live Tracker (0-Start)</h1>
-      <div style="font-size:11.5px;color:#94a3b8;margin-top:3px;">Last Bot Sync: <b>{state_payload['updated_at']}</b> · Tracks Only Live Telegram Bot Trades</div>
-    </div>
-    <span class="badge">● LIVE ACCOUNT SYNCED</span>
-  </div>
-
-  <div class="grid">
-    <div class="card">
-      <div class="lbl">Live Account Balance / Equity</div>
-      <div class="val" style="color:{'#10b981' if eq >= 5000 else '#ef4444'}">${bal:,.2f} / ${eq:,.2f}</div>
-      <div class="sub">Start: $5,000.00 | Peak: ${HIGH_WATER_MARK_USD:,.2f}</div>
-    </div>
-    <div class="card">
-      <div class="lbl">Today's PnL (Stop Limit: -$25.00)</div>
-      <div class="val" style="color:{'#10b981' if day_pnl >= 0 else '#ef4444'}">${day_pnl:+.2f}</div>
-      <div class="sub">Trades Today: {trades_today}/2 | Losses Today: {losses_today}/2</div>
-    </div>
-    <div class="card">
-      <div class="lbl">Weekly PnL (Stop Limit: -$75.00)</div>
-      <div class="val" style="color:{'#10b981' if week_pnl >= 0 else '#ef4444'}">${week_pnl:+.2f}</div>
-      <div class="sub">Max Drawdown Used: ${dd_used:.2f} / $100.00</div>
-    </div>
-    <div class="card">
-      <div class="lbl">Live Bot Trades & Win Rate</div>
-      <div class="val" style="color:#3b82f6">{live_stats['total']} Trades ({live_stats['decisive_wr']:.0f}% WR)</div>
-      <div class="sub">Wins (+2R): {live_stats['wins']} | BE (0R): {live_stats['breakevens']} | Loss (-1R): {live_stats['losses']}</div>
-    </div>
-    <div class="card">
-      <div class="lbl">Live Profit Factor & Expectancy</div>
-      <div class="val" style="color:#f59e0b">PF: {live_stats['profit_factor']:.2f}</div>
-      <div class="sub">Expectancy: ${live_stats['expectancy_usd']:+.2f}/trade ({live_stats['avg_r']:+.2f}R)</div>
-    </div>
-  </div>
-
-  <div class="sec-title">⚡ Active Running Trade (Live from Telegram Bot)</div>
-  {running_html}
-
-  <div class="sec-title">📅 My Live Day-Wise Performance (Monday – Friday)</div>
-  <div class="grid">{live_day_cards}</div>
-
-  <div class="sec-title">📒 Auto-Recorded 9-Column Trading Journal ({live_stats['total']} Completed Live Trades)</div>
-  <div class="tbl-wrap">
-    <table>
-      <thead>
-        <tr><th>#</th><th>Date / Day</th><th>Market</th><th>1H Bias</th><th>15M Level Swept</th><th>5M Confirm</th><th>Entry / SL / TP</th><th>Risk $</th><th>Result (R & $)</th></tr>
-      </thead>
-      <tbody>{journal_rows_html}</tbody>
-    </table>
-  </div>
-</div>
-</body>
-</html>"""
-
-    try:
-        with open(WEB_DASHBOARD_PATH, "w", encoding="utf-8") as hf:
-            hf.write(html_content)
-    except Exception as e:
-        print(f"HTML Write Warning: {e}")
-
-    if push_to_git and os.getenv("GITHUB_ACTIONS", "").lower() == "true":
-        try:
-            subprocess.run(["git", "config", "user.name", "ForexBotAutoSync"], check=False)
-            subprocess.run(["git", "config", "user.email", "bot@users.noreply.github.com"], check=False)
-            files_to_add = [WEB_DASHBOARD_PATH, STATE_JSON_PATH]
-            if os.path.isfile(JOURNAL_CSV_PATH):
-                files_to_add.append(JOURNAL_CSV_PATH)
-            subprocess.run(["git", "add"] + files_to_add, check=False)
-            subprocess.run(["git", "commit", "-m", "Auto-sync live trade dashboard [skip ci]"], check=False)
-            subprocess.run(["git", "push"], check=False)
-        except Exception as e:
-            print(f"Git Auto-Push Info: {e}")
-
-    return html_content.encode("utf-8")
-
-def sync_live_website_dashboard_async(push_to_git=True):
-    threading.Thread(target=sync_live_website_dashboard, kwargs={"push_to_git": push_to_git}, daemon=True).start()
-
-# =====================================================================
-# 10. FAST VISUAL CHARTS & 0-START /backtest REPORT (LIVE TRADES ONLY)
+# 9. HIGH-SPEED CHARTS (WITH BOS, FVG & OB MARKINGS) & TELEGRAM REPORTS
 # =====================================================================
 def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, day_breakdown):
     try:
-        fig = plt.figure(figsize=(11.5, 6.5), dpi=105, facecolor="#ffffff")
+        fig = plt.figure(figsize=(11.0, 6.2), dpi=100, facecolor="#ffffff")
 
         ax1 = fig.add_axes([0.06, 0.50, 0.90, 0.41], facecolor="#ffffff")
         eq_curve = combined_stats["equity_curve"]
@@ -1473,7 +1468,7 @@ def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, 
             ax3.text(b.get_x() + b.get_width() / 2.0, h_v + 0.05, str(h_v), ha="center", va="bottom", fontsize=8.0, fontweight="bold", color="#131722")
 
         buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=105, facecolor="#ffffff")
+        plt.savefig(buf, format="png", dpi=100, facecolor="#ffffff")
         plt.close(fig)
         buf.seek(0)
         return buf
@@ -1482,39 +1477,27 @@ def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, 
         return None
 
 def run_and_send_master_backtest_report(target_pair=None):
-    """
-    100% ZERO-START REPORT (/backtest, /report, /days):
-    Does NOT load any old historical candles! Starts cleanly at 0 trades ($5,000.00) and only counts
-    real live trades taken by the bot after the code starts running (resets to 0 on /reset).
-    """
     send_telegram_chat_action("upload_photo")
 
-    xau_trades = []
-    btc_trades = []
+    xau_trades, btc_trades, all_trades = [], [], []
     for r in journal_memory_log:
+        mkt = r.get("Market", "")
+        if target_pair == "XAU/USD" and mkt != "XAUUSD":
+            continue
+        if target_pair == "BTC/USD" and mkt != "BTCUSD":
+            continue
         t_obj = {
-            "market": r.get("Market", ""),
+            "market": mkt,
             "weekday_idx": int(r.get("weekday_idx", 0)),
             "result_r": float(r.get("numeric_r", 0.0)),
             "net_pnl": float(r.get("numeric_pnl", 0.0)),
             "cost_usd": float(r.get("cost_usd", 0.35))
         }
-        if t_obj["market"] == "XAUUSD" and target_pair in [None, "XAU/USD"]:
+        all_trades.append(t_obj)
+        if mkt == "XAUUSD":
             xau_trades.append(t_obj)
-        elif t_obj["market"] == "BTCUSD" and target_pair in [None, "BTC/USD"]:
+        elif mkt == "BTCUSD":
             btc_trades.append(t_obj)
-
-    all_trades = [
-        {
-            "market": r.get("Market", ""),
-            "weekday_idx": int(r.get("weekday_idx", 0)),
-            "result_r": float(r.get("numeric_r", 0.0)),
-            "net_pnl": float(r.get("numeric_pnl", 0.0)),
-            "cost_usd": float(r.get("cost_usd", 0.35))
-        }
-        for r in journal_memory_log
-        if (target_pair is None) or (target_pair == "XAU/USD" and r.get("Market") == "XAUUSD") or (target_pair == "BTC/USD" and r.get("Market") == "BTCUSD")
-    ]
 
     comb_stats    = compute_stage6_metrics(all_trades)
     xau_stats     = compute_stage6_metrics(xau_trades)
@@ -1528,13 +1511,13 @@ def run_and_send_master_backtest_report(target_pair=None):
         day_lines += f"{icon} <b>{ds['day_name']}:</b> {ds['total']} trades | WR: <b>{ds['wr']:.0f}%</b> | Net: <b><code>${ds['net_pnl']:+.2f}</code></b>\n"
 
     status_note = (
-        "✨ <i>0-Start Active: Only trades taken AFTER bot start are recorded here (0 old trades).</i>"
+        "✨ <i>0-Start Active: Only live trades taken AFTER bot start appear here (0 old trades).</i>"
         if comb_stats["total"] == 0 else
         f"✅ <i>Live Forward-Test Record: {comb_stats['total']} completed trades since 0-Start.</i>"
     )
 
     msg = (
-        f"📊 <b>0-START LIVE BACKTEST & DAY-WISE REPORT</b>\n"
+        f"📊 <b>0-START LIVE BACKTEST & DAY-WISE REPORT (TELEGRAM)</b>\n"
         f"{status_note}\n\n"
         f"💰 <b>Account Equity:</b> <code>$5,000.00</code> ➔ <b><code>${comb_stats['final_equity']:,.2f}</code></b> (Net: <b><code>${comb_stats['net_pnl_usd']:+.2f}</code></b>)\n"
         f"🏆 <b>Total Trades:</b> <b>{comb_stats['total']}</b> (Wins: <b>{comb_stats['wins']}</b> | BE: <b>{comb_stats['breakevens']}</b> | Losses: <b>{comb_stats['losses']}</b>)\n"
@@ -1592,7 +1575,7 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         h1_bias = roadmap["h1_bias"]
         levels  = roadmap["levels"]
 
-        fig = plt.figure(figsize=(10.5, 5.8), dpi=105, facecolor="#ffffff")
+        fig = plt.figure(figsize=(10.2, 5.6), dpi=100, facecolor="#ffffff")
         ax  = fig.add_axes([0.015, 0.08, 0.880, 0.83], facecolor="#ffffff")
 
         n_bars = len(sub)
@@ -1632,6 +1615,12 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
             all_y.extend([lv["top"], lv["bot"]])
         if active_trade is not None:
             all_y.extend([active_trade["entry_spot"], active_trade["sl_price"], active_trade["tp2_price"]])
+            if active_trade.get("fvg_zone"):
+                all_y.extend([active_trade["fvg_zone"]["top"], active_trade["fvg_zone"]["bot"]])
+            if active_trade.get("ob_zone"):
+                all_y.extend([active_trade["ob_zone"]["top"], active_trade["ob_zone"]["bot"]])
+            if active_trade.get("bos_line"):
+                all_y.append(active_trade["bos_line"])
 
         y_min, y_max = float(np.nanmin(all_y)), float(np.nanmax(all_y))
         total_span   = max(y_max - y_min, 1e-6)
@@ -1659,18 +1648,59 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
                 right_edge_idx - s_idx,
                 z_top - z_bot,
                 facecolor="#f23645" if lv["type"] == "HIGH_POOL" else "#089981",
-                alpha=0.08, edgecolor="none", zorder=2
+                alpha=0.07, edgecolor="none", zorder=2
             ))
-            ax.plot([s_idx, right_edge_idx], [z_top, z_top], color="#1e222d", linewidth=0.85, zorder=3)
-            ax.plot([s_idx, right_edge_idx], [z_bot, z_bot], color="#1e222d", linewidth=0.85, zorder=3)
-            ax.plot([s_idx, right_edge_idx], [z_mid, z_mid], color=lbl_c, linewidth=0.80, linestyle="--", alpha=0.80, zorder=3)
+            ax.plot([s_idx, right_edge_idx], [z_mid, z_mid], color=lbl_c, linewidth=0.80, linestyle="--", alpha=0.75, zorder=3)
 
             ax.text(
-                s_idx + 1, z_top + total_span * 0.006,
+                s_idx + 1, z_top + total_span * 0.005,
                 f"{lv['short']} ({format_price(z_mid, dec)})",
-                fontsize=7.3, fontweight="bold", color=lbl_c, ha="left", va="bottom",
+                fontsize=7.2, fontweight="bold", color=lbl_c, ha="left", va="bottom",
                 bbox=dict(boxstyle="round,pad=0.14", facecolor="#ffffff", edgecolor=lbl_c, alpha=0.88, linewidth=0.6),
                 clip_on=True, zorder=6
+            )
+
+        # Extract or draw BOS, FVG, and OB markings on the chart
+        pb_ref = active_trade if active_trade is not None else {}
+        fvg_draw = pb_ref.get("fvg_zone") or detect_5m_fvg_zone(sub, "BUY" if h1_bias != "BEARISH" else "SELL", lookback=10)
+        ob_info_draw = detect_5m_bos_and_order_block(df_5m, "BUY" if h1_bias != "BEARISH" else "SELL", dec)
+        ob_draw = pb_ref.get("ob_zone") or (ob_info_draw["ob_zone"] if ob_info_draw else None)
+        bos_val = pb_ref.get("bos_line") or (ob_info_draw["bos_price"] if ob_info_draw else None)
+
+        if bos_val is not None:
+            ax.plot([max(0, n_bars - 22), n_bars + 4], [bos_val, bos_val], color="#7c3aed", linestyle="-.", linewidth=1.2, zorder=6)
+            ax.text(
+                max(1, n_bars - 21), bos_val + total_span * 0.006,
+                f" BOS ({format_price(bos_val, dec)}) ",
+                fontsize=7.2, fontweight="bold", color="#ffffff", ha="left", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.15", facecolor="#7c3aed", edgecolor="none"),
+                clip_on=True, zorder=8
+            )
+
+        if fvg_draw is not None:
+            ax.add_patch(mpatches.Rectangle(
+                (max(0, n_bars - 14), fvg_draw["bot"]), 16, max(fvg_draw["top"] - fvg_draw["bot"], min_body_h * 1.4),
+                facecolor="#f59e0b", alpha=0.25, edgecolor="#d97706", linestyle="--", linewidth=0.9, zorder=3
+            ))
+            ax.text(
+                max(1, n_bars - 13), fvg_draw["top"] + total_span * 0.004,
+                " FVG ",
+                fontsize=7.1, fontweight="bold", color="#78350f", ha="left", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.14", facecolor="#fef3c7", edgecolor="#d97706", linewidth=0.7),
+                clip_on=True, zorder=7
+            )
+
+        if ob_draw is not None:
+            ax.add_patch(mpatches.Rectangle(
+                (max(0, n_bars - 18), ob_draw["bot"]), 20, max(ob_draw["top"] - ob_draw["bot"], min_body_h * 1.6),
+                facecolor="#0284c7", alpha=0.22, edgecolor="#0369a1", linestyle="-", linewidth=0.9, zorder=3
+            ))
+            ax.text(
+                max(1, n_bars - 17), ob_draw["bot"] - total_span * 0.005,
+                " ORDER BLOCK (OB) ",
+                fontsize=7.1, fontweight="bold", color="#ffffff", ha="left", va="top",
+                bbox=dict(boxstyle="round,pad=0.14", facecolor="#0284c7", edgecolor="none"),
+                clip_on=True, zorder=7
             )
 
         last_bull = closes[-1] >= opens[-1]
@@ -1684,13 +1714,6 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
             tp2_p = active_trade["tp2_price"]
             p_x0  = n_bars - 1
             p_w   = 18
-
-            fvg = active_trade.get("fvg_zone")
-            if fvg is not None:
-                ax.add_patch(mpatches.Rectangle(
-                    (n_bars - 6, fvg["bot"]), 8, fvg["top"] - fvg["bot"],
-                    facecolor="#fbbf24", alpha=0.25, edgecolor="#d97706", linestyle=":", linewidth=0.8, zorder=3
-                ))
 
             ax.add_patch(mpatches.Rectangle(
                 (p_x0, min(ent_p, sl_p)), p_w, abs(ent_p - sl_p),
@@ -1778,7 +1801,7 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         top_ax.axis("off")
         top_ax.text(
             0.0, 0.72,
-            f"{hdr_nam} ({mt5_sym}) · PDH/PDL + Session Liquidity Map (5m)",
+            f"{hdr_nam} ({mt5_sym}) · BOS / FVG / OB + Session Liquidity (5m)",
             fontsize=9.5, fontweight="bold", color="#131722", va="center", ha="left"
         )
         top_ax.text(
@@ -1793,10 +1816,10 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
             bbox=dict(boxstyle="round,pad=0.24", facecolor=bias_bg, edgecolor="#cbd5e1", linewidth=0.7)
         )
 
-        fig.text(0.015, 0.018, "TradingView · $5,000 Two-Step Roadmap", fontsize=9.0, fontweight="bold", color="#131722")
+        fig.text(0.015, 0.018, "Telegram Bot · London + NY · BOS / FVG / OB", fontsize=9.0, fontweight="bold", color="#131722")
 
         buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=105, facecolor="#ffffff")
+        plt.savefig(buf, format="png", dpi=100, facecolor="#ffffff")
         plt.close(fig)
         buf.seek(0)
         return buf
@@ -1814,7 +1837,7 @@ def send_telegram_signal_with_chart(caption_html, chart_buf, target_chat_id=CHAT
                 try:
                     files = {"photo": ("chart.png", photo_bytes, "image/png")}
                     data  = {"chat_id": target_chat_id, "caption": caption_html, "parse_mode": "HTML"}
-                    res   = TELEGRAM_SESSION.post(url, data=data, files=files, timeout=8) if attempt == 0 else requests.post(url, data=data, files=files, timeout=10)
+                    res   = TELEGRAM_SESSION.post(url, data=data, files=files, timeout=7) if attempt == 0 else requests.post(url, data=data, files=files, timeout=9)
                     if res.status_code == 200 and res.json().get("ok"):
                         return
                 except Exception as e:
@@ -1824,7 +1847,7 @@ def send_telegram_signal_with_chart(caption_html, chart_buf, target_chat_id=CHAT
             try:
                 files = {"photo": ("chart.png", photo_bytes, "image/png")}
                 data  = {"chat_id": target_chat_id}
-                res   = TELEGRAM_SESSION.post(url, data=data, files=files, timeout=8) if attempt == 0 else requests.post(url, data=data, files=files, timeout=10)
+                res   = TELEGRAM_SESSION.post(url, data=data, files=files, timeout=7) if attempt == 0 else requests.post(url, data=data, files=files, timeout=9)
                 if res.status_code == 200 and res.json().get("ok"):
                     send_telegram_message(caption_html, target_chat_id)
                     return
@@ -1857,46 +1880,48 @@ def send_instant_preview_chart(pair_key=None):
     cand    = pending_pre_alerts.get(pair_key) or evaluate_roadmap_sweep_mss_setup(pair_key, info, df_1h, df_15m, df_5m, live_spot, ignore_locks=True)
 
     chart_buf = generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=cand)
-    _, _, ny_status_txt, _ = get_ny_session_status()
+    _, _, sess_status_txt, _ = get_active_sessions_info()
 
     if cand is not None:
-        stage_lbl = "🚨 ENTER NOW (5M MSS CONFIRMED)" if cand.get("stage") == "CONFIRMED_BREAKOUT" else "⏳ PRE-ALERT LOCKED (WAITING FOR 5M MSS CLOSE)"
+        stage_lbl = "🚨 ENTER NOW (CONFIRMED)" if cand.get("stage") == "CONFIRMED_BREAKOUT" else "⏳ PRE-ALERT LOCKED"
         caption = (
-            f"📊 <b>{info['mt5_name']} • ROADMAP 1H ➔ 15M ➔ 5M SETUP</b>\n"
+            f"📊 <b>{info['mt5_name']} • 1H ➔ 15M ➔ 5M SETUP</b>\n"
             f"🔔 <b>Status:</b> <b>{stage_lbl}</b>\n\n"
             f"🧭 <b>1H Context:</b> <b>{roadmap['h1_bias']}</b> | 📢 <b>Action:</b> <b>{cand['action']}</b>\n"
-            f"🧲 <b>15M Level Swept:</b> {cand['swept_level_name']}\n"
+            f"🧲 <b>Setup / Level:</b> {cand['swept_level_name']}\n"
             f"📍 <b>Live Price:</b> <code>{format_price(live_spot, dec)}</code>\n"
             f"🎯 <b>ENTRY SPOT:</b> <b><code>{format_price(cand['entry_spot'], dec)}</code></b>\n"
-            f"💼 <b>Lot Size ($12.50 Risk):</b> <code>{cand['lot_size']:.2f} Lot</code> (Planned Risk: ${cand['planned_risk_usd']:.2f})\n"
+            f"💼 <b>Lot Size ($12.50 Risk):</b> <code>{cand['lot_size']:.2f} Lot</code> (Risk: ${cand['planned_risk_usd']:.2f})\n"
             f"🛑 <b>Invalidation SL:</b> <code>{format_price(cand['sl_price'], dec)}</code>\n"
             f"🛡️ <b>1:1 Lock (TP1):</b> <code>{format_price(cand['tp1_price'], dec)}</code> | 🎯 <b>1:2 Target (TP2):</b> <code>{format_price(cand['tp2_price'], dec)}</code>"
         )
     else:
         no_trade_note = "⚠️ <b>1H is RANGING/CHOPPY — Stand Aside!</b>\n" if roadmap["h1_bias"] == "RANGING" else ""
         caption = (
-            f"📊 <b>{info['mt5_name']} • PRE-SESSION LIQUIDITY MAP</b>\n"
-            f"🕒 <b>Session:</b> {ny_status_txt}\n"
+            f"📊 <b>{info['mt5_name']} • LIQUIDITY & BOS/FVG/OB MAP</b>\n"
+            f"🕒 <b>Session:</b> {sess_status_txt}\n"
             f"🧭 <b>1H Context:</b> <b>{roadmap['h1_bias']}</b> | 📍 <b>Live:</b> <code>{format_price(live_spot, dec)}</code>\n"
             f"{no_trade_note}\n"
             f"📌 <b>Pre-Marked Roadmap Levels:</b>\n"
             f"• <b>PDH / PDL:</b> <code>{format_price(roadmap['pdh'], dec)}</code> / <code>{format_price(roadmap['pdl'], dec)}</code>\n"
             f"• <b>London H / L:</b> <code>{format_price(roadmap['london_high'], dec)}</code> / <code>{format_price(roadmap['london_low'], dec)}</code>\n"
             f"• <b>Asian H / L:</b> <code>{format_price(roadmap['asian_high'], dec)}</code> / <code>{format_price(roadmap['asian_low'], dec)}</code>\n\n"
-            f"⏳ <b>Rule:</b> Waiting for 15M sweep of a key level + 5M MSS body close."
+            f"⏳ <b>Rules:</b> 15M Sweep + 5M MSS OR 1H Trend + 5M BOS ➔ FVG/OB Pullback."
         )
 
     send_telegram_signal_with_chart(caption, chart_buf)
 
 def send_live_status_summary():
     bal, eq, day_pnl, week_pnl = get_live_account_metrics()
-    _, _, ny_status_txt, _     = get_ny_session_status()
+    _, _, sess_status_txt, _     = get_active_sessions_info()
+    can_tr, _, guard_reason    = check_funded_account_risk_rules()
     dd_from_peak               = max(STARTING_CAPITAL_USD, HIGH_WATER_MARK_USD) - min(bal, eq)
     today_name                 = WEEKDAY_NAMES[get_ny_weekday_index(get_utc_now())]
 
     report = (
-        f"📊 <b>$5,000 TWO-STEP FUNDED ROADMAP STATUS (0-START)</b>\n\n"
-        f"📅 <b>Day:</b> <b>{today_name}</b> | 🕒 <b>Session:</b> {ny_status_txt}\n"
+        f"📊 <b>$5,000 TWO-STEP FUNDED STATUS (TELEGRAM 0-START)</b>\n\n"
+        f"📅 <b>Day:</b> <b>{today_name}</b> | 🕒 <b>Session:</b> {sess_status_txt}\n"
+        f"🚦 <b>Risk Guard:</b> <b>{'🟢 READY TO TRADE' if can_tr else '🔴 LOCKED (' + guard_reason + ')'}</b>\n"
         f"💰 <b>Balance / Equity:</b> <b>${bal:.2f} / ${eq:.2f}</b> (Peak: ${HIGH_WATER_MARK_USD:.2f})\n"
         f"📈 <b>Today's PnL:</b> <b>${day_pnl:+.2f}</b> (Limit: -${DAILY_STOP_LOSS_USD:.2f})\n"
         f"📅 <b>Weekly PnL:</b> <b>${week_pnl:+.2f}</b> (Limit: -${WEEKLY_STOP_LOSS_USD:.2f})\n"
@@ -1924,7 +1949,7 @@ def flush_old_telegram_updates():
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
         return
     try:
-        res = TELEGRAM_SESSION.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates", params={"timeout": 0}, timeout=3).json()
+        res = TELEGRAM_SESSION.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates", params={"timeout": 0}, timeout=2.5).json()
         if res.get("ok") and res.get("result"):
             last_update_id = res["result"][-1]["update_id"]
     except Exception:
@@ -1937,7 +1962,7 @@ def check_telegram_commands():
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
     params = {"offset": last_update_id + 1, "timeout": 0}
     try:
-        response = TELEGRAM_SESSION.get(url, params=params, timeout=2.5).json()
+        response = TELEGRAM_SESSION.get(url, params=params, timeout=2.0).json()
         if response.get("ok"):
             for result in response.get("result", []):
                 last_update_id = result["update_id"]
@@ -1948,16 +1973,9 @@ def check_telegram_commands():
                     continue
                 if msg_text in ["/status", "status", "/start", "start"]:
                     send_live_status_summary()
-                elif msg_text in ["/web", "web", "/dashboard", "dashboard", "/journal", "journal"]:
-                    html_bytes = sync_live_website_dashboard(push_to_git=False)
-                    send_telegram_document(
-                        html_bytes,
-                        "Funded_Live_Account.html",
-                        caption_html="🌐 <b>Live $5,000 Account & Journal (0-Start, Live Trades Only)</b>"
-                    )
                 elif msg_text in ["/reset", "reset"]:
                     reset_live_account_to_zero()
-                    send_telegram_message("✅ <b>Account, Website & /backtest Reset to 0 ($5,000.00 Starting Balance).</b>")
+                    send_telegram_message("✅ <b>Telegram Account & /backtest Reset to 0 ($5,000.00 Starting Balance).</b>")
                 elif msg_text in ["/backtest", "backtest", "/report", "report", "/days", "days"]:
                     run_and_send_master_backtest_report(None)
                 elif msg_text in ["/backtest gold", "/backtest xauusd", "/report gold"]:
@@ -1975,7 +1993,7 @@ def check_telegram_commands():
         pass
 
 # =====================================================================
-# 11. TRADE EXECUTION, LOCKED PRE-ALERTS & AUTO-SYNC MANAGEMENT
+# 10. TRADE EXECUTION, LOCKED PRE-ALERTS & TRADE MANAGEMENT
 # =====================================================================
 def dispatch_confirmed_trade_alert(name, info, df_1h, df_15m, df_5m, live_spot, cand, closed_time):
     global trades_today, last_candle_traded, last_setup_traded
@@ -2008,24 +2026,24 @@ def dispatch_confirmed_trade_alert(name, info, df_1h, df_15m, df_5m, live_spot, 
         "entry": entry_spot, "sl": sl_level, "sl_dist": sl_dist,
         "half_target": tp1_level, "target": tp2_level,
         "max_risk": risk_usd, "cost_usd": cost_usd, "expected_profit": reward_usd,
-        "entry_candle_time": closed_time, "trailed_to_cost": False, "is_open": True
+        "entry_candle_time": closed_time, "trailed_to_cost": False, "is_open": True,
+        "max_r_seen": 0.0, "min_r_seen": 0.0
     })
 
     msg = (
         f"🚨 <b>ENTER NOW — {info['mt5_name']} (TRADE #{trades_today}/{MAX_DAILY_TRADES} · {day_name})</b> 🚨\n\n"
         f"📢 <b>Action:</b> <b>{signal}</b>\n"
         f"🎯 <b>ENTRY SPOT:</b> <b><code>{format_price(entry_spot, dec)}</code></b> (Live: <code>{format_price(live_spot, dec)}</code>)\n"
-        f"💼 <b>MT5 Lot Size (0.25% Risk):</b> <b><code>{lot_size:.2f} Lot</code></b>\n\n"
+        f"💼 <b>Lot Size (0.25% Risk):</b> <b><code>{lot_size:.2f} Lot</code></b>\n\n"
         f"🛑 <b>Invalidation Stop-Loss:</b> <code>{format_price(sl_level, dec)}</code>\n"
         f"🛡️ <b>1:1 Breakeven Lock (TP1):</b> <code>{format_price(tp1_level, dec)}</code>\n"
         f"🎯 <b>1:2 Full Target (TP2):</b> <code>{format_price(tp2_level, dec)}</code>\n\n"
-        f"🔍 <b>Roadmap Checklist:</b>\n{cand['why_text']}\n\n"
+        f"🔍 <b>Setup Checklist:</b>\n{cand['why_text']}\n\n"
         f"⚖️ <b>Risk (incl. cost):</b> ${risk_usd:.2f}  |  <b>Net 1:2 Reward:</b> +${reward_usd:.2f}"
     )
 
     chart_buf = generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=cand)
     send_telegram_signal_with_chart(msg, chart_buf)
-    sync_live_website_dashboard_async(push_to_git=True)
 
 def dispatch_pre_alert_setup(name, info, df_1h, df_15m, df_5m, live_spot, cand, closed_time):
     dec        = info["decimals"]
@@ -2043,11 +2061,11 @@ def dispatch_pre_alert_setup(name, info, df_1h, df_15m, df_5m, live_spot, cand, 
     last_setup_traded[name]     = cand["setup_id"]
 
     msg = (
-        f"⏳ <b>PRE-ALERT LOCKED — {info['mt5_name']} (15M SWEEP DONE)</b> ⏳\n\n"
+        f"⏳ <b>PRE-ALERT LOCKED — {info['mt5_name']}</b> ⏳\n\n"
         f"📢 <b>Upcoming Action:</b> <b>{cand['action']}</b>\n"
-        f"🧲 <b>15M Swept Level:</b> <b>{cand['swept_level_name']}</b>\n"
+        f"🧲 <b>Setup / Level:</b> <b>{cand['swept_level_name']}</b>\n"
         f"📍 <b>Current Live Price:</b> <code>{format_price(live_spot, dec)}</code>\n"
-        f"🎯 <b>LOCKED 5M MSS ENTRY SPOT:</b> <b><code>{format_price(entry_spot, dec)}</code></b>\n\n"
+        f"🎯 <b>LOCKED ENTRY SPOT:</b> <b><code>{format_price(entry_spot, dec)}</code></b>\n\n"
         f"💼 <b>Lot Size ($12.50 Max Risk):</b> <b><code>{lot_size:.2f} Lot</code></b>\n"
         f"🛑 <b>Invalidation SL:</b> <code>{format_price(sl_level, dec)}</code>\n"
         f"🛡️ <b>1:1 Lock (TP1):</b> <code>{format_price(tp1_level, dec)}</code>\n"
@@ -2090,7 +2108,7 @@ def check_pending_pre_alerts_realtime():
             pre_alert_cooldown[name] = now_utc + timedelta(minutes=20)
             send_telegram_message(
                 f"❌ <b>PRE-ALERT INVALIDATED — {info['mt5_name']}</b>\n"
-                f"Price broke below invalidation SL (<code>{format_price(cand['sl_price'], dec)}</code>) before confirming 5M MSS. No trade taken."
+                f"Price broke below invalidation SL (<code>{format_price(cand['sl_price'], dec)}</code>). No trade taken."
             )
             continue
         elif cand["direction"] == "SELL" and live_spot >= cand["sl_price"]:
@@ -2098,7 +2116,7 @@ def check_pending_pre_alerts_realtime():
             pre_alert_cooldown[name] = now_utc + timedelta(minutes=20)
             send_telegram_message(
                 f"❌ <b>PRE-ALERT INVALIDATED — {info['mt5_name']}</b>\n"
-                f"Price broke above invalidation SL (<code>{format_price(cand['sl_price'], dec)}</code>) before confirming 5M MSS. No trade taken."
+                f"Price broke above invalidation SL (<code>{format_price(cand['sl_price'], dec)}</code>). No trade taken."
             )
             continue
 
@@ -2123,6 +2141,12 @@ def manage_open_trades(pair_name, candle_time, live_spot, df_5m, decimals):
             if to_utc_timestamp(candle_time) <= trade["entry_candle_time"]:
                 continue
 
+            if trade.get("sl_dist", 0.0) > 0:
+                hi_r = ((current_high - trade["entry"]) / trade["sl_dist"]) if trade["direction"] == "BUY" else ((trade["entry"] - current_low) / trade["sl_dist"])
+                lo_r = ((current_low - trade["entry"]) / trade["sl_dist"]) if trade["direction"] == "BUY" else ((trade["entry"] - current_high) / trade["sl_dist"])
+                trade["max_r_seen"] = round(max(float(trade.get("max_r_seen", 0.0)), hi_r), 2)
+                trade["min_r_seen"] = round(min(float(trade.get("min_r_seen", 0.0)), lo_r), 2)
+
             entry_str = format_price(trade["entry"], decimals)
             sl_str    = format_price(trade["sl"], decimals)
             price_str = format_price(live_spot, decimals)
@@ -2138,7 +2162,6 @@ def manage_open_trades(pair_name, candle_time, live_spot, df_5m, decimals):
                         f"📍 <b>Live Price:</b> <code>{price_str}</code>\n"
                         f"👉 Move Stop-Loss to Entry (<code>{entry_str}</code>) to make this trade 100% risk-free."
                     )
-                    sync_live_website_dashboard_async(push_to_git=True)
 
             hit_type = None
             if trade["direction"] == "BUY":
@@ -2162,7 +2185,7 @@ def manage_open_trades(pair_name, candle_time, live_spot, df_5m, decimals):
                 append_to_trading_journal(trade, +2.0, net_win, "WIN")
                 send_telegram_message(
                     f"🎯 <b>1:2 FULL TARGET HIT (+${net_win:.2f} / +2R) — {trade['mt5_name']}</b>\n"
-                    f"📒 Saved to 0-Start Live Journal & <code>/backtest</code>!"
+                    f"📒 Saved to 0-Start Telegram <code>/backtest</code>!"
                 )
             elif hit_type == "BREAKEVEN_SL":
                 trade["is_open"] = False
@@ -2174,7 +2197,7 @@ def manage_open_trades(pair_name, candle_time, live_spot, df_5m, decimals):
                 append_to_trading_journal(trade, 0.0, be_cost, "BREAKEVEN")
                 send_telegram_message(
                     f"🛡️ <b>BREAKEVEN EXIT (0R) — {trade['mt5_name']}</b>\n"
-                    f"📒 Capital preserved & logged in 0-Start <code>/backtest</code>."
+                    f"📒 Capital preserved & logged in Telegram <code>/backtest</code>."
                 )
             elif hit_type == "SL":
                 trade["is_open"] = False
@@ -2187,11 +2210,11 @@ def manage_open_trades(pair_name, candle_time, live_spot, df_5m, decimals):
                 append_to_trading_journal(trade, -1.0, -loss_amt, "LOSS")
                 send_telegram_message(
                     f"🛑 <b>INVALIDATION STOP-LOSS HIT (-${loss_amt:.2f} / -1R) — {trade['mt5_name']}</b> (<code>{sl_str}</code>)\n"
-                    f"Losses Today: {losses_today}/{MAX_DAILY_LOSS_COUNT}. Logged in 0-Start <code>/backtest</code>."
+                    f"Losses Today: {losses_today}/{MAX_DAILY_LOSS_COUNT}. Logged in Telegram <code>/backtest</code>."
                 )
 
 # =====================================================================
-# 12. MASTER SCANNER LOOP
+# 11. MASTER SCANNER LOOP (TELEGRAM ONLY)
 # =====================================================================
 def scan_markets():
     global trades_today, losses_today, current_day, current_week
@@ -2211,23 +2234,23 @@ def scan_markets():
         daily_halt_announced = False
         for k in live_bars_memory:
             live_bars_memory[k] = {}
-        sync_live_website_dashboard_async(push_to_git=True)
+        for k in last_radar_key:
+            last_radar_key[k] = None
 
     if iso_week != current_week:
         current_week = iso_week
         weekly_realized_pnl = 0.0
         weekly_halt_announced = False
 
-    ny_ok, is_pre_session, ny_status_txt, ist_window_str = get_ny_session_status()
+    _, is_pre_session, _, sessions_str = get_active_sessions_info()
     if is_pre_session and pre_session_brief_sent != today:
         pre_session_brief_sent = today
         today_name = WEEKDAY_NAMES[get_ny_weekday_index(get_utc_now())]
         send_telegram_message(
-            f"🔔 <b>NEW YORK PRE-SESSION ROUTINE ({today_name})</b> 🔔\n\n"
-            f"🕒 <b>NY Session Window:</b> {ist_window_str}\n"
-            f"📋 <b>Pre-Session Checklist (PDF Section 3):</b>\n"
-            f"• Risk per trade: <b>$12.50 (0.25%)</b> | Max <b>2 trades</b> today\n"
-            f"• Sending pre-marked PDH/PDL & Asian/London High-Low charts for <b>XAUUSD</b> and <b>BTCUSD</b>..."
+            f"🔔 <b>SESSION PRE-BRIEF ({today_name})</b> 🔔\n\n"
+            f"🕒 <b>Active Windows:</b> {sessions_str}\n"
+            f"📋 <b>Risk:</b> <b>$12.50 (0.25%)</b> | Max <b>2 trades</b>/day\n"
+            f"• Sending charts for <b>XAUUSD</b> and <b>BTCUSD</b>..."
         )
         send_instant_preview_chart("XAU/USD")
         send_instant_preview_chart("BTC/USD")
@@ -2282,16 +2305,14 @@ def scan_markets():
             print(f"Error scanning {name}: {e}")
 
 if __name__ == "__main__":
-    load_persistent_account_state()
     flush_old_telegram_updates()
     threading.Thread(target=fetch_live_economic_calendar, daemon=True).start()
-    sync_live_website_dashboard_async(push_to_git=True)
 
     send_telegram_message(
-        f"⚡ <b>$5,000 Two-Step Funded Bot Active (100% Zero-Start Mode)</b>\n"
-        f"• <b>Live Balance:</b> ${STARTING_CAPITAL_USD + total_account_pnl:,.2f} ({len(journal_memory_log)} Recorded Live Trades)\n"
-        f"• <b>/backtest & Website:</b> 100% Zero-Start (Only records live trades taken AFTER bot starts)\n"
-        f"• <b>Instant Photo Engine:</b> Zero-delay parallel chart rendering active\n"
+        f"⚡ <b>$5,000 Two-Step Funded Bot Active (Telegram-Only · 0-Start)</b>\n"
+        f"• <b>Sessions:</b> London + New York Active\n"
+        f"• <b>Setups:</b> 15M Sweep + 5M MSS & HTF Pullback to OB/FVG After 5M BOS\n"
+        f"• <b>Chart Tags:</b> <code>BOS</code>, <code>FVG</code> & <code>ORDER BLOCK (OB)</code> marked live\n"
         f"• <b>Commands:</b> <code>/gold</code>, <code>/btc</code>, <code>/backtest</code>, <code>/status</code>, <code>/reset</code>"
     )
 
@@ -2313,4 +2334,3 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Loop Error: {e}")
             time.sleep(2)
-            
