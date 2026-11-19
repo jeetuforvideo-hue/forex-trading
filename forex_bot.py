@@ -255,17 +255,12 @@ def check_low_spread_window(pair_info):
     if not LOW_SPREAD_FILTER_ENABLED:
         return True, "🟢 Spread Filter Off"
 
-    if pair_info.get("is_crypto", False):
-        if not is_forex_market_open():
-            pass
-    else:
-        if not is_forex_market_open():
-            return False, "🔴 Weekend Wide Spread"
+    if not pair_info.get("is_crypto", False) and not is_forex_market_open():
+        return False, "🔴 Weekend Wide Spread"
 
     utc_now = get_utc_now()
     utc_hr  = utc_now.hour + (utc_now.minute / 60.0)
 
-    # Daily rollover / thin liquidity spike window (21:45 - 00:30 UTC)
     if (not pair_info.get("is_crypto", False)) and (utc_hr >= 21.75 or utc_hr < 0.50):
         return False, "🔴 Rollover Wide Spread"
 
@@ -933,84 +928,6 @@ def detect_5m_bos_and_order_block(df_5m, direction, decimals):
             }
         return None
 
-def get_clean_smc_overlays(sub_5m, active_trade=None):
-    """
-    Returns clean, non-overlapping BOS, FVG, and OB structures for the visible 5M chart window.
-    """
-    n = len(sub_5m)
-    if n < 10:
-        return None, None, None
-
-    trade_ref = active_trade if active_trade is not None else {}
-    direction = trade_ref.get("direction")
-    if direction not in ("BUY", "SELL"):
-        last_c = float(sub_5m.iloc[-2]["Close"])
-        last_o = float(sub_5m.iloc[-2]["Open"])
-        direction = "BUY" if last_c >= last_o else "SELL"
-
-    highs = sub_5m["High"].values.astype(float)
-    lows  = sub_5m["Low"].values.astype(float)
-    opens = sub_5m["Open"].values.astype(float)
-    closes = sub_5m["Close"].values.astype(float)
-
-    bos_info = None
-    if trade_ref.get("bos_line") is not None:
-        bos_info = {"price": float(trade_ref["bos_line"]), "x_start": max(4, n - 18)}
-    else:
-        if direction == "BUY":
-            for i in range(n - 2, max(5, n - 24), -1):
-                lvl = float(np.max(highs[max(0, i - 6):i - 1]))
-                if highs[i] > lvl and closes[i] > lvl:
-                    bos_info = {"price": round(lvl, 2), "x_start": max(4, i - 4)}
-                    break
-        else:
-            for i in range(n - 2, max(5, n - 24), -1):
-                lvl = float(np.min(lows[max(0, i - 6):i - 1]))
-                if lows[i] < lvl and closes[i] < lvl:
-                    bos_info = {"price": round(lvl, 2), "x_start": max(4, i - 4)}
-                    break
-
-    fvg_info = None
-    if trade_ref.get("fvg_zone") is not None:
-        fz = trade_ref["fvg_zone"]
-        fvg_info = {"top": float(fz["top"]), "bot": float(fz["bot"]), "x_start": max(4, n - 12)}
-    else:
-        for i in range(n - 2, max(2, n - 18), -1):
-            if direction == "BUY":
-                g_bot = float(highs[i - 2])
-                g_top = float(lows[i])
-                if g_top > g_bot:
-                    fvg_info = {"top": g_top, "bot": g_bot, "x_start": i - 2}
-                    break
-            else:
-                g_top = float(lows[i - 2])
-                g_bot = float(highs[i])
-                if g_top > g_bot:
-                    fvg_info = {"top": g_top, "bot": g_bot, "x_start": i - 2}
-                    break
-
-    ob_info = None
-    if trade_ref.get("ob_zone") is not None:
-        oz = trade_ref["ob_zone"]
-        ob_info = {"top": float(oz["top"]), "bot": float(oz["bot"]), "x_start": max(4, n - 15)}
-    else:
-        for i in range(n - 3, max(2, n - 20), -1):
-            if direction == "BUY" and closes[i] < opens[i] and closes[i + 1] > highs[i]:
-                ob_info = {"top": float(highs[i]), "bot": float(lows[i]), "x_start": i}
-                break
-            if direction == "SELL" and closes[i] > opens[i] and closes[i + 1] < lows[i]:
-                ob_info = {"top": float(highs[i]), "bot": float(lows[i]), "x_start": i}
-                break
-
-    # Prevent OB and FVG boxes from sitting on top of each other with duplicate text
-    if fvg_info and ob_info:
-        ov_top = min(fvg_info["top"], ob_info["top"])
-        ov_bot = max(fvg_info["bot"], ob_info["bot"])
-        if ov_top > ov_bot:
-            ob_info = None
-
-    return bos_info, fvg_info, ob_info
-
 def check_sweep_proximity_radar(pair_name, info, roadmap, live_spot, atr_5m):
     if roadmap["h1_bias"] == "RANGING" or atr_5m <= 0:
         return
@@ -1485,7 +1402,7 @@ def compute_day_wise_breakdown(trades_list):
     return {"days": day_stats, "best_day": best_day, "worst_day": worst_day}
 
 # =====================================================================
-# 9. HIGH-SPEED CLEAN CHARTS & TELEGRAM REPORTS
+# 9. HIGH-SPEED CLEAN CHARTS (NO BOS / FVG / OB) & TELEGRAM REPORTS
 # =====================================================================
 def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, day_breakdown):
     try:
@@ -1723,17 +1640,9 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
             nearest_lv = min(levels, key=lambda l: abs(l["price"] - live_spot))
             visible_levels = [nearest_lv]
 
-        bos_info, fvg_info, ob_info = get_clean_smc_overlays(sub, active_trade=active_trade)
-
         all_y = list(highs) + list(lows) + [live_spot]
         for lv in visible_levels:
             all_y.extend([lv["top"], lv["bot"]])
-        if bos_info:
-            all_y.append(bos_info["price"])
-        if fvg_info:
-            all_y.extend([fvg_info["top"], fvg_info["bot"]])
-        if ob_info:
-            all_y.extend([ob_info["top"], ob_info["bot"]])
         if active_trade is not None:
             all_y.extend([active_trade["entry_spot"], active_trade["sl_price"], active_trade["tp2_price"]])
 
@@ -1773,48 +1682,6 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
                 fontsize=7.2, fontweight="bold", color=lbl_c, ha="left", va="bottom",
                 bbox=dict(boxstyle="round,pad=0.14", facecolor="#ffffff", edgecolor=lbl_c, alpha=0.88, linewidth=0.6),
                 clip_on=True, zorder=6
-            )
-
-        if bos_info is not None:
-            bx0 = bos_info["x_start"]
-            by  = bos_info["price"]
-            ax.plot([bx0, n_bars], [by, by], color="#7c3aed", linestyle="-.", linewidth=1.25, zorder=6)
-            ax.text(
-                n_bars - 1, by + total_span * 0.005,
-                f" BOS {format_price(by, dec)} ",
-                fontsize=7.0, fontweight="bold", color="#ffffff", ha="right", va="bottom",
-                bbox=dict(boxstyle="round,pad=0.14", facecolor="#7c3aed", edgecolor="none"),
-                clip_on=True, zorder=8
-            )
-
-        if fvg_info is not None:
-            fx0 = fvg_info["x_start"]
-            f_h = max(fvg_info["top"] - fvg_info["bot"], min_body_h * 1.4)
-            ax.add_patch(mpatches.Rectangle(
-                (fx0, fvg_info["bot"]), max(4, n_bars - fx0), f_h,
-                facecolor="#f59e0b", alpha=0.22, edgecolor="#d97706", linestyle="--", linewidth=0.9, zorder=3
-            ))
-            ax.text(
-                fx0 + 0.5, fvg_info["top"] + total_span * 0.004,
-                " FVG ",
-                fontsize=7.0, fontweight="bold", color="#78350f", ha="left", va="bottom",
-                bbox=dict(boxstyle="round,pad=0.14", facecolor="#fef3c7", edgecolor="#d97706", linewidth=0.7),
-                clip_on=True, zorder=7
-            )
-
-        if ob_info is not None:
-            ox0 = ob_info["x_start"]
-            o_h = max(ob_info["top"] - ob_info["bot"], min_body_h * 1.6)
-            ax.add_patch(mpatches.Rectangle(
-                (ox0, ob_info["bot"]), max(4, n_bars - ox0), o_h,
-                facecolor="#0284c7", alpha=0.20, edgecolor="#0369a1", linestyle="-", linewidth=0.9, zorder=3
-            ))
-            ax.text(
-                ox0 + 0.5, ob_info["bot"] - total_span * 0.004,
-                " OB ",
-                fontsize=7.0, fontweight="bold", color="#ffffff", ha="left", va="top",
-                bbox=dict(boxstyle="round,pad=0.14", facecolor="#0284c7", edgecolor="none"),
-                clip_on=True, zorder=7
             )
 
         last_bull = closes[-1] >= opens[-1]
@@ -1915,7 +1782,7 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         top_ax.axis("off")
         top_ax.text(
             0.0, 0.72,
-            f"{hdr_nam} ({mt5_sym}) · BOS / FVG / OB + Session Liquidity (5m)",
+            f"{hdr_nam} ({mt5_sym}) · Session Liquidity Map (5m)",
             fontsize=9.5, fontweight="bold", color="#131722", va="center", ha="left"
         )
         top_ax.text(
@@ -1930,7 +1797,7 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
             bbox=dict(boxstyle="round,pad=0.24", facecolor=bias_bg, edgecolor="#cbd5e1", linewidth=0.7)
         )
 
-        fig.text(0.015, 0.018, "Telegram Bot · London + NY · Low-Spread · BOS / FVG / OB", fontsize=9.0, fontweight="bold", color="#131722")
+        fig.text(0.015, 0.018, "Telegram Bot · London + NY · Low-Spread", fontsize=9.0, fontweight="bold", color="#131722")
 
         buf = io.BytesIO()
         plt.savefig(buf, format="png", dpi=100, facecolor="#ffffff")
@@ -2013,7 +1880,7 @@ def send_instant_preview_chart(pair_key=None):
     else:
         no_trade_note = "⚠️ <b>1H is RANGING/CHOPPY — Stand Aside!</b>\n" if roadmap["h1_bias"] == "RANGING" else ""
         caption = (
-            f"📊 <b>{info['mt5_name']} • LIQUIDITY & BOS/FVG/OB MAP</b>\n"
+            f"📊 <b>{info['mt5_name']} • SESSION LIQUIDITY MAP</b>\n"
             f"🕒 <b>Session:</b> {sess_status_txt}\n"
             f"💧 <b>Spread Window:</b> {spread_status_txt}\n"
             f"🧭 <b>1H Context:</b> <b>{roadmap['h1_bias']}</b> | 📍 <b>Live:</b> <code>{format_price(live_spot, dec)}</code>\n"
@@ -2438,8 +2305,7 @@ if __name__ == "__main__":
         f"⚡ <b>$5,000 Two-Step Funded Bot Active (Telegram-Only · 0-Start)</b>\n"
         f"• <b>Sessions:</b> London + New York Active\n"
         f"• <b>Spread Filter:</b> Active (Low-Spread Hours Only)\n"
-        f"• <b>Setups:</b> 15M Sweep + 5M MSS & HTF Pullback to OB/FVG After 5M BOS\n"
-        f"• <b>Chart Tags:</b> Clean <code>BOS</code>, <code>FVG</code> & <code>OB</code> marked live\n"
+        f"• <b>Chart:</b> Clean Session Liquidity Map (BOS / FVG / OB removed)\n"
         f"• <b>Commands:</b> <code>/gold</code>, <code>/btc</code>, <code>/backtest</code>, <code>/status</code>, <code>/reset</code>"
     )
 
