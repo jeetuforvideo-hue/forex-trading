@@ -73,6 +73,7 @@ PRE_ALERT_EXPIRY_MINUTES     = 25
 MAX_TRADE_HOLD_MINUTES       = 90
 
 STRICT_SESSION_ONLY          = True      # London + New York active windows
+LOW_SPREAD_FILTER_ENABLED    = True      # Trade only during low-spread liquidity hours
 JOURNAL_CSV_PATH             = "trading_journal.csv"
 
 WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -90,6 +91,7 @@ FOREX_PAIRS = {
         "currencies": ["USD"],
         "decimals": 2,
         "spread_and_cost": 0.35,
+        "low_spread_utc_windows": [(7.0, 11.0), (13.0, 17.0)],
         "unit_name": "Pts",
         "usd_exposure": "SHORT_USD_ON_BUY",
         "min_sl_dist": 2.80,
@@ -109,6 +111,7 @@ FOREX_PAIRS = {
         "currencies": ["USD"],
         "decimals": 2,
         "spread_and_cost": 28.00,
+        "low_spread_utc_windows": [(7.0, 21.0)],
         "unit_name": "Pts",
         "usd_exposure": "SHORT_USD_ON_BUY",
         "min_sl_dist": 160.0,
@@ -205,7 +208,7 @@ def reset_live_account_to_zero():
             pass
 
 # =====================================================================
-# 3. LONDON + NEW YORK SESSION & ECONOMIC CALENDAR ENGINE
+# 3. LONDON + NEW YORK SESSION, LOW-SPREAD & NEWS ENGINE
 # =====================================================================
 def is_forex_market_open():
     now = get_ist_now()
@@ -243,6 +246,40 @@ def get_active_sessions_info():
         return True, (is_pre_london or is_pre_ny), f"🟢 24H Mode ({sessions_str})", sessions_str
 
     return False, (is_pre_london or is_pre_ny), f"⏸️ Waiting ({sessions_str})", sessions_str
+
+def check_low_spread_window(pair_info):
+    """
+    Checks whether current UTC time is inside low-spread liquidity hours for the pair.
+    Returns (is_low_spread_ok, label_text).
+    """
+    if not LOW_SPREAD_FILTER_ENABLED:
+        return True, "🟢 Spread Filter Off"
+
+    if pair_info.get("is_crypto", False):
+        if not is_forex_market_open():
+            pass
+    else:
+        if not is_forex_market_open():
+            return False, "🔴 Weekend Wide Spread"
+
+    utc_now = get_utc_now()
+    utc_hr  = utc_now.hour + (utc_now.minute / 60.0)
+
+    # Daily rollover / thin liquidity spike window (21:45 - 00:30 UTC)
+    if (not pair_info.get("is_crypto", False)) and (utc_hr >= 21.75 or utc_hr < 0.50):
+        return False, "🔴 Rollover Wide Spread"
+
+    windows = pair_info.get("low_spread_utc_windows", [(7.0, 11.0), (13.0, 17.0)])
+    for start_hr, end_hr in windows:
+        if start_hr <= utc_hr <= end_hr:
+            return True, "🟢 Low Spread Active"
+
+    return False, "🟡 Elevated Spread Window"
+
+def get_dynamic_spread_cost(pair_info):
+    base_cost = float(pair_info.get("spread_and_cost", 0.0))
+    spread_ok, _ = check_low_spread_window(pair_info)
+    return base_cost if spread_ok else round(base_cost * 1.5, 4)
 
 def fetch_live_economic_calendar():
     global cached_news_events, last_news_fetch_time
@@ -363,7 +400,7 @@ def calculate_roadmap_position_size(pair_name, pair_info, sl_dist, max_risk_usd=
     if sl_dist <= 0:
         return None, 0.0, 0.0
 
-    spread_cost_dist  = pair_info.get("spread_and_cost", 0.0)
+    spread_cost_dist  = get_dynamic_spread_cost(pair_info)
     effective_sl_dist = sl_dist + spread_cost_dist
 
     if "XAU" in pair_name:
@@ -978,7 +1015,8 @@ def check_sweep_proximity_radar(pair_name, info, roadmap, live_spot, atr_5m):
     if roadmap["h1_bias"] == "RANGING" or atr_5m <= 0:
         return
     ny_ok, _, _, _ = get_active_sessions_info()
-    if not ny_ok:
+    spread_ok, _   = check_low_spread_window(info)
+    if not ny_ok or not spread_ok:
         return
     if pending_pre_alerts.get(pair_name) is not None:
         return
@@ -1006,6 +1044,9 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
         sess_ok, _, _, _ = get_active_sessions_info()
         if not sess_ok:
             return (None, "OUTSIDE_ACTIVE_SESSION") if return_skip_reason else None
+        spread_ok, _ = check_low_spread_window(info)
+        if not spread_ok:
+            return (None, "WIDE_SPREAD_WINDOW") if return_skip_reason else None
         news_ok, _ = check_news_window_for_pair(info)
         if not news_ok:
             return (None, "HIGH_IMPACT_NEWS") if return_skip_reason else None
@@ -1048,7 +1089,8 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
 
     candidates = []
     skipped_for_risk = False
-    buf_5m = round(max(atr_5m * 0.12, info["spread_and_cost"] * 0.5), dec)
+    spread_cost_now = get_dynamic_spread_cost(info)
+    buf_5m = round(max(atr_5m * 0.12, spread_cost_now * 0.5), dec)
 
     # -----------------------------------------------------------------
     # STRATEGY A: 15M LIQUIDITY SWEEP + 5M MSS + FVG
@@ -1733,7 +1775,6 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
                 clip_on=True, zorder=6
             )
 
-        # Clean BOS, FVG, and OB overlays placed without clutter or overlap
         if bos_info is not None:
             bx0 = bos_info["x_start"]
             by  = bos_info["price"]
@@ -1889,7 +1930,7 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
             bbox=dict(boxstyle="round,pad=0.24", facecolor=bias_bg, edgecolor="#cbd5e1", linewidth=0.7)
         )
 
-        fig.text(0.015, 0.018, "Telegram Bot · London + NY · Clean BOS / FVG / OB", fontsize=9.0, fontweight="bold", color="#131722")
+        fig.text(0.015, 0.018, "Telegram Bot · London + NY · Low-Spread · BOS / FVG / OB", fontsize=9.0, fontweight="bold", color="#131722")
 
         buf = io.BytesIO()
         plt.savefig(buf, format="png", dpi=100, facecolor="#ffffff")
@@ -1954,12 +1995,13 @@ def send_instant_preview_chart(pair_key=None):
 
     chart_buf = generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=cand)
     _, _, sess_status_txt, _ = get_active_sessions_info()
+    _, spread_status_txt     = check_low_spread_window(info)
 
     if cand is not None:
         stage_lbl = "🚨 ENTER NOW (CONFIRMED)" if cand.get("stage") == "CONFIRMED_BREAKOUT" else "⏳ PRE-ALERT LOCKED"
         caption = (
             f"📊 <b>{info['mt5_name']} • 1H ➔ 15M ➔ 5M SETUP</b>\n"
-            f"🔔 <b>Status:</b> <b>{stage_lbl}</b>\n\n"
+            f"🔔 <b>Status:</b> <b>{stage_lbl}</b> | 💧 <b>Spread:</b> {spread_status_txt}\n\n"
             f"🧭 <b>1H Context:</b> <b>{roadmap['h1_bias']}</b> | 📢 <b>Action:</b> <b>{cand['action']}</b>\n"
             f"🧲 <b>Setup / Level:</b> {cand['swept_level_name']}\n"
             f"📍 <b>Live Price:</b> <code>{format_price(live_spot, dec)}</code>\n"
@@ -1973,13 +2015,14 @@ def send_instant_preview_chart(pair_key=None):
         caption = (
             f"📊 <b>{info['mt5_name']} • LIQUIDITY & BOS/FVG/OB MAP</b>\n"
             f"🕒 <b>Session:</b> {sess_status_txt}\n"
+            f"💧 <b>Spread Window:</b> {spread_status_txt}\n"
             f"🧭 <b>1H Context:</b> <b>{roadmap['h1_bias']}</b> | 📍 <b>Live:</b> <code>{format_price(live_spot, dec)}</code>\n"
             f"{no_trade_note}\n"
             f"📌 <b>Pre-Marked Roadmap Levels:</b>\n"
             f"• <b>PDH / PDL:</b> <code>{format_price(roadmap['pdh'], dec)}</code> / <code>{format_price(roadmap['pdl'], dec)}</code>\n"
             f"• <b>London H / L:</b> <code>{format_price(roadmap['london_high'], dec)}</code> / <code>{format_price(roadmap['london_low'], dec)}</code>\n"
             f"• <b>Asian H / L:</b> <code>{format_price(roadmap['asian_high'], dec)}</code> / <code>{format_price(roadmap['asian_low'], dec)}</code>\n\n"
-            f"⏳ <b>Rules:</b> 15M Sweep + 5M MSS OR 1H Trend + 5M BOS ➔ FVG/OB Pullback."
+            f"⏳ <b>Rules:</b> Active Session + Low Spread + (15M Sweep + 5M MSS OR 1H Trend + 5M BOS ➔ FVG/OB Pullback)."
         )
 
     send_telegram_signal_with_chart(caption, chart_buf)
@@ -2003,6 +2046,7 @@ def send_live_status_summary():
         f"📒 <b>Total Live Trades Since 0-Start:</b> {len(journal_memory_log)}\n\n"
     )
     for name, info in FOREX_PAIRS.items():
+        _, sp_txt = check_low_spread_window(info)
         try:
             df_1h, df_15m, df_5m, live_spot = get_roadmap_3tf_spot_data(name, info, use_fast_cache=True)
             if df_1h is not None and df_15m is not None and live_spot is not None:
@@ -2011,9 +2055,11 @@ def send_live_status_summary():
                 rm     = extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, info["decimals"])
                 pend   = pending_pre_alerts.get(name)
                 st_str = f"⏳ Pre-Alert @ {format_price(pend['entry_spot'], info['decimals'])}" if pend else f"PDH:{format_price(rm['pdh'], info['decimals'])} | PDL:{format_price(rm['pdl'], info['decimals'])}"
-                report += f"🔹 <b>{info['mt5_name']}:</b> <code>{format_price(live_spot, info['decimals'])}</code> | 1H: <b>{rm['h1_bias']}</b> ({st_str})\n"
+                report += f"🔹 <b>{info['mt5_name']}:</b> <code>{format_price(live_spot, info['decimals'])}</code> | {sp_txt} | 1H: <b>{rm['h1_bias']}</b> ({st_str})\n"
+            else:
+                report += f"🔹 <b>{info['mt5_name']}:</b> {sp_txt}\n"
         except Exception:
-            pass
+            report += f"🔹 <b>{info['mt5_name']}:</b> {sp_txt}\n"
     report += "\n⚡ Commands: <code>/gold</code>, <code>/btc</code>, <code>/backtest</code>, <code>/reset</code>"
     send_telegram_message(report)
 
@@ -2084,6 +2130,7 @@ def dispatch_confirmed_trade_alert(name, info, df_1h, df_15m, df_5m, live_spot, 
     cost_usd   = cand.get("cost_usd", 0.35)
     reward_usd = round((risk_usd * PRIMARY_RR_TARGET) - cost_usd, 2)
     day_name   = WEEKDAY_NAMES[get_ny_weekday_index(closed_time)]
+    _, sp_txt  = check_low_spread_window(info)
 
     cand["stage"]            = "CONFIRMED_BREAKOUT"
     last_candle_traded[name] = closed_time
@@ -2105,7 +2152,7 @@ def dispatch_confirmed_trade_alert(name, info, df_1h, df_15m, df_5m, live_spot, 
 
     msg = (
         f"🚨 <b>ENTER NOW — {info['mt5_name']} (TRADE #{trades_today}/{MAX_DAILY_TRADES} · {day_name})</b> 🚨\n\n"
-        f"📢 <b>Action:</b> <b>{signal}</b>\n"
+        f"📢 <b>Action:</b> <b>{signal}</b> | 💧 <b>Spread:</b> {sp_txt}\n"
         f"🎯 <b>ENTRY SPOT:</b> <b><code>{format_price(entry_spot, dec)}</code></b> (Live: <code>{format_price(live_spot, dec)}</code>)\n"
         f"💼 <b>Lot Size (0.25% Risk):</b> <b><code>{lot_size:.2f} Lot</code></b>\n\n"
         f"🛑 <b>Invalidation Stop-Loss:</b> <code>{format_price(sl_level, dec)}</code>\n"
@@ -2127,6 +2174,7 @@ def dispatch_pre_alert_setup(name, info, df_1h, df_15m, df_5m, live_spot, cand, 
     lot_size   = cand["lot_size"]
     risk_usd   = cand["planned_risk_usd"]
     reward_usd = round((risk_usd * PRIMARY_RR_TARGET) - cand.get("cost_usd", 0.35), 2)
+    _, sp_txt  = check_low_spread_window(info)
 
     cand["created_utc"]         = get_utc_now()
     pending_pre_alerts[name]    = cand
@@ -2135,7 +2183,7 @@ def dispatch_pre_alert_setup(name, info, df_1h, df_15m, df_5m, live_spot, cand, 
 
     msg = (
         f"⏳ <b>PRE-ALERT LOCKED — {info['mt5_name']}</b> ⏳\n\n"
-        f"📢 <b>Upcoming Action:</b> <b>{cand['action']}</b>\n"
+        f"📢 <b>Upcoming Action:</b> <b>{cand['action']}</b> | 💧 <b>Spread:</b> {sp_txt}\n"
         f"🧲 <b>Setup / Level:</b> <b>{cand['swept_level_name']}</b>\n"
         f"📍 <b>Current Live Price:</b> <code>{format_price(live_spot, dec)}</code>\n"
         f"🎯 <b>LOCKED ENTRY SPOT:</b> <b><code>{format_price(entry_spot, dec)}</code></b>\n\n"
@@ -2159,6 +2207,10 @@ def check_pending_pre_alerts_realtime():
             continue
         info = FOREX_PAIRS[name]
         dec  = info["decimals"]
+
+        spread_ok, _ = check_low_spread_window(info)
+        if not spread_ok:
+            continue
 
         mins_waiting = (now_utc - cand.get("created_utc", now_utc)).total_seconds() / 60.0
         if mins_waiting > PRE_ALERT_EXPIRY_MINUTES:
@@ -2322,6 +2374,7 @@ def scan_markets():
         send_telegram_message(
             f"🔔 <b>SESSION PRE-BRIEF ({today_name})</b> 🔔\n\n"
             f"🕒 <b>Active Windows:</b> {sessions_str}\n"
+            f"💧 <b>Spread Filter:</b> Active (Low-spread hours only)\n"
             f"📋 <b>Risk:</b> <b>$12.50 (0.25%)</b> | Max <b>2 trades</b>/day\n"
             f"• Sending charts for <b>XAUUSD</b> and <b>BTCUSD</b>..."
         )
@@ -2373,7 +2426,6 @@ def scan_markets():
                 elif cand["stage"] == "PRE_ALERT":
                     if now_utc >= pre_alert_cooldown.get(name, datetime.min.replace(tzinfo=timezone.utc)) and last_pre_alert_candle.get(name) != closed_time:
                         dispatch_pre_alert_setup(name, info, df_1h, df_15m, df_5m, live_spot, cand, closed_time)
-
         except Exception as e:
             print(f"Error scanning {name}: {e}")
 
@@ -2384,6 +2436,7 @@ if __name__ == "__main__":
     send_telegram_message(
         f"⚡ <b>$5,000 Two-Step Funded Bot Active (Telegram-Only · 0-Start)</b>\n"
         f"• <b>Sessions:</b> London + New York Active\n"
+        f"• <b>Spread Filter:</b> Active (Low-Spread Hours Only)\n"
         f"• <b>Setups:</b> 15M Sweep + 5M MSS & HTF Pullback to OB/FVG After 5M BOS\n"
         f"• <b>Chart Tags:</b> Clean <code>BOS</code>, <code>FVG</code> & <code>OB</code> marked live\n"
         f"• <b>Commands:</b> <code>/gold</code>, <code>/btc</code>, <code>/backtest</code>, <code>/status</code>, <code>/reset</code>"
@@ -2407,4 +2460,3 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Loop Error: {e}")
             time.sleep(2)
- 
