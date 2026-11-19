@@ -2426,6 +2426,7 @@ def scan_markets():
                 elif cand["stage"] == "PRE_ALERT":
                     if now_utc >= pre_alert_cooldown.get(name, datetime.min.replace(tzinfo=timezone.utc)) and last_pre_alert_candle.get(name) != closed_time:
                         dispatch_pre_alert_setup(name, info, df_1h, df_15m, df_5m, live_spot, cand, closed_time)
+
         except Exception as e:
             print(f"Error scanning {name}: {e}")
 
