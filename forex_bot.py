@@ -825,120 +825,20 @@ def extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, decimal
     }
 
 # =====================================================================
-# 7. SETUP ENGINES: (A) 15M SWEEP + 5M MSS  |  (B) HTF PULLBACK TO OB/FVG AFTER BOS
+# 7. STRATEGY 1 ENGINE: 1H BIAS + 15M KEY LEVEL SWEEP + 5M MSS + PAIR RADAR
 # =====================================================================
-def detect_5m_fvg_zone(df_5m, direction, lookback=8):
-    n = len(df_5m)
-    if n < lookback + 4:
-        return None
-    for idx in range(n - 2, max(2, n - 2 - lookback), -1):
-        c_curr  = df_5m.iloc[idx]
-        c_prev2 = df_5m.iloc[idx - 2]
-        if direction == "BUY":
-            gap_bot = float(c_prev2["High"])
-            gap_top = float(c_curr["Low"])
-            if gap_top > gap_bot:
-                return {"top": gap_top, "bot": gap_bot, "mid": (gap_top + gap_bot) / 2.0, "x_idx": idx - 2}
-        else:
-            gap_top = float(c_prev2["Low"])
-            gap_bot = float(c_curr["High"])
-            if gap_top > gap_bot:
-                return {"top": gap_top, "bot": gap_bot, "mid": (gap_top + gap_bot) / 2.0, "x_idx": idx - 2}
-    return None
-
-def detect_5m_bos_and_order_block(df_5m, direction, decimals):
-    n = len(df_5m)
-    if n < 14:
-        return None
-
-    highs = df_5m["High"].values.astype(float)
-    lows  = df_5m["Low"].values.astype(float)
-    opens = df_5m["Open"].values.astype(float)
-    close_last = float(df_5m.iloc[-2]["Close"])
-
-    if direction == "BUY":
-        best_bos = None
-        for b_idx in range(n - 2, max(5, n - 14), -1):
-            prior_high = float(np.max(highs[max(0, b_idx - 7):b_idx - 1]))
-            if float(highs[b_idx]) > prior_high and float(df_5m.iloc[b_idx]["Close"]) > prior_high:
-                ob_idx = None
-                for k in range(b_idx - 1, max(0, b_idx - 7), -1):
-                    if float(df_5m.iloc[k]["Close"]) < opens[k]:
-                        ob_idx = k
-                        break
-                if ob_idx is not None:
-                    ob_top = round(float(max(opens[ob_idx], float(df_5m.iloc[ob_idx]["Close"]), highs[ob_idx])), decimals)
-                    ob_bot = round(float(lows[ob_idx]), decimals)
-                    best_bos = {
-                        "bos_price": round(prior_high, decimals),
-                        "bos_x": b_idx,
-                        "ob": {"top": ob_top, "bot": ob_bot, "mid": round((ob_top + ob_bot) / 2.0, decimals), "x_idx": ob_idx}
-                    }
-                    break
-        if not best_bos:
-            return None
-        fvg = detect_5m_fvg_zone(df_5m, "BUY", lookback=8)
-        zone = best_bos["ob"]
-        in_ob  = (close_last <= zone["top"] * 1.0005) and (close_last >= zone["bot"] * 0.9985)
-        in_fvg = (fvg is not None) and (close_last <= fvg["top"]) and (close_last >= fvg["bot"])
-        if in_ob or in_fvg:
-            return {
-                "bos_price": best_bos["bos_price"],
-                "bos_x": best_bos["bos_x"],
-                "ob_zone": best_bos["ob"],
-                "fvg_zone": fvg,
-                "active_zone": fvg if (in_fvg and not in_ob) else best_bos["ob"],
-                "zone_name": "5M FVG" if (in_fvg and not in_ob) else "5M Bullish OB"
-            }
-        return None
-
-    else:
-        best_bos = None
-        for b_idx in range(n - 2, max(5, n - 14), -1):
-            prior_low = float(np.min(lows[max(0, b_idx - 7):b_idx - 1]))
-            if float(lows[b_idx]) < prior_low and float(df_5m.iloc[b_idx]["Close"]) < prior_low:
-                ob_idx = None
-                for k in range(b_idx - 1, max(0, b_idx - 7), -1):
-                    if float(df_5m.iloc[k]["Close"]) > opens[k]:
-                        ob_idx = k
-                        break
-                if ob_idx is not None:
-                    ob_bot = round(float(min(opens[ob_idx], float(df_5m.iloc[ob_idx]["Close"]), lows[ob_idx])), decimals)
-                    ob_top = round(float(highs[ob_idx]), decimals)
-                    best_bos = {
-                        "bos_price": round(prior_low, decimals),
-                        "bos_x": b_idx,
-                        "ob": {"top": ob_top, "bot": ob_bot, "mid": round((ob_top + ob_bot) / 2.0, decimals), "x_idx": ob_idx}
-                    }
-                    break
-        if not best_bos:
-            return None
-        fvg = detect_5m_fvg_zone(df_5m, "SELL", lookback=8)
-        zone = best_bos["ob"]
-        in_ob  = (close_last >= zone["bot"] * 0.9995) and (close_last <= zone["top"] * 1.0015)
-        in_fvg = (fvg is not None) and (close_last >= fvg["bot"]) and (close_last <= fvg["top"])
-        if in_ob or in_fvg:
-            return {
-                "bos_price": best_bos["bos_price"],
-                "bos_x": best_bos["bos_x"],
-                "ob_zone": best_bos["ob"],
-                "fvg_zone": fvg,
-                "active_zone": fvg if (in_fvg and not in_ob) else best_bos["ob"],
-                "zone_name": "5M FVG" if (in_fvg and not in_ob) else "5M Bearish OB"
-            }
-        return None
-
 def check_sweep_proximity_radar(pair_name, info, roadmap, live_spot, atr_5m):
+    """Alerts when live price approaches any aligned key liquidity area around the pair."""
     if roadmap["h1_bias"] == "RANGING" or atr_5m <= 0:
         return
-    ny_ok, _, _, _ = get_active_sessions_info()
-    spread_ok, _   = check_low_spread_window(info)
-    if not ny_ok or not spread_ok:
+    sess_ok, _, _, _ = get_active_sessions_info()
+    spread_ok, _     = check_low_spread_window(info)
+    if not sess_ok or not spread_ok:
         return
     if pending_pre_alerts.get(pair_name) is not None:
         return
 
-    prox_band = atr_5m * 0.35
+    prox_band = atr_5m * 0.45
     for lv in roadmap["levels"]:
         aligned = (roadmap["h1_bias"] == "BULLISH" and lv["type"] == "LOW_POOL") or \
                   (roadmap["h1_bias"] == "BEARISH" and lv["type"] == "HIGH_POOL")
@@ -950,9 +850,9 @@ def check_sweep_proximity_radar(pair_name, info, roadmap, live_spot, atr_5m):
                 last_radar_key[pair_name] = radar_key
                 dec = info["decimals"]
                 send_telegram_message(
-                    f"📡 <b>SWEEP RADAR — {info['mt5_name']} APPROACHING LEVEL</b>\n"
+                    f"📡 <b>PAIR LEVEL RADAR — {info['mt5_name']} NEAR KEY AREA</b>\n"
                     f"🧭 <b>1H Bias:</b> <b>{roadmap['h1_bias']}</b> | 🧲 <b>Level:</b> <b>{lv['short']} (<code>{format_price(lv['price'], dec)}</code>)</b>\n"
-                    f"📍 <b>Live Price:</b> <code>{format_price(live_spot, dec)}</code> — Watch for sweep + MSS or BOS pullback."
+                    f"📍 <b>Live Price:</b> <code>{format_price(live_spot, dec)}</code> — Watching 15M sweep + 5M MSS."
                 )
             break
 
@@ -1010,7 +910,7 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
     buf_5m = round(max(atr_5m * 0.12, spread_cost_now * 0.5), dec)
 
     # -----------------------------------------------------------------
-    # STRATEGY A: 15M LIQUIDITY SWEEP + 5M MSS + FVG
+    # STRATEGY 1 ONLY: 15M LIQUIDITY SWEEP + 5M MSS
     # -----------------------------------------------------------------
     for lv in levels:
         lvl_price = lv["price"]
@@ -1044,14 +944,9 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
                 )
 
                 if mss_body_confirmed or mss_pre_forming:
-                    fvg_zone = detect_5m_fvg_zone(df_5m, "BUY", lookback=5)
-                    ob_info  = detect_5m_bos_and_order_block(df_5m, "BUY", dec)
-                    ob_zone  = ob_info["ob_zone"] if ob_info else None
-                    bos_line = ob_info["bos_price"] if ob_info else round(mss_neck_high, dec)
-
                     if mss_body_confirmed:
                         entry_spot = round(p_close, dec)
-                        mss_desc   = "5M Bullish MSS Body Close + FVG" if fvg_zone else "5M Bullish MSS Body Close"
+                        mss_desc   = "5M Bullish MSS Body Close"
                         stage_type = "CONFIRMED_BREAKOUT"
                     else:
                         entry_spot = round(mss_neck_high + buf_5m, dec)
@@ -1094,9 +989,6 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
                             "lot_size": lot_size,
                             "planned_risk_usd": planned_risk_usd,
                             "cost_usd": cost_usd,
-                            "fvg_zone": fvg_zone,
-                            "ob_zone": ob_zone,
-                            "bos_line": bos_line,
                             "rr": PRIMARY_RR_TARGET,
                             "score": 90 if mss_body_confirmed else 84,
                             "why_text": (
@@ -1132,14 +1024,9 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
                 )
 
                 if mss_body_confirmed or mss_pre_forming:
-                    fvg_zone = detect_5m_fvg_zone(df_5m, "SELL", lookback=5)
-                    ob_info  = detect_5m_bos_and_order_block(df_5m, "SELL", dec)
-                    ob_zone  = ob_info["ob_zone"] if ob_info else None
-                    bos_line = ob_info["bos_price"] if ob_info else round(mss_neck_low, dec)
-
                     if mss_body_confirmed:
                         entry_spot = round(p_close, dec)
-                        mss_desc   = "5M Bearish MSS Body Close + FVG" if fvg_zone else "5M Bearish MSS Body Close"
+                        mss_desc   = "5M Bearish MSS Body Close"
                         stage_type = "CONFIRMED_BREAKOUT"
                     else:
                         entry_spot = round(mss_neck_low - buf_5m, dec)
@@ -1182,9 +1069,6 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
                             "lot_size": lot_size,
                             "planned_risk_usd": planned_risk_usd,
                             "cost_usd": cost_usd,
-                            "fvg_zone": fvg_zone,
-                            "ob_zone": ob_zone,
-                            "bos_line": bos_line,
                             "rr": PRIMARY_RR_TARGET,
                             "score": 90 if mss_body_confirmed else 84,
                             "why_text": (
@@ -1193,107 +1077,6 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
                                 f"3️⃣ <b>5M Confirmation:</b> <b>{mss_desc}</b> with SL above sweep high (<code>{format_price(invalidation_sl, dec)}</code>)."
                             )
                         })
-
-    # -----------------------------------------------------------------
-    # STRATEGY B: HTF PULLBACK TO ORDER BLOCK / FVG AFTER 5M BOS
-    # -----------------------------------------------------------------
-    if h1_bias in ["BULLISH", "BEARISH"]:
-        pb_info = detect_5m_bos_and_order_block(df_5m, "BUY" if h1_bias == "BULLISH" else "SELL", dec)
-        if pb_info is not None:
-            az = pb_info["active_zone"]
-            ob_z = pb_info["ob_zone"]
-            fvg_z = pb_info["fvg_zone"]
-            if h1_bias == "BULLISH" and p_close > p_open and close_p >= 0.55:
-                entry_spot = round(p_close, dec)
-                invalidation_sl = round(min(float(df_5m.iloc[-6:-1]["Low"].min()), az["bot"]) - (atr_5m * 0.20), dec)
-                sl_dist = round(abs(entry_spot - invalidation_sl), dec)
-                if sl_dist < info["min_sl_dist"]:
-                    sl_dist = info["min_sl_dist"]
-                    invalidation_sl = round(entry_spot - sl_dist, dec)
-                lot_size, planned_risk_usd, cost_usd = calculate_roadmap_position_size(pair_name, info, sl_dist, RISK_PER_TRADE_USD)
-                if lot_size is None or sl_dist > info["max_sl_dist"]:
-                    skipped_for_risk = True
-                else:
-                    tp1_price = round(entry_spot + (sl_dist * BREAKEVEN_LOCK_R), dec)
-                    tp2_price = round(entry_spot + (sl_dist * PRIMARY_RR_TARGET), dec)
-                    candidates.append({
-                        "stage": "CONFIRMED_BREAKOUT",
-                        "direction": "BUY",
-                        "action": "BUY (LONG) 🟢",
-                        "h1_bias": h1_bias,
-                        "swept_level_name": f"5M BOS ({format_price(pb_info['bos_price'], dec)}) ➔ {pb_info['zone_name']}",
-                        "swept_level_short": f"BOS➔{pb_info['zone_name']}",
-                        "swept_level_price": pb_info["bos_price"],
-                        "mss_confirmation": f"HTF Pullback to {pb_info['zone_name']} After 5M BOS",
-                        "short_tag": f"1H BULL + 5M BOS + {pb_info['zone_name']}",
-                        "setup_id": f"BOS_PB_BUY_{pb_info['bos_price']}",
-                        "entry_spot": entry_spot,
-                        "sl_price": invalidation_sl,
-                        "sl_dist": sl_dist,
-                        "lock_level": tp1_price,
-                        "tp1_price": tp1_price,
-                        "tp2_price": tp2_price,
-                        "tp2_dist": round(sl_dist * PRIMARY_RR_TARGET, dec),
-                        "lot_size": lot_size,
-                        "planned_risk_usd": planned_risk_usd,
-                        "cost_usd": cost_usd,
-                        "fvg_zone": fvg_z,
-                        "ob_zone": ob_z,
-                        "bos_line": pb_info["bos_price"],
-                        "rr": PRIMARY_RR_TARGET,
-                        "score": 88,
-                        "why_text": (
-                            f"1️⃣ <b>1H Context:</b> <b>BULLISH</b> trend aligned.\n"
-                            f"2️⃣ <b>5M BOS:</b> Broke structure above <code>{format_price(pb_info['bos_price'], dec)}</code>.\n"
-                            f"3️⃣ <b>Pullback Entry:</b> Rejected from <b>{pb_info['zone_name']}</b> with SL at <code>{format_price(invalidation_sl, dec)}</code>."
-                        )
-                    })
-
-            elif h1_bias == "BEARISH" and p_close < p_open and close_p <= 0.45:
-                entry_spot = round(p_close, dec)
-                invalidation_sl = round(max(float(df_5m.iloc[-6:-1]["High"].max()), az["top"]) + (atr_5m * 0.20), dec)
-                sl_dist = round(abs(invalidation_sl - entry_spot), dec)
-                if sl_dist < info["min_sl_dist"]:
-                    sl_dist = info["min_sl_dist"]
-                    invalidation_sl = round(entry_spot + sl_dist, dec)
-                lot_size, planned_risk_usd, cost_usd = calculate_roadmap_position_size(pair_name, info, sl_dist, RISK_PER_TRADE_USD)
-                if lot_size is None or sl_dist > info["max_sl_dist"]:
-                    skipped_for_risk = True
-                else:
-                    tp1_price = round(entry_spot - (sl_dist * BREAKEVEN_LOCK_R), dec)
-                    tp2_price = round(entry_spot - (sl_dist * PRIMARY_RR_TARGET), dec)
-                    candidates.append({
-                        "stage": "CONFIRMED_BREAKOUT",
-                        "direction": "SELL",
-                        "action": "SELL (SHORT) 🔴",
-                        "h1_bias": h1_bias,
-                        "swept_level_name": f"5M BOS ({format_price(pb_info['bos_price'], dec)}) ➔ {pb_info['zone_name']}",
-                        "swept_level_short": f"BOS➔{pb_info['zone_name']}",
-                        "swept_level_price": pb_info["bos_price"],
-                        "mss_confirmation": f"HTF Pullback to {pb_info['zone_name']} After 5M BOS",
-                        "short_tag": f"1H BEAR + 5M BOS + {pb_info['zone_name']}",
-                        "setup_id": f"BOS_PB_SELL_{pb_info['bos_price']}",
-                        "entry_spot": entry_spot,
-                        "sl_price": invalidation_sl,
-                        "sl_dist": sl_dist,
-                        "lock_level": tp1_price,
-                        "tp1_price": tp1_price,
-                        "tp2_price": tp2_price,
-                        "tp2_dist": round(sl_dist * PRIMARY_RR_TARGET, dec),
-                        "lot_size": lot_size,
-                        "planned_risk_usd": planned_risk_usd,
-                        "cost_usd": cost_usd,
-                        "fvg_zone": fvg_z,
-                        "ob_zone": ob_z,
-                        "bos_line": pb_info["bos_price"],
-                        "rr": PRIMARY_RR_TARGET,
-                        "score": 88,
-                        "why_text": (
-                            f"1️⃣ <b>1H Context:</b> <b>BEARISH</b> trend aligned.\n"
-                            f"2️⃣ <b>5M BOS:</b> Broke structure below <code>{format_price(pb_info['bos_price'], dec)}</code>.\n"
-                            f"3️⃣ <b>Pullback Entry:</b> Rejected from <b>{pb_info['zone_name']}</b> with SL at <code>{format_price(invalidation_sl, dec)}</code>."
-                        )
-                    })
 
     if not candidates:
         reason = "SKIPPED_SL_EXCEEDS_12_50_RISK" if skipped_for_risk else "NO_SETUP"
@@ -1402,7 +1185,7 @@ def compute_day_wise_breakdown(trades_list):
     return {"days": day_stats, "best_day": best_day, "worst_day": worst_day}
 
 # =====================================================================
-# 9. HIGH-SPEED CLEAN CHARTS (NO BOS / FVG / OB) & TELEGRAM REPORTS
+# 9. HIGH-SPEED CLEAN CHARTS & TELEGRAM REPORTS
 # =====================================================================
 def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, day_breakdown):
     try:
@@ -1782,7 +1565,7 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         top_ax.axis("off")
         top_ax.text(
             0.0, 0.72,
-            f"{hdr_nam} ({mt5_sym}) · Session Liquidity Map (5m)",
+            f"{hdr_nam} ({mt5_sym}) · 15M Sweep + 5M MSS Liquidity Map (5m)",
             fontsize=9.5, fontweight="bold", color="#131722", va="center", ha="left"
         )
         top_ax.text(
@@ -1797,7 +1580,7 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
             bbox=dict(boxstyle="round,pad=0.24", facecolor=bias_bg, edgecolor="#cbd5e1", linewidth=0.7)
         )
 
-        fig.text(0.015, 0.018, "Telegram Bot · London + NY · Low-Spread", fontsize=9.0, fontweight="bold", color="#131722")
+        fig.text(0.015, 0.018, "Telegram Bot · Strategy 1 Only · London + NY · Low-Spread", fontsize=9.0, fontweight="bold", color="#131722")
 
         buf = io.BytesIO()
         plt.savefig(buf, format="png", dpi=100, facecolor="#ffffff")
@@ -1870,7 +1653,7 @@ def send_instant_preview_chart(pair_key=None):
             f"📊 <b>{info['mt5_name']} • 1H ➔ 15M ➔ 5M SETUP</b>\n"
             f"🔔 <b>Status:</b> <b>{stage_lbl}</b> | 💧 <b>Spread:</b> {spread_status_txt}\n\n"
             f"🧭 <b>1H Context:</b> <b>{roadmap['h1_bias']}</b> | 📢 <b>Action:</b> <b>{cand['action']}</b>\n"
-            f"🧲 <b>Setup / Level:</b> {cand['swept_level_name']}\n"
+            f"🧲 <b>Swept Level:</b> {cand['swept_level_name']}\n"
             f"📍 <b>Live Price:</b> <code>{format_price(live_spot, dec)}</code>\n"
             f"🎯 <b>ENTRY SPOT:</b> <b><code>{format_price(cand['entry_spot'], dec)}</code></b>\n"
             f"💼 <b>Lot Size ($12.50 Risk):</b> <code>{cand['lot_size']:.2f} Lot</code> (Risk: ${cand['planned_risk_usd']:.2f})\n"
@@ -1880,16 +1663,16 @@ def send_instant_preview_chart(pair_key=None):
     else:
         no_trade_note = "⚠️ <b>1H is RANGING/CHOPPY — Stand Aside!</b>\n" if roadmap["h1_bias"] == "RANGING" else ""
         caption = (
-            f"📊 <b>{info['mt5_name']} • SESSION LIQUIDITY MAP</b>\n"
+            f"📊 <b>{info['mt5_name']} • PAIR LEVEL RADAR MAP</b>\n"
             f"🕒 <b>Session:</b> {sess_status_txt}\n"
             f"💧 <b>Spread Window:</b> {spread_status_txt}\n"
             f"🧭 <b>1H Context:</b> <b>{roadmap['h1_bias']}</b> | 📍 <b>Live:</b> <code>{format_price(live_spot, dec)}</code>\n"
             f"{no_trade_note}\n"
-            f"📌 <b>Pre-Marked Roadmap Levels:</b>\n"
+            f"📌 <b>Nearby Pair Levels:</b>\n"
             f"• <b>PDH / PDL:</b> <code>{format_price(roadmap['pdh'], dec)}</code> / <code>{format_price(roadmap['pdl'], dec)}</code>\n"
             f"• <b>London H / L:</b> <code>{format_price(roadmap['london_high'], dec)}</code> / <code>{format_price(roadmap['london_low'], dec)}</code>\n"
             f"• <b>Asian H / L:</b> <code>{format_price(roadmap['asian_high'], dec)}</code> / <code>{format_price(roadmap['asian_low'], dec)}</code>\n\n"
-            f"⏳ <b>Rules:</b> Active Session + Low Spread + (15M Sweep + 5M MSS OR 1H Trend + 5M BOS ➔ FVG/OB Pullback)."
+            f"⏳ <b>Active Rule:</b> 1H Bias + 15M Level Sweep + 5M MSS (Strategy 1 Only)."
         )
 
     send_telegram_signal_with_chart(caption, chart_buf)
@@ -2051,7 +1834,7 @@ def dispatch_pre_alert_setup(name, info, df_1h, df_15m, df_5m, live_spot, cand, 
     msg = (
         f"⏳ <b>PRE-ALERT LOCKED — {info['mt5_name']}</b> ⏳\n\n"
         f"📢 <b>Upcoming Action:</b> <b>{cand['action']}</b> | 💧 <b>Spread:</b> {sp_txt}\n"
-        f"🧲 <b>Setup / Level:</b> <b>{cand['swept_level_name']}</b>\n"
+        f"🧲 <b>Swept Level:</b> <b>{cand['swept_level_name']}</b>\n"
         f"📍 <b>Current Live Price:</b> <code>{format_price(live_spot, dec)}</code>\n"
         f"🎯 <b>LOCKED ENTRY SPOT:</b> <b><code>{format_price(entry_spot, dec)}</code></b>\n\n"
         f"💼 <b>Lot Size ($12.50 Max Risk):</b> <b><code>{lot_size:.2f} Lot</code></b>\n"
@@ -2302,10 +2085,10 @@ if __name__ == "__main__":
     threading.Thread(target=fetch_live_economic_calendar, daemon=True).start()
 
     send_telegram_message(
-        f"⚡ <b>$5,000 Two-Step Funded Bot Active (Telegram-Only · 0-Start)</b>\n"
+        f"⚡ <b>$5,000 Two-Step Funded Bot Active (Strategy 1 Only · 0-Start)</b>\n"
+        f"• <b>Active Strategy:</b> 1H Bias + 15M Sweep + 5M MSS + Pair Radar\n"
         f"• <b>Sessions:</b> London + New York Active\n"
         f"• <b>Spread Filter:</b> Active (Low-Spread Hours Only)\n"
-        f"• <b>Chart:</b> Clean Session Liquidity Map (BOS / FVG / OB removed)\n"
         f"• <b>Commands:</b> <code>/gold</code>, <code>/btc</code>, <code>/backtest</code>, <code>/status</code>, <code>/reset</code>"
     )
 
