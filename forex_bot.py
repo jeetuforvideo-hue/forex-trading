@@ -1648,13 +1648,14 @@ def send_instant_preview_chart(pair_key=None):
 
     # Preview chart shows live market structure without triggering or displaying manual trade signals
     chart_buf = generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None)
-    _, _, sess_status_txt, _ = get_active_sessions_info(info.get("is_crypto", False))
-    _, spread_status_txt     = check_low_spread_window(info)
+    _, _, sess_status_txt, sessions_str = get_active_sessions_info(info.get("is_crypto", False))
+    _, spread_status_txt                = check_low_spread_window(info)
 
     no_trade_note = "⚠️ <b>1H is RANGING/CHOPPY — Stand Aside!</b>\n" if roadmap["h1_bias"] == "RANGING" else ""
     caption = (
         f"📊 <b>{info['mt5_name']} • LIVE MARKET CHART</b>\n"
         f"🕒 <b>Session:</b> {sess_status_txt}\n"
+        f"🕒 <b>Sessions:</b> {sessions_str}\n"
         f"💧 <b>Spread Window:</b> {spread_status_txt}\n"
         f"🧭 <b>1H Context:</b> <b>{roadmap['h1_bias']}</b> | 📍 <b>Live:</b> <code>{format_price(live_spot, dec)}</code>\n"
         f"{no_trade_note}\n"
