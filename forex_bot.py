@@ -221,9 +221,12 @@ def is_forex_market_open():
         return False
     return True
 
-def get_active_sessions_info():
+def get_active_sessions_info(is_crypto=False):
     """Returns (is_trading_allowed, is_pre_session, status_label, sessions_summary)."""
     sessions_str = "London (12:30–4:30 PM IST) + New York (6:30–10:30 PM IST)"
+    if is_crypto:
+        return True, False, "🟢 24/7 Crypto Market Active", sessions_str
+
     if not is_forex_market_open():
         return False, False, "Weekend Closed", sessions_str
 
@@ -831,7 +834,7 @@ def check_sweep_proximity_radar(pair_name, info, roadmap, live_spot, atr_5m):
     """Alerts when live price approaches any aligned key liquidity area around the pair."""
     if roadmap["h1_bias"] == "RANGING" or atr_5m <= 0:
         return
-    sess_ok, _, _, _ = get_active_sessions_info()
+    sess_ok, _, _, _ = get_active_sessions_info(info.get("is_crypto", False))
     spread_ok, _     = check_low_spread_window(info)
     if not sess_ok or not spread_ok:
         return
@@ -858,7 +861,7 @@ def check_sweep_proximity_radar(pair_name, info, roadmap, live_spot, atr_5m):
 
 def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot, ignore_locks=False, return_skip_reason=False):
     if not ignore_locks:
-        sess_ok, _, _, _ = get_active_sessions_info()
+        sess_ok, _, _, _ = get_active_sessions_info(info.get("is_crypto", False))
         if not sess_ok:
             return (None, "OUTSIDE_ACTIVE_SESSION") if return_skip_reason else None
         spread_ok, _ = check_low_spread_window(info)
@@ -1645,7 +1648,7 @@ def send_instant_preview_chart(pair_key=None):
 
     # Preview chart shows live market structure without triggering or displaying manual trade signals
     chart_buf = generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None)
-    _, _, sess_status_txt, _ = get_active_sessions_info()
+    _, _, sess_status_txt, _ = get_active_sessions_info(info.get("is_crypto", False))
     _, spread_status_txt     = check_low_spread_window(info)
 
     no_trade_note = "⚠️ <b>1H is RANGING/CHOPPY — Stand Aside!</b>\n" if roadmap["h1_bias"] == "RANGING" else ""
@@ -1666,7 +1669,7 @@ def send_instant_preview_chart(pair_key=None):
 
 def send_live_status_summary():
     bal, eq, day_pnl, week_pnl = get_live_account_metrics()
-    _, _, sess_status_txt, _     = get_active_sessions_info()
+    _, _, sess_status_txt, _     = get_active_sessions_info(False)
     can_tr, _, guard_reason    = check_funded_account_risk_rules()
     dd_from_peak               = max(STARTING_CAPITAL_USD, HIGH_WATER_MARK_USD) - min(bal, eq)
     today_name                 = WEEKDAY_NAMES[get_ny_weekday_index(get_utc_now())]
@@ -2004,7 +2007,7 @@ def scan_markets():
         weekly_realized_pnl = 0.0
         weekly_halt_announced = False
 
-    _, is_pre_session, _, sessions_str = get_active_sessions_info()
+    _, is_pre_session, _, sessions_str = get_active_sessions_info(False)
     if is_pre_session and pre_session_brief_sent != today:
         pre_session_brief_sent = today
         today_name = WEEKDAY_NAMES[get_ny_weekday_index(get_utc_now())]
@@ -2074,7 +2077,7 @@ if __name__ == "__main__":
     send_telegram_message(
         f"⚡ <b>$5,000 Two-Step Funded Bot Active (Strategy 1 Only · 0-Start)</b>\n"
         f"• <b>Active Strategy:</b> 1H Bias + 15M Sweep + 5M MSS + Pair Radar\n"
-        f"• <b>Sessions:</b> London + New York Active\n"
+        f"• <b>Sessions:</b> London + New York Active (BTC/USD 24/7)\n"
         f"• <b>Spread Filter:</b> Active (Low-Spread Hours Only)\n"
         f"• <b>Commands:</b> <code>/gold</code>, <code>/btc</code>, <code>/backtest</code>, <code>/status</code>, <code>/reset</code>"
     )
