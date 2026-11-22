@@ -691,7 +691,7 @@ def generate_smc_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None,
 
         n_bars = len(sub)
         x_vals = np.arange(n_bars)
-        right_pad = n_bars + 15
+        right_pad = n_bars + 18
 
         ax.grid(True, linestyle="-", linewidth=0.5, color="#f1f5f9", zorder=1)
         for s in ["top", "left"]:
@@ -741,7 +741,7 @@ def generate_smc_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None,
             is_buy = active_trade["direction"] == "BUY"
 
             x_box_start = n_bars - 2
-            box_width = 16
+            box_width = 19
 
             # Profit Box (Green) & Risk Box (Red)
             target_h = abs(tp - ent)
@@ -775,11 +775,12 @@ def generate_smc_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None,
                 zorder=7
             )
 
-            # Central Long/Short Tool Badge
+            # Central Long/Short Tool Badge (Shifted right so candles remain 100% visible)
             badge_title = "🎯 LONG POSITION" if is_buy else "🎯 SHORT POSITION"
+            badge_shift_x = x_box_start + 6.0
             ax.text(
-                x_box_start + 7.5, ent, f" {badge_title} | 1:2 RR ($30 -> +$60) ",
-                color="#ffffff", fontsize=7.5, fontweight="bold", ha="center", va="center",
+                badge_shift_x, ent, f" {badge_title} | 1:2 RR ($30 -> +$60) ",
+                color="#ffffff", fontsize=7.4, fontweight="bold", ha="left", va="center",
                 bbox=dict(boxstyle="round,pad=0.25", facecolor="#1e40af", edgecolor="none"),
                 zorder=8
             )
