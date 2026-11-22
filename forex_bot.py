@@ -1,23 +1,32 @@
 """
 =============================================================================
-SMC TRADING BOT (XAU/USD & BTC/USD)
+SMC TRADING BOT (XAU/USD & BTC/USD) — PRO EDITION
 =============================================================================
 Key Features & Rules:
 1. Pairs: XAU/USD (Gold) and BTC/USD (Bitcoin).
 2. Strategy: Smart Money Concepts (SMC)
-   - 1H Market Context / Bias (Bullish / Bearish / Choppy)
+   - 1H Market Bias / Order Flow
    - 15M Key Liquidity Sweep (PDH/PDL, London H/L, Asian H/L, 1H Swings)
    - 5M Market Structure Shift (MSS) with Strong Displacement Body
-3. Risk Management:
-   - Max 2 Trades Per Day
-   - $30.00 Fixed Risk Per Trade
+3. Smart Early Alerts & Notifications:
+   - ⏳ PRE-ALERT: Alerts when 15M sweep happens & 5M MSS is forming (Get ready!)
+   - 🔔 SESSION POPUPS: Automatic alerts when London (12:30 PM IST) & New York (6:30 PM IST) start
+   - 🎯 CONFIRMED SIGNAL: Dispatches trade with exact Entry, SL, 1:2 TP, and Lot Size
+   - 🛡️ 1:1 BREAKEVEN ALERT: Moves SL to Entry when price reaches +$30 (+1R)
+   - 🏆 EXIT NOTIFICATION: Instant alert when TP (+$60) or SL (-$30) is hit
+4. TradingView Long/Short Position Charts:
+   - Realistic, hand-annotated TradingView look
+   - Green Profit Box & Red Risk Box (Long/Short Tool)
+   - Swept wick annotated with '💧 Liquidity Swept'
+   - Neckline annotated with '⚡ 5M MSS Break'
+   - Live Spot price badge with candle countdown timer
+5. Risk Management:
+   - Exactly 2 trades per day
+   - Exactly $30.00 planned loss per trade
+   - 1:2 Risk to Reward (Risk $30 -> Gain +$60)
    - Max Daily Loss: $60.00 (or 2 consecutive losses -> Stop for the day)
-   - 1:2 Risk to Reward (Risk $30 -> Target +$60)
-   - 1:1 Breakeven Lock (+1R -> Move SL to Entry)
-4. Execution: Alert & Signal Mode (Clean, Uncluttered, Ready-to-Execute)
-5. Speed: Asynchronous Chart Generation (Non-blocking scanner)
-6. 24/7 Bitcoin: BTC trades continuously 365 days, including Saturday & Sunday.
-7. Crash-Proof: State saved to 'bot_state.json' (Restores trade count on restart)
+6. 24/7 Bitcoin: BTC trades continuously 365 days (Saturday & Sunday Enabled).
+7. Crash-Proof: Persistent State ('bot_state.json') restores trades across reboots.
 =============================================================================
 """
 
@@ -42,7 +51,7 @@ for pkg in REQUIRED_PACKAGES:
         try:
             subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
         except Exception as e:
-            print(f"Warning installing {pkg}: {e}")
+            print(f"Package install notice ({pkg}): {e}")
 
 import requests
 import numpy as np
@@ -50,7 +59,7 @@ import pandas as pd
 import yfinance as yf
 
 import matplotlib
-matplotlib.use("Agg")  # Non-GUI fast backend
+matplotlib.use("Agg")  # Fast Non-GUI backend
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.patches import Polygon
@@ -61,7 +70,7 @@ from matplotlib.patches import Polygon
 BOT_TOKEN = os.getenv("BOT_TOKEN") or "YOUR_TELEGRAM_BOT_TOKEN"
 CHAT_ID   = os.getenv("CHAT_ID") or "5610520408"
 
-# Risk Configuration
+# Risk Parameters
 STARTING_BALANCE_USD   = 5000.0
 RISK_PER_TRADE_USD     = 30.00    # Exact $30 risk per trade
 MAX_DAILY_TRADES       = 2        # Exactly 2 trades per day
@@ -85,13 +94,12 @@ TELEGRAM_SESSION.headers.update({
     "Connection": "keep-alive"
 })
 
-# Dedicated thread pools for non-blocking operations
 DATA_EXECUTOR  = ThreadPoolExecutor(max_workers=5, thread_name_prefix="DataWorker")
 CHART_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ChartWorker")
 STATE_LOCK     = threading.Lock()
 
 # ---------------------------------------------------------------------------
-# Pairs Setup (XAU/USD & BTC/USD Only)
+# Pairs Configuration (XAU/USD & BTC/USD Only)
 # ---------------------------------------------------------------------------
 PAIRS_CONFIG = {
     "XAU/USD": {
@@ -103,13 +111,13 @@ PAIRS_CONFIG = {
         "binance_symbol": "PAXGUSDT",
         "yf_symbol": "GC=F",
         "decimals": 2,
-        "spread_estimate": 0.35,          # $0.35 spread estimate
-        "contract_multiplier": 100.0,      # 1 Lot = 100 oz ($1 move = $100 per lot)
+        "spread_estimate": 0.35,
+        "contract_multiplier": 100.0,  # 1 Lot = 100 oz ($1 move = $100 per lot)
         "min_lot": 0.01,
         "max_lot": 1.00,
-        "min_sl_dist": 2.50,               # Minimum logical SL in points
-        "max_sl_dist": 15.00,              # Maximum logical SL to prevent low RR
-        "is_crypto": False                 # Respects Forex market hours (Closed weekends)
+        "min_sl_dist": 2.50,
+        "max_sl_dist": 15.00,
+        "is_crypto": False             # Respects Forex market hours
     },
     "BTC/USD": {
         "symbol": "BTCUSD",
@@ -120,18 +128,18 @@ PAIRS_CONFIG = {
         "binance_symbol": "BTCUSDT",
         "yf_symbol": "BTC-USD",
         "decimals": 2,
-        "spread_estimate": 25.0,           # $25 spread estimate
-        "contract_multiplier": 1.0,        # Standard CFD: 1 Lot = 1 BTC ($1 move = $1 per lot)
+        "spread_estimate": 25.0,
+        "contract_multiplier": 1.0,    # 1 Lot = 1 BTC ($1 move = $1 per lot)
         "min_lot": 0.01,
         "max_lot": 2.00,
-        "min_sl_dist": 150.0,              # Minimum logical SL in points
-        "max_sl_dist": 1500.0,             # Maximum logical SL
-        "is_crypto": True                  # 24/7 365 Days Active (TRADES ON WEEKENDS)
+        "min_sl_dist": 150.0,
+        "max_sl_dist": 1500.0,
+        "is_crypto": True              # 24/7 365 Days Active (TRADES ON WEEKENDS)
     }
 }
 
 # ---------------------------------------------------------------------------
-# Time Helpers
+# Time & Session Helpers
 # ---------------------------------------------------------------------------
 def get_utc_now():
     return datetime.now(timezone.utc)
@@ -160,7 +168,7 @@ def is_forex_market_open():
     return True
 
 # ---------------------------------------------------------------------------
-# Persistent State Manager (Crash-Proof Engine)
+# Persistent State Manager
 # ---------------------------------------------------------------------------
 class StateManager:
     def __init__(self, filepath=STATE_FILE_PATH):
@@ -175,7 +183,8 @@ class StateManager:
             "losses_today": 0,
             "daily_realized_pnl": 0.0,
             "open_trades": [],
-            "daily_halt": False
+            "daily_halt": False,
+            "announced_sessions": []
         }
         if os.path.exists(self.filepath):
             try:
@@ -184,7 +193,6 @@ class StateManager:
                     if data.get("date") == today_str:
                         return data
                     else:
-                        # New day started
                         default_state["date"] = today_str
                         return default_state
             except Exception as e:
@@ -208,6 +216,8 @@ class StateManager:
                 self.state["losses_today"] = 0
                 self.state["daily_realized_pnl"] = 0.0
                 self.state["daily_halt"] = False
+                self.state["open_trades"] = []
+                self.state["announced_sessions"] = []
                 self.save_state()
             send_telegram_message(
                 f"🌅 <b>NEW TRADING DAY INITIALIZED ({today_str})</b>\n"
@@ -227,13 +237,14 @@ class StateManager:
 
 state_mgr = StateManager()
 
-# Runtime Memory for fast duplicate prevention
+# Runtime in-memory caches
 last_candle_traded   = {name: None for name in PAIRS_CONFIG}
+last_pre_alert_time  = {name: datetime.min.replace(tzinfo=timezone.utc) for name in PAIRS_CONFIG}
 pair_cooldown_until  = {name: datetime.min.replace(tzinfo=timezone.utc) for name in PAIRS_CONFIG}
 ohlc_cache           = {}
 
 # ---------------------------------------------------------------------------
-# Telegram Messenger
+# Telegram Dispatcher
 # ---------------------------------------------------------------------------
 def send_telegram_message(text, target_chat_id=CHAT_ID):
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
@@ -256,7 +267,6 @@ def send_telegram_photo(photo_bytes, caption_html="", target_chat_id=CHAT_ID):
     try:
         res = TELEGRAM_SESSION.post(url, data=data, files=files, timeout=8.0)
         if res.status_code != 200 and len(caption_html) > 1024:
-            # Fallback if caption exceeded limit
             TELEGRAM_SESSION.post(url, data={"chat_id": target_chat_id}, files=files, timeout=8.0)
             send_telegram_message(caption_html, target_chat_id)
     except Exception as e:
@@ -264,10 +274,9 @@ def send_telegram_photo(photo_bytes, caption_html="", target_chat_id=CHAT_ID):
         send_telegram_message(caption_html, target_chat_id)
 
 # ---------------------------------------------------------------------------
-# Market Data Engine (Fast, Multi-Source & Cached)
+# Market Data Engine
 # ---------------------------------------------------------------------------
 def fetch_binance_ohlc(symbol, interval="5m", limit=180):
-    """High-speed official Binance API for 24/7 crypto and gold fallback."""
     for base in ["https://data-api.binance.vision/api/v3/klines", "https://api.binance.com/api/v3/klines"]:
         try:
             r = HTTP_SESSION.get(base, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=2.5)
@@ -288,7 +297,6 @@ def fetch_binance_ohlc(symbol, interval="5m", limit=180):
     return None
 
 def fetch_tradingview_spot_and_5m(tv_tickers, screener="cfd"):
-    """Fetches real-time CFD tick data from TradingView scanner."""
     if isinstance(tv_tickers, str):
         tv_tickers = [tv_tickers]
     url = f"https://scanner.tradingview.com/{screener}/scan"
@@ -327,17 +335,15 @@ def sanitize_df(df, min_bars=30):
     return df
 
 def get_3tf_data(pair_name, info):
-    """Fetches 1H, 15M, and 5M data with real-time spot calibration."""
     now_ts = time.time()
     cache_entry = ohlc_cache.get(pair_name)
-    if cache_entry and (now_ts - cache_entry["time"]) < 20.0:
+    if cache_entry and (now_ts - cache_entry["time"]) < 18.0:
         return cache_entry["1h"], cache_entry["15m"], cache_entry["5m"], cache_entry["spot"]
 
     df_1h, df_15m, df_5m = None, None, None
     live_spot = None
 
     if info.get("is_crypto"):
-        # Instant official Binance feeds for BTC
         sym = info["binance_symbol"]
         f_1h  = DATA_EXECUTOR.submit(fetch_binance_ohlc, sym, "1h", 120)
         f_15m = DATA_EXECUTOR.submit(fetch_binance_ohlc, sym, "15m", 150)
@@ -346,7 +352,6 @@ def get_3tf_data(pair_name, info):
         if df_5m is not None and not df_5m.empty:
             live_spot = float(df_5m.iloc[-1]["Close"])
     else:
-        # Multi-source for Gold
         tv_future = DATA_EXECUTOR.submit(fetch_tradingview_spot_and_5m, info["tv_tickers"], info["tv_screener"])
         try:
             tkr = yf.Ticker(info["yf_symbol"])
@@ -356,7 +361,6 @@ def get_3tf_data(pair_name, info):
         except Exception:
             pass
 
-        # Fallback to PAXGUSDT if Yahoo is slow
         if df_1h is None or df_15m is None or df_5m is None:
             sym = info["binance_symbol"]
             df_1h  = fetch_binance_ohlc(sym, "1h", 120)
@@ -372,7 +376,6 @@ def get_3tf_data(pair_name, info):
     if df_1h is None or df_15m is None or df_5m is None or live_spot is None:
         return None, None, None, None
 
-    # Calibrate latest bar with spot
     last_idx = df_5m.index[-1]
     df_5m.loc[last_idx, "Close"] = live_spot
     df_5m.loc[last_idx, "High"]  = max(float(df_5m.loc[last_idx, "High"]), live_spot)
@@ -402,13 +405,6 @@ def enrich_indicators(df):
     return df
 
 def get_smc_levels_and_1h_bias(df_1h, df_15m, decimals):
-    """
-    Extracts 1H Higher Timeframe Bias and Key Liquidity Pools:
-    - PDH (Previous Day High), PDL (Previous Day Low)
-    - Asian High / Low
-    - London High / Low
-    - 1H Swing Highs & Lows (Equal Highs / Equal Lows)
-    """
     closed_1h = df_1h.iloc[:-1] if len(df_1h) > 20 else df_1h
     atr_1h = float(closed_1h.iloc[-1]["ATR"])
     c_last = closed_1h.iloc[-1]
@@ -416,7 +412,6 @@ def get_smc_levels_and_1h_bias(df_1h, df_15m, decimals):
     h1_ema20 = float(c_last["EMA20"])
     h1_ema50 = float(c_last["EMA50"])
 
-    # 1H Structure Swings
     highs = closed_1h["High"].values
     lows  = closed_1h["Low"].values
     swing_highs, swing_lows = [], []
@@ -426,13 +421,11 @@ def get_smc_levels_and_1h_bias(df_1h, df_15m, decimals):
         if lows[i] <= min(lows[i-2:i]) and lows[i] <= lows[i+1]:
             swing_lows.append(round(float(lows[i]), decimals))
 
-    # Determine 1H Trend
     if h1_close > h1_ema20 and h1_ema20 >= h1_ema50:
         h1_bias = "BULLISH"
     elif h1_close < h1_ema20 and h1_ema20 <= h1_ema50:
         h1_bias = "BEARISH"
     else:
-        # Check swing progression
         if swing_highs and swing_lows and h1_close >= swing_lows[-1]:
             h1_bias = "BULLISH"
         elif swing_highs and swing_lows and h1_close <= swing_highs[-1]:
@@ -440,7 +433,6 @@ def get_smc_levels_and_1h_bias(df_1h, df_15m, decimals):
         else:
             h1_bias = "RANGING"
 
-    # 15M Session Liquidity Pools
     df_15m_utc = df_15m.copy()
     if isinstance(df_15m_utc.index, pd.DatetimeIndex):
         utc_idx = df_15m_utc.index.tz_convert("UTC") if df_15m_utc.index.tz else df_15m_utc.index.tz_localize("UTC")
@@ -488,16 +480,9 @@ def get_smc_levels_and_1h_bias(df_1h, df_15m, decimals):
     }
 
 # ---------------------------------------------------------------------------
-# Position Sizing: Exactly $30.00 Risk Calculation
+# Position Sizing
 # ---------------------------------------------------------------------------
 def calculate_lot_size(pair_name, info, sl_dist):
-    """
-    Calculates exact lot size to risk precisely $30.00:
-    - Gold (XAUUSD): 1 lot = 100 oz. $1 move = $100 per 1.0 lot.
-      Formula: Lot = 30.00 / ((SL Distance + Spread) * 100)
-    - Bitcoin (BTCUSD): 1 lot = 1 BTC. $1 move = $1 per 1.0 lot.
-      Formula: Lot = 30.00 / ((SL Distance + Spread) * 1.0)
-    """
     if sl_dist <= 0:
         return None, 0.0
 
@@ -513,11 +498,9 @@ def calculate_lot_size(pair_name, info, sl_dist):
     min_lot = info.get("min_lot", 0.01)
     max_lot = info.get("max_lot", 1.00)
 
-    # Round to 2 decimal places
     lot_size = max(min_lot, min(round(raw_lot, 2), max_lot))
     actual_risk = round(lot_size * loss_per_1_lot, 2)
 
-    # If rounding pushed risk > $30.50, step down one micro lot if possible
     if actual_risk > (RISK_PER_TRADE_USD + 0.75) and lot_size > min_lot:
         lot_size = round(lot_size - 0.01, 2)
         actual_risk = round(lot_size * loss_per_1_lot, 2)
@@ -525,20 +508,9 @@ def calculate_lot_size(pair_name, info, sl_dist):
     return lot_size, actual_risk
 
 # ---------------------------------------------------------------------------
-# SMC Strategy Engine (15M Liquidity Sweep + 5M MSS with Displacement)
+# SMC Strategy Engine (With Pre-Alert & Confirmed Entry Stages)
 # ---------------------------------------------------------------------------
 def evaluate_smc_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot):
-    """
-    Smart Money Concepts (SMC) Setup Rules:
-    1. 1H Bias Alignment (Only BUY in Bullish, only SELL in Bearish).
-    2. 15M Liquidity Sweep: Price wicks through a key level (PDH/PDL/Session H/L)
-       taking buy-stops/sell-stops, but closes back inside.
-    3. 5M Market Structure Shift (MSS):
-       - Bullish: 5M candle body closes ABOVE recent swing high with strong body (>50% body ratio).
-       - Bearish: 5M candle body closes BELOW recent swing low with strong body (>50% body ratio).
-    4. SL Placement: At the absolute extreme of the sweep wick (Invalidation level).
-    5. TP Placement: 1:2 Risk to Reward (+ $60.00 profit).
-    """
     dec = info["decimals"]
     smc_ctx = get_smc_levels_and_1h_bias(df_1h, df_15m, dec)
     h1_bias = smc_ctx["h1_bias"]
@@ -552,8 +524,8 @@ def evaluate_smc_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot):
     p_close = float(m5_c0["Close"])
     p_open  = float(m5_c0["Open"])
 
-    if np.isnan(atr_5m) or atr_5m <= 0 or body_r < 0.45:
-        return None  # Candle lacked displacement body
+    if np.isnan(atr_5m) or atr_5m <= 0:
+        return None
 
     m15_recent = df_15m.iloc[-6:-1]
     m5_prev3   = df_5m.iloc[-5:-2]
@@ -565,31 +537,33 @@ def evaluate_smc_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot):
         lvl_short = lv["short"]
         lvl_type  = lv["type"]
 
-        # -------------------------------------------------------------------
-        # BUY SETUP: Bullish 1H + Sell-Side Liquidity Swept on 15M + 5M MSS
-        # -------------------------------------------------------------------
+        # BUY SETUP
         if h1_bias == "BULLISH" and lvl_type == "SELL_SIDE_LIQUIDITY":
             m15_min_low = float(m15_recent["Low"].min())
             m15_last_c  = float(df_15m.iloc[-2]["Close"])
-
-            # Swept below level and closed back above
             swept = (m15_min_low <= lvl_price) and (m15_last_c >= lvl_price - (atr_5m * 0.15))
 
             if swept:
-                # 5M MSS: Body close above previous swing high
                 neck_high = float(m5_prev3["High"].max())
                 sweep_low = min(float(df_5m.iloc[-8:-1]["Low"].min()), m15_min_low)
 
+                # Confirmed Breakout vs Pre-Alert Forming
                 mss_confirmed = (
                     (p_close > neck_high) and
                     (p_close > p_open) and
-                    (body_r >= 0.48) and
+                    (body_r >= 0.45) and
                     (live_spot >= lvl_price)
                 )
 
-                if mss_confirmed:
-                    entry = round(p_close, dec)
-                    # Logical SL: Just below sweep wick low with small buffer
+                mss_forming = (
+                    not mss_confirmed and
+                    (live_spot >= lvl_price) and
+                    (live_spot < neck_high + atr_5m * 0.10) and
+                    ((neck_high - live_spot) <= atr_5m * 0.85)
+                )
+
+                if mss_confirmed or mss_forming:
+                    entry = round(p_close if mss_confirmed else neck_high, dec)
                     sl = round(sweep_low - (atr_5m * 0.18), dec)
                     sl_dist = round(entry - sl, dec)
 
@@ -598,11 +572,17 @@ def evaluate_smc_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot):
                         if lot_size is not None:
                             be_level = round(entry + sl_dist, dec)
                             tp_level = round(entry + (sl_dist * PRIMARY_RR_TARGET), dec)
+                            stage = "CONFIRMED" if mss_confirmed else "PRE_ALERT"
+
                             candidates.append({
+                                "stage": stage,
                                 "direction": "BUY",
                                 "action": "BUY (LONG) 🟢",
                                 "h1_bias": h1_bias,
                                 "swept_level": f"{lvl_short} ({lvl_price})",
+                                "swept_price": lvl_price,
+                                "neckline": neck_high,
+                                "sweep_point": sweep_low,
                                 "entry": entry,
                                 "sl": sl,
                                 "sl_dist": sl_dist,
@@ -614,36 +594,37 @@ def evaluate_smc_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot):
                                 "reward_usd": round(actual_risk * PRIMARY_RR_TARGET, 2),
                                 "smc_notes": [
                                     f"1H Order Flow: {h1_bias}",
-                                    f"Liquidity Sweep: {lvl_short} Swept & Rejected",
-                                    "5M Trigger: Market Structure Shift (MSS) with Strong Body"
+                                    f"Liquidity: {lvl_short} Swept & Rejected",
+                                    "5M Trigger: Market Structure Shift (MSS) with Strong Body" if mss_confirmed else f"5M Trigger: Approaching Neckline {neck_high}"
                                 ]
                             })
 
-        # -------------------------------------------------------------------
-        # SELL SETUP: Bearish 1H + Buy-Side Liquidity Swept on 15M + 5M MSS
-        # -------------------------------------------------------------------
+        # SELL SETUP
         if h1_bias == "BEARISH" and lvl_type == "BUY_SIDE_LIQUIDITY":
             m15_max_high = float(m15_recent["High"].max())
             m15_last_c   = float(df_15m.iloc[-2]["Close"])
-
-            # Swept above level and closed back below
             swept = (m15_max_high >= lvl_price) and (m15_last_c <= lvl_price + (atr_5m * 0.15))
 
             if swept:
-                # 5M MSS: Body close below previous swing low
                 neck_low = float(m5_prev3["Low"].min())
                 sweep_high = max(float(df_5m.iloc[-8:-1]["High"].max()), m15_max_high)
 
                 mss_confirmed = (
                     (p_close < neck_low) and
                     (p_close < p_open) and
-                    (body_r >= 0.48) and
+                    (body_r >= 0.45) and
                     (live_spot <= lvl_price)
                 )
 
-                if mss_confirmed:
-                    entry = round(p_close, dec)
-                    # Logical SL: Just above sweep wick high with small buffer
+                mss_forming = (
+                    not mss_confirmed and
+                    (live_spot <= lvl_price) and
+                    (live_spot > neck_low - atr_5m * 0.10) and
+                    ((live_spot - neck_low) <= atr_5m * 0.85)
+                )
+
+                if mss_confirmed or mss_forming:
+                    entry = round(p_close if mss_confirmed else neck_low, dec)
                     sl = round(sweep_high + (atr_5m * 0.18), dec)
                     sl_dist = round(sl - entry, dec)
 
@@ -652,11 +633,17 @@ def evaluate_smc_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot):
                         if lot_size is not None:
                             be_level = round(entry - sl_dist, dec)
                             tp_level = round(entry - (sl_dist * PRIMARY_RR_TARGET), dec)
+                            stage = "CONFIRMED" if mss_confirmed else "PRE_ALERT"
+
                             candidates.append({
+                                "stage": stage,
                                 "direction": "SELL",
                                 "action": "SELL (SHORT) 🔴",
                                 "h1_bias": h1_bias,
                                 "swept_level": f"{lvl_short} ({lvl_price})",
+                                "swept_price": lvl_price,
+                                "neckline": neck_low,
+                                "sweep_point": sweep_high,
                                 "entry": entry,
                                 "sl": sl,
                                 "sl_dist": sl_dist,
@@ -668,18 +655,28 @@ def evaluate_smc_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot):
                                 "reward_usd": round(actual_risk * PRIMARY_RR_TARGET, 2),
                                 "smc_notes": [
                                     f"1H Order Flow: {h1_bias}",
-                                    f"Liquidity Sweep: {lvl_short} Swept & Rejected",
-                                    "5M Trigger: Market Structure Shift (MSS) with Strong Body"
+                                    f"Liquidity: {lvl_short} Swept & Rejected",
+                                    "5M Trigger: Market Structure Shift (MSS) with Strong Body" if mss_confirmed else f"5M Trigger: Approaching Neckline {neck_low}"
                                 ]
                             })
 
-    return candidates[0] if candidates else None
+    if not candidates:
+        return None
+    # Prefer confirmed over pre-alert
+    candidates.sort(key=lambda x: (1 if x["stage"] == "CONFIRMED" else 0), reverse=True)
+    return candidates[0]
 
 # ---------------------------------------------------------------------------
-# High-Speed Chart Generator (TradingView Style, Non-Blocking)
+# TradingView Long / Short Position Chart Generator
 # ---------------------------------------------------------------------------
-def generate_smc_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None):
-    """Generates a clean, crisp, professional chart showing Entry, SL, TP, and SMC Levels."""
+def generate_smc_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None, status_badge=None):
+    """
+    Renders authentic TradingView chart with:
+    - Long / Short Position tool (Green Target box & Red Stop Loss box)
+    - Hand-drawn style annotations (Liquidity Swept arrow & 5M MSS Break line)
+    - Live spot badge with candle countdown timer
+    - Clean white aesthetic with right-side price axis badges
+    """
     try:
         sub = df_5m.iloc[-45:].copy()
         if len(sub) < 15:
@@ -689,14 +686,14 @@ def generate_smc_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None)
         sym = info["symbol"]
         smc_ctx = get_smc_levels_and_1h_bias(df_1h, df_15m, dec)
 
-        fig = plt.figure(figsize=(9.2, 5.0), dpi=95, facecolor="#ffffff")
-        ax = fig.add_axes([0.02, 0.08, 0.88, 0.83], facecolor="#ffffff")
+        fig = plt.figure(figsize=(9.6, 5.2), dpi=100, facecolor="#ffffff")
+        ax = fig.add_axes([0.02, 0.08, 0.86, 0.82], facecolor="#ffffff")
 
         n_bars = len(sub)
         x_vals = np.arange(n_bars)
-        right_pad = n_bars + 14
+        right_pad = n_bars + 15
 
-        ax.grid(True, linestyle="-", linewidth=0.5, color="#f1f5f9")
+        ax.grid(True, linestyle="-", linewidth=0.5, color="#f1f5f9", zorder=1)
         for s in ["top", "left"]:
             ax.spines[s].set_visible(False)
         ax.spines["right"].set_color("#cbd5e1")
@@ -707,72 +704,154 @@ def generate_smc_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None)
         lows   = sub["Low"].values.astype(float)
         closes = sub["Close"].values.astype(float)
 
-        c_min, c_max = float(np.min(lows)), float(np.max(highs))
+        all_y = list(highs) + list(lows) + [live_spot]
+        if active_trade:
+            all_y.extend([active_trade["entry"], active_trade["sl"], active_trade["tp"]])
+
+        c_min, c_max = float(np.min(all_y)), float(np.max(all_y))
         y_span = max(c_max - c_min, 1e-4)
 
-        # Plot Candles
+        # Plot Japanese Candlesticks
         bulls = closes >= opens
         bears = ~bulls
         ax.vlines(x_vals[bulls], lows[bulls], highs[bulls], color="#089981", linewidth=1.2, zorder=3)
         ax.vlines(x_vals[bears], lows[bears], highs[bears], color="#f23645", linewidth=1.2, zorder=3)
-        ax.bar(x_vals[bulls], np.abs(closes[bulls] - opens[bulls]), bottom=np.minimum(opens[bulls], closes[bulls]), width=0.65, color="#089981", edgecolor="#089981", zorder=3)
-        ax.bar(x_vals[bears], np.abs(closes[bears] - opens[bears]), bottom=np.minimum(opens[bears], closes[bears]), width=0.65, color="#f23645", edgecolor="#f23645", zorder=3)
+        ax.bar(x_vals[bulls], np.abs(closes[bulls] - opens[bulls]), bottom=np.minimum(opens[bulls], closes[bulls]), width=0.66, color="#089981", edgecolor="#089981", zorder=3)
+        ax.bar(x_vals[bears], np.abs(closes[bears] - opens[bears]), bottom=np.minimum(opens[bears], closes[bears]), width=0.66, color="#f23645", edgecolor="#f23645", zorder=3)
 
-        # Plot Nearby SMC Levels
+        # Plot Nearby Liquidity Pools (Dashed horizontal lines with labels)
         for lv in smc_ctx["levels"]:
             p = lv["price"]
-            if (c_min - y_span * 0.3) <= p <= (c_max + y_span * 0.3):
+            if (c_min - y_span * 0.15) <= p <= (c_max + y_span * 0.15):
                 col = "#b91c1c" if "BUY" in lv["type"] else "#047857"
-                ax.axhline(p, color=col, linestyle="--", linewidth=0.8, alpha=0.65)
-                ax.text(1, p + (y_span * 0.01), f"{lv['short']} ({p:.{dec}f})", color=col, fontsize=7.5, fontweight="bold")
+                ax.axhline(p, color=col, linestyle="--", linewidth=0.8, alpha=0.60, zorder=2)
+                ax.text(
+                    1, p + (y_span * 0.012), f" {lv['short']} ({p:.{dec}f}) ",
+                    color=col, fontsize=7.2, fontweight="bold",
+                    bbox=dict(boxstyle="square,pad=0.15", facecolor="#ffffff", edgecolor=col, linewidth=0.6, alpha=0.85),
+                    zorder=4
+                )
 
-        # Plot Active Trade Levels (Entry / SL / TP)
+        # Draw TradingView Long / Short Position Tool
         if active_trade:
             ent = active_trade["entry"]
             sl  = active_trade["sl"]
             tp  = active_trade["tp"]
             be  = active_trade["be_level"]
+            is_buy = active_trade["direction"] == "BUY"
 
-            ax.axhline(ent, color="#2563eb", linestyle="--", linewidth=1.4, label="Entry")
-            ax.axhline(sl,  color="#dc2626", linestyle="-",  linewidth=1.4, label="Stop Loss")
-            ax.axhline(tp,  color="#16a34a", linestyle="-",  linewidth=1.4, label="Take Profit")
-            ax.axhline(be,  color="#089981", linestyle=":",  linewidth=1.0, label="1:1 BE Lock")
+            x_box_start = n_bars - 2
+            box_width = 16
 
-            # Entry Marker Tag
+            # Profit Box (Green) & Risk Box (Red)
+            target_h = abs(tp - ent)
+            stop_h   = abs(ent - sl)
+
+            # Profit Area Rectangle
+            ax.add_patch(mpatches.Rectangle(
+                (x_box_start, min(ent, tp)), box_width, target_h,
+                facecolor="#089981", alpha=0.18, edgecolor="#089981", linewidth=1.0, zorder=2
+            ))
+            # Stop Area Rectangle
+            ax.add_patch(mpatches.Rectangle(
+                (x_box_start, min(ent, sl)), box_width, stop_h,
+                facecolor="#f23645", alpha=0.18, edgecolor="#f23645", linewidth=1.0, zorder=2
+            ))
+
+            # Entry Level Center Line
+            ax.plot([x_box_start - 3, right_pad], [ent, ent], color="#2563eb", linestyle="--", linewidth=1.3, zorder=5)
+            # TP & SL Boundary Lines
+            ax.plot([x_box_start, right_pad], [tp, tp], color="#089981", linewidth=1.4, zorder=5)
+            ax.plot([x_box_start, right_pad], [sl, sl], color="#dc2626", linewidth=1.4, zorder=5)
+            # 1:1 Breakeven Line
+            ax.plot([x_box_start, right_pad], [be, be], color="#089981", linestyle=":", linewidth=1.0, zorder=4)
+
+            # Directional Entry Arrow
+            arrow_col = "#089981" if is_buy else "#f23645"
+            arrow_y = ent - (y_span * 0.04 if is_buy else -y_span * 0.04)
+            ax.annotate(
+                "", xy=(x_box_start, ent), xytext=(x_box_start, arrow_y),
+                arrowprops=dict(facecolor=arrow_col, edgecolor=arrow_col, width=2.5, headwidth=8.0),
+                zorder=7
+            )
+
+            # Central Long/Short Tool Badge
+            badge_title = "🎯 LONG POSITION" if is_buy else "🎯 SHORT POSITION"
             ax.text(
-                right_pad - 1, ent, f" ENTRY: {ent:.{dec}f} ",
-                color="#ffffff", fontsize=8.0, fontweight="bold", va="center", ha="right",
-                bbox=dict(facecolor="#2563eb", edgecolor="none", pad=2.5)
+                x_box_start + 7.5, ent, f" {badge_title} | 1:2 RR ($30 -> +$60) ",
+                color="#ffffff", fontsize=7.5, fontweight="bold", ha="center", va="center",
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="#1e40af", edgecolor="none"),
+                zorder=8
+            )
+
+            # Hand-drawn Style Markers (Swept Wick & MSS Break)
+            if active_trade.get("sweep_point"):
+                sp_y = active_trade["sweep_point"]
+                ax.text(
+                    n_bars - 8, sp_y, "💧 Liquidity Swept!",
+                    color="#b91c1c" if not is_buy else "#047857", fontsize=7.6, fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.18", facecolor="#ffffff", edgecolor="#cbd5e1", linewidth=0.6),
+                    zorder=7
+                )
+            if active_trade.get("neckline"):
+                nl_y = active_trade["neckline"]
+                ax.axhline(nl_y, color="#64748b", linestyle=":", linewidth=0.9, alpha=0.7)
+                ax.text(n_bars - 12, nl_y, "⚡ 5M MSS Break", color="#475569", fontsize=7.4, fontweight="bold")
+
+            # Right Axis Exact Price Badges
+            ax.text(
+                right_pad + 0.3, tp, f" 1:2 TP {tp:.{dec}f} (+ $60) ",
+                color="#ffffff", fontsize=7.8, fontweight="bold", va="center", ha="left",
+                bbox=dict(boxstyle="square,pad=0.20", facecolor="#16a34a", edgecolor="none"),
+                clip_on=False, zorder=9
             )
             ax.text(
-                right_pad - 1, sl, f" SL: {sl:.{dec}f} ",
-                color="#ffffff", fontsize=8.0, fontweight="bold", va="center", ha="right",
-                bbox=dict(facecolor="#dc2626", edgecolor="none", pad=2.5)
+                right_pad + 0.3, ent, f" ENTRY {ent:.{dec}f} ",
+                color="#ffffff", fontsize=7.8, fontweight="bold", va="center", ha="left",
+                bbox=dict(boxstyle="square,pad=0.20", facecolor="#2563eb", edgecolor="none"),
+                clip_on=False, zorder=9
             )
             ax.text(
-                right_pad - 1, tp, f" 1:2 TP: {tp:.{dec}f} ",
-                color="#ffffff", fontsize=8.0, fontweight="bold", va="center", ha="right",
-                bbox=dict(facecolor="#16a34a", edgecolor="none", pad=2.5)
+                right_pad + 0.3, sl, f" SL {sl:.{dec}f} (- $30) ",
+                color="#ffffff", fontsize=7.8, fontweight="bold", va="center", ha="left",
+                bbox=dict(boxstyle="square,pad=0.20", facecolor="#dc2626", edgecolor="none"),
+                clip_on=False, zorder=9
             )
 
-        # Live Spot Tag
-        ax.axhline(live_spot, color="#475569", linestyle=":", linewidth=0.9)
+        # Live Spot Tag with 5M Candle Countdown Timer
+        now_utc = get_utc_now()
+        rem_sec = max(0, (5 - (now_utc.minute % 5)) * 60 - now_utc.second)
+        mm, ss = divmod(rem_sec, 60)
+        spot_col = "#089981" if closes[-1] >= opens[-1] else "#f23645"
+        ax.axhline(live_spot, color=spot_col, linestyle=":", linewidth=0.9, zorder=6)
         ax.text(
-            right_pad - 1, live_spot, f" SPOT: {live_spot:.{dec}f} ",
-            color="#ffffff", fontsize=7.5, fontweight="bold", va="center", ha="right",
-            bbox=dict(facecolor="#475569", edgecolor="none", pad=2.0)
+            right_pad + 0.3, live_spot, f" SPOT {live_spot:.{dec}f} \n {mm:02d}:{ss:02d} ",
+            color="#ffffff", fontsize=7.6, fontweight="bold", va="center", ha="left",
+            bbox=dict(boxstyle="square,pad=0.22", facecolor=spot_col, edgecolor="none"),
+            clip_on=False, zorder=10
         )
 
+        ax.set_ylim(c_min - (y_span * 0.08), c_max + (y_span * 0.08))
         ax.set_xlim(-0.8, right_pad)
         ax.yaxis.tick_right()
-        ax.tick_params(axis="y", labelsize=8.0)
+        ax.tick_params(axis="y", labelsize=8.0, colors="#0f172a")
         ax.set_xticks([])
 
-        # Header Title
-        fig.text(0.02, 0.94, f"{sym} · 5M SMC Strategy Chart (1H: {smc_ctx['h1_bias']})", fontsize=10.0, fontweight="bold", color="#0f172a")
+        # Top Bar Header
+        header_text = f"{sym} · 5M SMC Liquidity & Structure"
+        if status_badge:
+            header_text += f" [{status_badge}]"
+        fig.text(0.02, 0.94, header_text, fontsize=9.8, fontweight="bold", color="#0f172a")
+
+        bias_bg = "#ecfdf5" if smc_ctx["h1_bias"] == "BULLISH" else ("#fef2f2" if smc_ctx["h1_bias"] == "BEARISH" else "#f8fafc")
+        fig.text(
+            0.88, 0.94, f" 1H Bias: {smc_ctx['h1_bias']} ",
+            fontsize=8.0, fontweight="bold", color="#0f172a", ha="right",
+            bbox=dict(boxstyle="round,pad=0.22", facecolor=bias_bg, edgecolor="#cbd5e1", linewidth=0.6)
+        )
 
         buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=95, facecolor="#ffffff")
+        plt.savefig(buf, format="png", dpi=100, facecolor="#ffffff")
         plt.close(fig)
         buf.seek(0)
         return buf
@@ -780,36 +859,114 @@ def generate_smc_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None)
         print(f"Chart Render Error: {e}")
         return None
 
+# ---------------------------------------------------------------------------
+# Asynchronous Alert Handlers
+# ---------------------------------------------------------------------------
+def async_dispatch_pre_alert(setup, info, df_1h, df_15m, df_5m, live_spot):
+    """Sends pre-alert when setup is forming so user can prepare in advance."""
+    def _worker():
+        dec = info["decimals"]
+        caption = (
+            f"⏳ <b>SMC PRE-ALERT: SETUP FORMING!</b> ⏳\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔹 <b>Market:</b> <b>{info['symbol']}</b>\n"
+            f"📢 <b>Upcoming Action:</b> <b>{setup['action']}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🧲 <b>Swept Pool:</b> <b>{setup['swept_level']}</b>\n"
+            f"📍 <b>Live Spot:</b> <code>{live_spot:.{dec}f}</code>\n"
+            f"🎯 <b>Watch For 5M Trigger @</b> <code>{setup['entry']:.{dec}f}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💼 <b>Planned Lot Size:</b> <b><code>{setup['lot_size']} Lot</code></b>\n"
+            f"🛑 <b>Tentative SL:</b> <code>{setup['sl']:.{dec}f}</code> (Risk: ${setup['risk_usd']:.2f})\n"
+            f"🎯 <b>Tentative 1:2 TP:</b> <code>{setup['tp']:.{dec}f}</code> (+${setup['reward_usd']:.2f})\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ <i>Broker terminal khol kar ready rahein! 5M candle close hone par confirm signal aayega.</i>"
+        )
+        chart_buf = generate_smc_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=setup, status_badge="SETUP FORMING")
+        if chart_buf:
+            send_telegram_photo(chart_buf.getvalue(), caption)
+        else:
+            send_telegram_message(caption)
+
+    CHART_EXECUTOR.submit(_worker)
+
 def async_dispatch_trade_signal(trade, info, df_1h, df_15m, df_5m, live_spot):
-    """Renders chart and sends Telegram alert asynchronously without blocking scanner."""
+    """Dispatches confirmed trade alert with Long/Short position tool on chart."""
     def _worker():
         dec = info["decimals"]
         trade_num = state_mgr.state["trades_today"]
-
-        # Ultra-Clean, Non-Cluttered Message Layout
         caption = (
-            f"🚨 <b>SMC TRADE SIGNAL: {info['symbol']}</b> 🚨\n"
+            f"🚨 <b>CONFIRMED SMC TRADE SIGNAL: {info['symbol']}</b> 🚨\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📢 <b>ACTION:</b> <b>{trade['action']}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 <b>ENTRY:</b> <code>{trade['entry']:.{dec}f}</code>  (Spot: <code>{live_spot:.{dec}f}</code>)\n"
+            f"🎯 <b>ENTRY SPOT:</b> <code>{trade['entry']:.{dec}f}</code>  (Live: <code>{live_spot:.{dec}f}</code>)\n"
             f"🛑 <b>STOP LOSS:</b> <code>{trade['sl']:.{dec}f}</code>  (Dist: {trade['sl_dist']:.{dec}f})\n"
-            f"🎯 <b>TAKE PROFIT (1:2):</b> <code>{trade['tp']:.{dec}f}</code>  (Dist: {trade['tp_dist']:.{dec}f})\n"
-            f"🛡️ <b>BREAKEVEN (1:1):</b> <code>{trade['be_level']:.{dec}f}</code>\n"
+            f"🎯 <b>1:2 FULL TP:</b> <code>{trade['tp']:.{dec}f}</code>  (Dist: {trade['tp_dist']:.{dec}f})\n"
+            f"🛡️ <b>1:1 BREAKEVEN:</b> <code>{trade['be_level']:.{dec}f}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"💼 <b>LOT SIZE:</b> <b><code>{trade['lot_size']} Lot</code></b>\n"
             f"💵 <b>PLANNED RISK:</b> <b>${trade['risk_usd']:.2f}</b>\n"
-            f"💰 <b>NET REWARD:</b> <b>+${trade['reward_usd']:.2f} (1:2 RR)</b>\n"
+            f"💰 <b>NET 1:2 REWARD:</b> <b>+${trade['reward_usd']:.2f}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🧠 <b>SMC REASONING:</b>\n"
+            f"🧠 <b>SMC LOGIC:</b>\n"
             f"1️⃣ {trade['smc_notes'][0]}\n"
             f"2️⃣ {trade['smc_notes'][1]}\n"
             f"3️⃣ {trade['smc_notes'][2]}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 <i>Trade #{trade_num}/{MAX_DAILY_TRADES} for today. Set SL & TP in broker.</i>"
+            f"📊 <i>Trade #{trade_num}/{MAX_DAILY_TRADES} for today. Set SL & TP in your broker now.</i>"
         )
+        chart_buf = generate_smc_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=trade, status_badge="CONFIRMED ENTRY")
+        if chart_buf:
+            send_telegram_photo(chart_buf.getvalue(), caption)
+        else:
+            send_telegram_message(caption)
 
-        chart_buf = generate_smc_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=trade)
+    CHART_EXECUTOR.submit(_worker)
+
+def async_dispatch_exit_notification(trade, hit_type, exit_price, pnl_usd, info, df_1h, df_15m, df_5m, live_spot):
+    """Sends instant alert when TP or SL is hit, along with the Long/Short chart."""
+    def _worker():
+        dec = info["decimals"]
+        if hit_type == "TP":
+            title = f"🎯 <b>1:2 FULL TARGET HIT! (+${pnl_usd:.2f})</b> 🎯"
+            body = (
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔹 <b>Market:</b> <b>{info['symbol']}</b> ({trade['direction']})\n"
+                f"🎯 <b>Target Hit:</b> <code>{exit_price:.{dec}f}</code>\n"
+                f"💰 <b>Profit Realized:</b> <b>+${pnl_usd:.2f} (+2R)</b>\n"
+                f"📈 <b>Today's Net PnL:</b> <code>${state_mgr.state['daily_realized_pnl']:+.2f}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏆 <i>Trade target successfully achieved with 1:2 Risk to Reward!</i>"
+            )
+            badge = "1:2 TARGET HIT"
+        elif hit_type == "BE":
+            title = f"🛡️ <b>BREAKEVEN EXIT (0 LOSS)</b> 🛡️"
+            body = (
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔹 <b>Market:</b> <b>{info['symbol']}</b> ({trade['direction']})\n"
+                f"📍 <b>Exited @ Entry:</b> <code>{exit_price:.{dec}f}</code>\n"
+                f"🛡️ <b>Capital Preserved:</b> $0 Loss (Risk-Free Exit)\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"✨ <i>1:1 lock protected your account. Onto the next high-quality setup!</i>"
+            )
+            badge = "BREAKEVEN EXIT"
+        else:
+            title = f"🛑 <b>STOP LOSS HIT (-${abs(pnl_usd):.2f})</b> 🛑"
+            body = (
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔹 <b>Market:</b> <b>{info['symbol']}</b> ({trade['direction']})\n"
+                f"🛑 <b>Stop Out:</b> <code>{exit_price:.{dec}f}</code>\n"
+                f"💵 <b>Loss Amount:</b> <b>-${abs(pnl_usd):.2f} (-1R)</b>\n"
+                f"🛑 <b>Losses Today:</b> {state_mgr.state['losses_today']}/{MAX_DAILY_LOSSES}\n"
+                f"📉 <b>Today's Net PnL:</b> <code>${state_mgr.state['daily_realized_pnl']:+.2f}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"⚠️ <i>Strict risk rule enforced: Maximum $30 loss per trade.</i>"
+            )
+            badge = "STOP LOSS HIT"
+
+        caption = f"{title}\n{body}"
+        chart_buf = generate_smc_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=trade, status_badge=badge)
         if chart_buf:
             send_telegram_photo(chart_buf.getvalue(), caption)
         else:
@@ -818,10 +975,144 @@ def async_dispatch_trade_signal(trade, info, df_1h, df_15m, df_5m, live_spot):
     CHART_EXECUTOR.submit(_worker)
 
 # ---------------------------------------------------------------------------
-# Telegram Command Listener (Dedicated Background Thread)
+# Session Kickoff Broadcaster (London & New York Popups)
+# ---------------------------------------------------------------------------
+def check_session_kickoffs():
+    """Sends automatic popup when London or New York Session starts."""
+    utc_now = get_utc_now()
+    utc_hour = utc_now.hour + (utc_now.minute / 60.0)
+    today_str = str(get_ist_now().date())
+
+    announced = state_mgr.state.get("announced_sessions", [])
+
+    # London Session (07:00 UTC / 12:30 PM IST)
+    if (7.0 <= utc_hour < 7.5) and "london" not in announced:
+        announced.append("london")
+        state_mgr.state["announced_sessions"] = announced
+        state_mgr.save_state()
+
+        # Send London Kickoff Popup
+        send_telegram_message(
+            f"🔔 <b>LONDON SESSION KICKOFF (12:30 PM – 4:30 PM IST)</b> 🔔\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💧 <b>Market Liquidity Influx Active!</b>\n"
+            f"📌 <b>Strategy:</b> 15M London Sweep + 5M MSS\n"
+            f"📋 <b>Risk Rule:</b> $30 Risk | Max 2 Trades/Day\n"
+            f"• <b>Gold (XAUUSD):</b> Scanning London High/Low sweeps\n"
+            f"• <b>Bitcoin (BTCUSD):</b> 🟢 24/7 Active\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚡ <i>Bot is active and ready for London setups!</i>"
+        )
+        send_instant_chart("XAU/USD")
+
+    # New York Session (13:00 UTC / 6:30 PM IST)
+    if (13.0 <= utc_hour < 13.5) and "new_york" not in announced:
+        announced.append("new_york")
+        state_mgr.state["announced_sessions"] = announced
+        state_mgr.save_state()
+
+        # Send New York Kickoff Popup
+        send_telegram_message(
+            f"🔔 <b>NEW YORK SESSION KICKOFF (6:30 PM – 10:30 PM IST)</b> 🔔\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚡ <b>NY Open High-Volatility Active!</b>\n"
+            f"📌 <b>Strategy:</b> 15M NY Liquidity Sweep + 5M MSS\n"
+            f"📋 <b>Risk Rule:</b> $30 Risk | Max 2 Trades/Day\n"
+            f"• <b>Gold (XAUUSD):</b> London High/Low sweep watch\n"
+            f"• <b>Bitcoin (BTCUSD):</b> 🟢 24/7 Active\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚡ <i>Hunting for prime New York trade setups!</i>"
+        )
+        send_instant_chart("XAU/USD")
+
+# ---------------------------------------------------------------------------
+# Real-Time Open Position Monitor (SL, TP, and 1:1 Breakeven)
+# ---------------------------------------------------------------------------
+def monitor_open_positions(pair_name, info, df_1h, df_15m, df_5m, live_spot):
+    """Monitors live trades and triggers instant notifications when TP, SL, or 1:1 BE is reached."""
+    open_trades = state_mgr.state.get("open_trades", [])
+    if not open_trades:
+        return
+
+    latest_bar = df_5m.iloc[-1]
+    bar_high = max(live_spot, float(latest_bar["High"]))
+    bar_low  = min(live_spot, float(latest_bar["Low"]))
+    dec = info["decimals"]
+
+    for trade in open_trades:
+        if trade.get("symbol") != info["symbol"] or not trade.get("is_open", True):
+            continue
+
+        direction = trade["direction"]
+        ent = trade["entry"]
+        sl  = trade["sl"]
+        tp  = trade["tp"]
+        be  = trade["be_level"]
+
+        # 1:1 Breakeven Check
+        if not trade.get("be_locked", False):
+            be_reached = (direction == "BUY" and bar_high >= be) or (direction == "SELL" and bar_low <= be)
+            if be_reached:
+                trade["be_locked"] = True
+                trade["sl"] = ent  # Move SL to Entry
+                state_mgr.save_state()
+                send_telegram_message(
+                    f"🛡️ <b>1:1 (+1R) REACHED — MOVE SL TO ENTRY!</b> 🛡️\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🔹 <b>Market:</b> <b>{info['symbol']}</b>\n"
+                    f"📍 <b>Current Price:</b> <code>{live_spot:.{dec}f}</code>\n"
+                    f"👉 <b>Action:</b> Move Stop Loss to Entry (<code>{ent:.{dec}f}</code>) now!\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"✨ <i>Trade is now 100% Risk-Free. Capital secured!</i>"
+                )
+
+        # Check TP or SL Hit
+        hit_type = None
+        exit_price = None
+
+        if direction == "BUY":
+            if bar_high >= tp:
+                hit_type = "TP"
+                exit_price = tp
+            elif bar_low <= sl:
+                hit_type = "BE" if trade.get("be_locked") else "SL"
+                exit_price = sl
+        else:
+            if bar_low <= tp:
+                hit_type = "TP"
+                exit_price = tp
+            elif bar_high >= sl:
+                hit_type = "BE" if trade.get("be_locked") else "SL"
+                exit_price = sl
+
+        if hit_type:
+            trade["is_open"] = False
+            trade["exit_price"] = exit_price
+
+            if hit_type == "TP":
+                pnl = trade["reward_usd"]
+                state_mgr.state["daily_realized_pnl"] += pnl
+            elif hit_type == "BE":
+                pnl = 0.0
+            else:
+                pnl = -trade["risk_usd"]
+                state_mgr.state["losses_today"] += 1
+                state_mgr.state["daily_realized_pnl"] += pnl
+
+            state_mgr.save_state()
+            async_dispatch_exit_notification(trade, hit_type, exit_price, pnl, info, df_1h, df_15m, df_5m, live_spot)
+
+            # If 2 losses hit, announce halt
+            if state_mgr.state["losses_today"] >= MAX_DAILY_LOSSES or state_mgr.state["daily_realized_pnl"] <= -DAILY_STOP_LOSS_USD:
+                send_telegram_message(
+                    f"🛑 <b>DAILY STOP TRIGGERED (-${abs(state_mgr.state['daily_realized_pnl']):.2f})</b> 🛑\n"
+                    f"Max daily loss ($60 or 2 losses) reached. Trading paused until tomorrow to protect capital."
+                )
+
+# ---------------------------------------------------------------------------
+# Telegram Command Listener Thread
 # ---------------------------------------------------------------------------
 def telegram_command_listener():
-    """Runs independently so Telegram user queries receive immediate replies."""
     last_update_id = 0
     while True:
         try:
@@ -847,13 +1138,15 @@ def telegram_command_listener():
                         if text in ["/status", "status", "/start", "start"]:
                             can_tr, reason = state_mgr.can_trade_today()
                             st = state_mgr.state
+                            open_cnt = sum(1 for t in st.get("open_trades", []) if t.get("is_open", True))
                             msg_out = (
                                 f"📊 <b>SMC BOT STATUS ({st['date']})</b>\n\n"
                                 f"🚦 <b>Trading Status:</b> {'🟢 READY' if can_tr else '🔴 PAUSED (' + reason + ')'}\n"
-                                f"🔢 <b>Trades Today:</b> {st['trades_today']}/{MAX_DAILY_TRADES}\n"
+                                f"🔢 <b>Trades Taken Today:</b> {st['trades_today']}/{MAX_DAILY_TRADES}\n"
                                 f"🛑 <b>Losses Today:</b> {st['losses_today']}/{MAX_DAILY_LOSSES}\n"
                                 f"💵 <b>Risk Per Trade:</b> ${RISK_PER_TRADE_USD:.2f}\n"
-                                f"📈 <b>Realized PnL:</b> ${st['daily_realized_pnl']:+.2f}\n\n"
+                                f"📈 <b>Daily Net PnL:</b> ${st['daily_realized_pnl']:+.2f}\n"
+                                f"📂 <b>Open Positions:</b> {open_cnt}\n\n"
                                 f"• <b>BTC/USD:</b> 🟢 24/7 Active (Weekend Enabled)\n"
                                 f"• <b>XAU/USD:</b> {'🟢 Market Open' if is_forex_market_open() else '🔴 Weekend Closed'}\n\n"
                                 f"Commands: <code>/gold</code>, <code>/btc</code>, <code>/reset</code>"
@@ -866,8 +1159,9 @@ def telegram_command_listener():
                                 state_mgr.state["losses_today"] = 0
                                 state_mgr.state["daily_realized_pnl"] = 0.0
                                 state_mgr.state["daily_halt"] = False
+                                state_mgr.state["open_trades"] = []
                                 state_mgr.save_state()
-                            send_telegram_message("✅ <b>Today's Trades & Loss Count Reset to 0!</b>")
+                            send_telegram_message("✅ <b>Today's Trades & Losses Reset to 0!</b>")
 
                         elif text in ["/gold", "gold"]:
                             send_instant_chart("XAU/USD")
@@ -879,7 +1173,6 @@ def telegram_command_listener():
             time.sleep(2)
 
 def send_instant_chart(pair_name):
-    """Sends immediate snapshot chart for requested pair."""
     def _worker():
         info = PAIRS_CONFIG[pair_name]
         df_1h, df_15m, df_5m, live_spot = get_3tf_data(pair_name, info)
@@ -891,7 +1184,7 @@ def send_instant_chart(pair_name):
         df_15m = enrich_indicators(df_15m)
         df_5m  = enrich_indicators(df_5m)
 
-        buf = generate_smc_chart(df_1h, df_15m, df_5m, info, live_spot)
+        buf = generate_smc_chart(df_1h, df_15m, df_5m, info, live_spot, status_badge="LIVE SNAPSHOT")
         caption = (
             f"📊 <b>{info['display_name']}</b>\n"
             f"📍 <b>Live Spot:</b> <code>{live_spot:.{info['decimals']}f}</code>\n"
@@ -909,21 +1202,24 @@ def send_instant_chart(pair_name):
 # ---------------------------------------------------------------------------
 def run_scanner():
     print("=================================================================")
-    print("SMC TRADING BOT ACTIVE (XAU/USD & BTC/USD)")
+    print("SMC TRADING BOT PRO ACTIVE (XAU/USD & BTC/USD)")
     print(f"Risk Per Trade: ${RISK_PER_TRADE_USD} | Max Daily Trades: {MAX_DAILY_TRADES}")
-    print("BTC/USD: 24/7 Active (Saturday & Sunday Enabled)")
+    print("SMC Features: Pre-Alert + Long/Short Charts + Session Popups + Hit Alerts")
     print("=================================================================")
 
-    # Start Telegram Listener Thread
     threading.Thread(target=telegram_command_listener, daemon=True, name="TelegramListener").start()
 
     send_telegram_message(
-        f"⚡ <b>SMC TRADING BOT ONLINE</b> ⚡\n\n"
+        f"⚡ <b>SMC TRADING BOT PRO ONLINE</b> ⚡\n\n"
         f"• <b>Markets:</b> XAU/USD & BTC/USD\n"
         f"• <b>Bitcoin Mode:</b> 🟢 <b>24/7 Active (Saturday & Sunday Included)</b>\n"
-        f"• <b>Risk Rule:</b> <b>${RISK_PER_TRADE_USD:.2f} Risk</b> per trade | Max <b>{MAX_DAILY_TRADES} trades</b>/day\n"
+        f"• <b>Risk Control:</b> <b>${RISK_PER_TRADE_USD:.2f} Risk</b> per trade | Max <b>{MAX_DAILY_TRADES} trades</b>/day\n"
         f"• <b>Target:</b> 1:2 RR (+${RISK_PER_TRADE_USD * PRIMARY_RR_TARGET:.2f})\n"
-        f"• <b>Strategy:</b> 1H Trend + 15M Sweep + 5M MSS\n\n"
+        f"• <b>Enhanced Features:</b>\n"
+        f"  ⏳ <b>Pre-Alerts:</b> Early notification when setup is forming\n"
+        f"  🔔 <b>Session Popups:</b> London (12:30 PM IST) & NY (6:30 PM IST)\n"
+        f"  📐 <b>TradingView Tool:</b> Long/Short Position Box on all charts\n"
+        f"  🎯 <b>Exit Alerts:</b> Instant notification when TP or SL is hit\n\n"
         f"<i>Type /status, /gold, or /btc anytime for live charts.</i>"
     )
 
@@ -935,19 +1231,10 @@ def run_scanner():
             if (now - last_scan) >= 8:
                 last_scan = now
                 state_mgr.check_new_day()
-
-                can_trade, reason = state_mgr.can_trade_today()
-                if not can_trade:
-                    time.sleep(5)
-                    continue
+                check_session_kickoffs()
 
                 for pair_name, info in PAIRS_CONFIG.items():
-                    # Check Forex hours for Gold; BTC is ALWAYS checked (24/7 weekend)
                     if not info.get("is_crypto") and not is_forex_market_open():
-                        continue
-
-                    # Cooldown check
-                    if get_utc_now() < pair_cooldown_until[pair_name]:
                         continue
 
                     df_1h, df_15m, df_5m, live_spot = get_3tf_data(pair_name, info)
@@ -959,22 +1246,52 @@ def run_scanner():
                     df_5m  = enrich_indicators(df_5m)
 
                     closed_candle_time = to_utc_timestamp(df_5m.index[-2])
-                    if last_candle_traded[pair_name] == closed_candle_time:
+
+                    # 1. First monitor any existing open trades for SL / TP / Breakeven
+                    monitor_open_positions(pair_name, info, df_1h, df_15m, df_5m, live_spot)
+
+                    # 2. Check if account is eligible for a new trade
+                    can_trade, _ = state_mgr.can_trade_today()
+                    if not can_trade:
                         continue
 
+                    # Don't take a new trade if an open trade in this pair already exists
+                    has_open = any(t.get("symbol") == info["symbol"] and t.get("is_open", True) for t in state_mgr.state.get("open_trades", []))
+                    if has_open:
+                        continue
+
+                    if get_utc_now() < pair_cooldown_until[pair_name]:
+                        continue
+
+                    # Evaluate SMC Setup (Pre-Alert vs Confirmed Entry)
                     setup = evaluate_smc_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot)
+                    if not setup:
+                        continue
 
-                    if setup:
-                        last_candle_traded[pair_name] = closed_candle_time
-                        pair_cooldown_until[pair_name] = get_utc_now() + timedelta(minutes=25)
+                    setup["symbol"] = info["symbol"]
 
-                        with STATE_LOCK:
-                            state_mgr.state["trades_today"] += 1
-                            state_mgr.state["open_trades"].append(setup)
-                            state_mgr.save_state()
+                    if setup["stage"] == "CONFIRMED":
+                        if last_candle_traded[pair_name] != closed_candle_time:
+                            last_candle_traded[pair_name] = closed_candle_time
+                            pair_cooldown_until[pair_name] = get_utc_now() + timedelta(minutes=25)
 
-                        # Dispatch trade alert asynchronously
-                        async_dispatch_trade_signal(setup, info, df_1h, df_15m, df_5m, live_spot)
+                            setup["is_open"] = True
+                            setup["be_locked"] = False
+                            setup["entry_time"] = str(get_ist_now())
+
+                            with STATE_LOCK:
+                                state_mgr.state["trades_today"] += 1
+                                state_mgr.state["open_trades"].append(setup)
+                                state_mgr.save_state()
+
+                            async_dispatch_trade_signal(setup, info, df_1h, df_15m, df_5m, live_spot)
+
+                    elif setup["stage"] == "PRE_ALERT":
+                        # Send pre-alert if not sent recently
+                        now_utc = get_utc_now()
+                        if (now_utc - last_pre_alert_time[pair_name]).total_seconds() > 900:  # 15m cooldown
+                            last_pre_alert_time[pair_name] = now_utc
+                            async_dispatch_pre_alert(setup, info, df_1h, df_15m, df_5m, live_spot)
 
             time.sleep(0.5)
 
