@@ -404,13 +404,45 @@ def enrich_indicators(df):
     df["Body_Ratio"] = df["Body"] / df["Range"]
     return df
 
-def get_smc_levels_and_1h_bias(df_1h, df_15m, decimals):
+def get_active_session_name():
+    """Returns human-readable active session name and exact current IST time."""
+    now_utc = get_utc_now()
+    utc_hr = now_utc.hour + (now_utc.minute / 60.0)
+    now_ist = get_ist_now()
+    ist_time_str = now_ist.strftime("%I:%M %p IST")
+
+    if 13.0 <= utc_hr <= 16.5:
+        session_label = "London / NY Overlap (6:30 PM – 10:00 PM IST) 🔥"
+    elif 7.0 <= utc_hr < 13.0:
+        session_label = "London Session (12:30 PM – 6:30 PM IST) 🇬🇧"
+    elif 13.0 <= utc_hr < 21.0:
+        session_label = "New York Session (6:30 PM – 2:30 AM IST) 🇺🇸"
+    elif 0.0 <= utc_hr < 7.0:
+        session_label = "Asian Session (5:30 AM – 12:30 PM IST) 🌏"
+    else:
+        session_label = "Late NY / Pre-Asia (2:30 AM – 5:30 AM IST) 🌙"
+
+    return f"{session_label} [Time: {ist_time_str}]"
+
+def get_smc_levels_and_1h_bias(df_1h, df_15m, decimals, live_spot=None):
     closed_1h = df_1h.iloc[:-1] if len(df_1h) > 20 else df_1h
     atr_1h = float(closed_1h.iloc[-1]["ATR"])
     c_last = closed_1h.iloc[-1]
     h1_close = float(c_last["Close"])
     h1_ema20 = float(c_last["EMA20"])
     h1_ema50 = float(c_last["EMA50"])
+
+    # Live forming 1H candle / live spot (Prevents 1-hour lag during strong rallies)
+    spot = live_spot if live_spot is not None else float(df_1h.iloc[-1]["Close"])
+    cur_1h_open = float(df_1h.iloc[-1]["Open"])
+    cur_1h_is_green = spot >= cur_1h_open
+
+    # 15M Intraday Order Flow (Reacts in real-time to rallies & dips)
+    m15_c0 = df_15m.iloc[-2] if len(df_15m) >= 2 else df_15m.iloc[-1]
+    m15_close = float(m15_c0["Close"])
+    m15_ema20 = float(m15_c0["EMA20"])
+    m15_ema50 = float(m15_c0["EMA50"])
+    m15_bullish = (spot > m15_ema20) or (m15_close > m15_ema20 and m15_ema20 >= m15_ema50)
 
     highs = closed_1h["High"].values
     lows  = closed_1h["Low"].values
@@ -421,17 +453,28 @@ def get_smc_levels_and_1h_bias(df_1h, df_15m, decimals):
         if lows[i] <= min(lows[i-2:i]) and lows[i] <= lows[i+1]:
             swing_lows.append(round(float(lows[i]), decimals))
 
-    if h1_close > h1_ema20 and h1_ema20 >= h1_ema50:
-        h1_bias = "BULLISH"
-    elif h1_close < h1_ema20 and h1_ema20 <= h1_ema50:
-        h1_bias = "BEARISH"
-    else:
-        if swing_highs and swing_lows and h1_close >= swing_lows[-1]:
+    # Fast, Responsive Multi-Timeframe Trend & Structure Detection (BUY & SELL Enabled)
+    if spot >= h1_ema20 or (m15_bullish and cur_1h_is_green):
+        if spot >= h1_ema50 or (swing_lows and spot > swing_lows[-1]):
             h1_bias = "BULLISH"
-        elif swing_highs and swing_lows and h1_close <= swing_highs[-1]:
-            h1_bias = "BEARISH"
+            trend_desc = "BULLISH (Upward Order Flow / Higher Lows) 📈"
         else:
-            h1_bias = "RANGING"
+            h1_bias = "BULLISH"
+            trend_desc = "BULLISH (Upward Momentum & 15M Bullish Shift) 🚀"
+    elif spot < h1_ema20 and not m15_bullish:
+        if spot <= h1_ema50 or (swing_highs and spot < swing_highs[-1]):
+            h1_bias = "BEARISH"
+            trend_desc = "BEARISH (Downward Order Flow / Lower Highs) 📉"
+        else:
+            h1_bias = "BEARISH"
+            trend_desc = "BEARISH (Downward Reversal Momentum) 🩸"
+    else:
+        if m15_bullish or spot >= h1_ema20:
+            h1_bias = "BULLISH"
+            trend_desc = "BULLISH (15M Order Flow Leading Upward) 📈"
+        else:
+            h1_bias = "BEARISH"
+            trend_desc = "BEARISH (15M Order Flow Leading Downward) 📉"
 
     df_15m_utc = df_15m.copy()
     if isinstance(df_15m_utc.index, pd.DatetimeIndex):
@@ -465,13 +508,33 @@ def get_smc_levels_and_1h_bias(df_1h, df_15m, decimals):
         {"name": "Asian Session Low",   "short": "ASIA L", "price": asian_low,  "type": "SELL_SIDE_LIQUIDITY"}
     ]
 
+    # Major 1H Structure Swings
     if swing_highs:
         levels.append({"name": "1H Swing High", "short": "1H High", "price": swing_highs[-1], "type": "BUY_SIDE_LIQUIDITY"})
     if swing_lows:
         levels.append({"name": "1H Swing Low", "short": "1H Low", "price": swing_lows[-1], "type": "SELL_SIDE_LIQUIDITY"})
 
+    # Dynamic 15M Intraday Swing Points (Pullback Liquidity during Rallies/Dumps)
+    highs_15m = df_15m["High"].values
+    lows_15m  = df_15m["Low"].values
+    n_15m = len(df_15m)
+
+    recent_15m_lows = []
+    recent_15m_highs = []
+    for i in range(max(2, n_15m - 20), n_15m - 2):
+        if lows_15m[i] <= min(lows_15m[i-2:i]) and lows_15m[i] <= min(lows_15m[i+1:i+3]):
+            recent_15m_lows.append(round(float(lows_15m[i]), decimals))
+        if highs_15m[i] >= max(highs_15m[i-2:i]) and highs_15m[i] >= max(highs_15m[i+1:i+3]):
+            recent_15m_highs.append(round(float(highs_15m[i]), decimals))
+
+    if recent_15m_lows:
+        levels.append({"name": "15M Intraday Low", "short": "15M Low", "price": recent_15m_lows[-1], "type": "SELL_SIDE_LIQUIDITY"})
+    if recent_15m_highs:
+        levels.append({"name": "15M Intraday High", "short": "15M High", "price": recent_15m_highs[-1], "type": "BUY_SIDE_LIQUIDITY"})
+
     return {
         "h1_bias": h1_bias,
+        "trend_desc": trend_desc,
         "atr_1h": atr_1h,
         "pdh": pdh, "pdl": pdl,
         "london_high": london_high, "london_low": london_low,
@@ -512,11 +575,9 @@ def calculate_lot_size(pair_name, info, sl_dist):
 # ---------------------------------------------------------------------------
 def evaluate_smc_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot):
     dec = info["decimals"]
-    smc_ctx = get_smc_levels_and_1h_bias(df_1h, df_15m, dec)
+    smc_ctx = get_smc_levels_and_1h_bias(df_1h, df_15m, dec, live_spot=live_spot)
     h1_bias = smc_ctx["h1_bias"]
-
-    if h1_bias == "RANGING":
-        return None
+    trend_desc = smc_ctx["trend_desc"]
 
     m5_c0  = df_5m.iloc[-2]  # Last closed 5M candle
     atr_5m = float(m5_c0["ATR"])
@@ -528,7 +589,10 @@ def evaluate_smc_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot):
         return None
 
     m15_recent = df_15m.iloc[-6:-1]
-    m5_prev3   = df_5m.iloc[-5:-2]
+    # Flexible 7-candle lookback for minor swing neckline pivot
+    m5_lookback = df_5m.iloc[-9:-2]
+    neck_high = float(m5_lookback["High"].max())
+    neck_low  = float(m5_lookback["Low"].min())
 
     candidates = []
 
@@ -538,28 +602,33 @@ def evaluate_smc_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot):
         lvl_type  = lv["type"]
 
         # BUY SETUP
-        if h1_bias == "BULLISH" and lvl_type == "SELL_SIDE_LIQUIDITY":
+        # 1. Pro-Trend Pullback: If order flow is BULLISH, catch ANY dip/pullback sweep
+        # 2. Reversal Bottom Grab: If a major level (Asian Low, London Low, PDL, 1H Low) is swept, allow BUY reversal
+        is_major_sell_liq = lvl_short in ["ASIA L", "LON L", "PDL", "1H Low"]
+        allow_buy_check = (h1_bias == "BULLISH") or is_major_sell_liq
+
+        if allow_buy_check and lvl_type == "SELL_SIDE_LIQUIDITY":
             m15_min_low = float(m15_recent["Low"].min())
-            m15_last_c  = float(df_15m.iloc[-2]["Close"])
-            swept = (m15_min_low <= lvl_price) and (m15_last_c >= lvl_price - (atr_5m * 0.15))
+            m5_min_low  = float(df_5m.iloc[-8:-1]["Low"].min())
+            min_recent_low = min(m15_min_low, m5_min_low)
+            swept = (min_recent_low <= lvl_price + (atr_5m * 0.12)) and (live_spot >= lvl_price - (atr_5m * 0.20))
 
             if swept:
-                neck_high = float(m5_prev3["High"].max())
-                sweep_low = min(float(df_5m.iloc[-8:-1]["Low"].min()), m15_min_low)
+                sweep_low = min(m5_min_low, min_recent_low)
 
                 # Confirmed Breakout vs Pre-Alert Forming
                 mss_confirmed = (
                     (p_close > neck_high) and
                     (p_close > p_open) and
-                    (body_r >= 0.45) and
+                    (body_r >= 0.40) and
                     (live_spot >= lvl_price)
                 )
 
                 mss_forming = (
                     not mss_confirmed and
                     (live_spot >= lvl_price) and
-                    (live_spot < neck_high + atr_5m * 0.10) and
-                    ((neck_high - live_spot) <= atr_5m * 0.85)
+                    (live_spot < neck_high + atr_5m * 0.15) and
+                    ((neck_high - live_spot) <= atr_5m * 1.10)
                 )
 
                 if mss_confirmed or mss_forming:
@@ -579,7 +648,8 @@ def evaluate_smc_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot):
                                 "direction": "BUY",
                                 "action": "BUY (LONG) 🟢",
                                 "h1_bias": h1_bias,
-                                "swept_level": f"{lvl_short} ({lvl_price})",
+                                "trend_desc": trend_desc,
+                                "swept_level": f"{lvl_short} ({lvl_price:.{dec}f})",
                                 "swept_price": lvl_price,
                                 "neckline": neck_high,
                                 "sweep_point": sweep_low,
@@ -593,34 +663,39 @@ def evaluate_smc_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot):
                                 "risk_usd": actual_risk,
                                 "reward_usd": round(actual_risk * PRIMARY_RR_TARGET, 2),
                                 "smc_notes": [
-                                    f"1H Order Flow: {h1_bias}",
-                                    f"Liquidity: {lvl_short} Swept & Rejected",
-                                    "5M Trigger: Market Structure Shift (MSS) with Strong Body" if mss_confirmed else f"5M Trigger: Approaching Neckline {neck_high}"
+                                    f"1H Trend: {trend_desc}",
+                                    f"Liquidity: {lvl_short} Swept & Reclaimed",
+                                    "5M Trigger: Market Structure Shift (MSS) Breakout" if mss_confirmed else f"5M Trigger: Approaching Neckline {neck_high:.{dec}f}"
                                 ]
                             })
 
         # SELL SETUP
-        if h1_bias == "BEARISH" and lvl_type == "BUY_SIDE_LIQUIDITY":
+        # 1. Pro-Trend Pullback: If order flow is BEARISH, catch ANY rally sweep
+        # 2. Reversal Top Grab: If a major level is swept AND market is NOT in a raging bull rally
+        is_major_buy_liq = lvl_short in ["ASIA H", "LON H", "PDH", "1H High"]
+        allow_sell_check = (h1_bias == "BEARISH") or (is_major_buy_liq and h1_bias != "BULLISH")
+
+        if allow_sell_check and lvl_type == "BUY_SIDE_LIQUIDITY":
             m15_max_high = float(m15_recent["High"].max())
-            m15_last_c   = float(df_15m.iloc[-2]["Close"])
-            swept = (m15_max_high >= lvl_price) and (m15_last_c <= lvl_price + (atr_5m * 0.15))
+            m5_max_high  = float(df_5m.iloc[-8:-1]["High"].max())
+            max_recent_high = max(m15_max_high, m5_max_high)
+            swept = (max_recent_high >= lvl_price - (atr_5m * 0.12)) and (live_spot <= lvl_price + (atr_5m * 0.20))
 
             if swept:
-                neck_low = float(m5_prev3["Low"].min())
-                sweep_high = max(float(df_5m.iloc[-8:-1]["High"].max()), m15_max_high)
+                sweep_high = max(m5_max_high, max_recent_high)
 
                 mss_confirmed = (
                     (p_close < neck_low) and
                     (p_close < p_open) and
-                    (body_r >= 0.45) and
+                    (body_r >= 0.40) and
                     (live_spot <= lvl_price)
                 )
 
                 mss_forming = (
                     not mss_confirmed and
                     (live_spot <= lvl_price) and
-                    (live_spot > neck_low - atr_5m * 0.10) and
-                    ((live_spot - neck_low) <= atr_5m * 0.85)
+                    (live_spot > neck_low - atr_5m * 0.15) and
+                    ((live_spot - neck_low) <= atr_5m * 1.10)
                 )
 
                 if mss_confirmed or mss_forming:
@@ -640,7 +715,8 @@ def evaluate_smc_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot):
                                 "direction": "SELL",
                                 "action": "SELL (SHORT) 🔴",
                                 "h1_bias": h1_bias,
-                                "swept_level": f"{lvl_short} ({lvl_price})",
+                                "trend_desc": trend_desc,
+                                "swept_level": f"{lvl_short} ({lvl_price:.{dec}f})",
                                 "swept_price": lvl_price,
                                 "neckline": neck_low,
                                 "sweep_point": sweep_high,
@@ -654,16 +730,18 @@ def evaluate_smc_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot):
                                 "risk_usd": actual_risk,
                                 "reward_usd": round(actual_risk * PRIMARY_RR_TARGET, 2),
                                 "smc_notes": [
-                                    f"1H Order Flow: {h1_bias}",
-                                    f"Liquidity: {lvl_short} Swept & Rejected",
-                                    "5M Trigger: Market Structure Shift (MSS) with Strong Body" if mss_confirmed else f"5M Trigger: Approaching Neckline {neck_low}"
+                                    f"1H Trend: {trend_desc}",
+                                    f"Liquidity: {lvl_short} Swept & Reclaimed",
+                                    "5M Trigger: Market Structure Shift (MSS) Breakout" if mss_confirmed else f"5M Trigger: Approaching Neckline {neck_low:.{dec}f}"
                                 ]
                             })
 
     if not candidates:
         return None
-    # Prefer confirmed over pre-alert
-    candidates.sort(key=lambda x: (1 if x["stage"] == "CONFIRMED" else 0), reverse=True)
+    candidates.sort(key=lambda x: (
+        1 if x["stage"] == "CONFIRMED" else 0,
+        1 if x["direction"] == ("BUY" if h1_bias == "BULLISH" else "SELL") else 0
+    ), reverse=True)
     return candidates[0]
 
 # ---------------------------------------------------------------------------
@@ -684,7 +762,7 @@ def generate_smc_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None,
 
         dec = info["decimals"]
         sym = info["symbol"]
-        smc_ctx = get_smc_levels_and_1h_bias(df_1h, df_15m, dec)
+        smc_ctx = get_smc_levels_and_1h_bias(df_1h, df_15m, dec, live_spot=live_spot)
 
         fig = plt.figure(figsize=(9.6, 5.2), dpi=100, facecolor="#ffffff")
         ax = fig.add_axes([0.02, 0.08, 0.86, 0.82], facecolor="#ffffff")
@@ -867,11 +945,15 @@ def async_dispatch_pre_alert(setup, info, df_1h, df_15m, df_5m, live_spot):
     """Sends pre-alert when setup is forming so user can prepare in advance."""
     def _worker():
         dec = info["decimals"]
+        session_str = get_active_session_name()
+        trend_str = setup.get("trend_desc", setup.get("h1_bias", "NEUTRAL"))
         caption = (
             f"⏳ <b>SMC PRE-ALERT: SETUP FORMING!</b> ⏳\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔹 <b>Market:</b> <b>{info['symbol']}</b>\n"
             f"📢 <b>Upcoming Action:</b> <b>{setup['action']}</b>\n"
+            f"🕒 <b>Session:</b> <b>{session_str}</b>\n"
+            f"🧭 <b>1H Trend:</b> <b>{trend_str}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🧲 <b>Swept Pool:</b> <b>{setup['swept_level']}</b>\n"
             f"📍 <b>Live Spot:</b> <code>{live_spot:.{dec}f}</code>\n"
@@ -896,10 +978,14 @@ def async_dispatch_trade_signal(trade, info, df_1h, df_15m, df_5m, live_spot):
     def _worker():
         dec = info["decimals"]
         trade_num = state_mgr.state["trades_today"]
+        session_str = get_active_session_name()
+        trend_str = trade.get("trend_desc", trade.get("h1_bias", "NEUTRAL"))
         caption = (
             f"🚨 <b>CONFIRMED SMC TRADE SIGNAL: {info['symbol']}</b> 🚨\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📢 <b>ACTION:</b> <b>{trade['action']}</b>\n"
+            f"🕒 <b>SESSION:</b> <b>{session_str}</b>\n"
+            f"🧭 <b>1H TREND:</b> <b>{trend_str}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🎯 <b>ENTRY SPOT:</b> <code>{trade['entry']:.{dec}f}</code>  (Live: <code>{live_spot:.{dec}f}</code>)\n"
             f"🛑 <b>STOP LOSS:</b> <code>{trade['sl']:.{dec}f}</code>  (Dist: {trade['sl_dist']:.{dec}f})\n"
@@ -1140,8 +1226,10 @@ def telegram_command_listener():
                             can_tr, reason = state_mgr.can_trade_today()
                             st = state_mgr.state
                             open_cnt = sum(1 for t in st.get("open_trades", []) if t.get("is_open", True))
+                            sess_label = get_active_session_name()
                             msg_out = (
                                 f"📊 <b>SMC BOT STATUS ({st['date']})</b>\n\n"
+                                f"🕒 <b>Active Session:</b> {sess_label}\n"
                                 f"🚦 <b>Trading Status:</b> {'🟢 READY' if can_tr else '🔴 PAUSED (' + reason + ')'}\n"
                                 f"🔢 <b>Trades Taken Today:</b> {st['trades_today']}/{MAX_DAILY_TRADES}\n"
                                 f"🛑 <b>Losses Today:</b> {st['losses_today']}/{MAX_DAILY_LOSSES}\n"
