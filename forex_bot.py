@@ -970,6 +970,9 @@ def async_dispatch_pre_alert(setup, info, df_1h, df_15m, df_5m, live_spot):
         caption = (
             f"⏳ <b>SMC PRE-ALERT: SETUP FORMING!</b> ⏳\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📐 <b>STRATEGY:</b> <code>1H Trend + 15M Sweep + 5M MSS</code>\n"
+            f"📜 <b>RULES:</b> <code>1:2 RR | Max $30 Risk | 1:1 Breakeven</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔹 <b>Market:</b> <b>{info['symbol']}</b>\n"
             f"📢 <b>Upcoming Action:</b> <b>{setup['action']}</b>\n"
             f"🕒 <b>Session:</b> <b>{session_str}</b>\n"
@@ -1019,6 +1022,9 @@ def async_dispatch_trade_signal(trade, info, df_1h, df_15m, df_5m, live_spot):
         trend_str = trade.get("trend_desc", trade.get("h1_bias", "NEUTRAL"))
         caption = (
             f"🚨 <b>CONFIRMED SMC TRADE SIGNAL: {info['symbol']}</b> 🚨\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📐 <b>STRATEGY:</b> <code>1H Trend + 15M Sweep + 5M MSS</code>\n"
+            f"📜 <b>RULES:</b> <code>1:2 RR (Risk $30 -> Gain +$60) | 1:1 Breakeven</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📢 <b>ACTION:</b> <b>{trade['action']}</b>\n"
             f"🕒 <b>SESSION:</b> <b>{session_str}</b>\n"
@@ -1266,6 +1272,8 @@ def telegram_command_listener():
                             sess_label = get_active_session_name()
                             msg_out = (
                                 f"📊 <b>SMC BOT STATUS ({st['date']})</b>\n\n"
+                                f"📐 <b>Strategy:</b> <code>1H Trend + 15M Sweep + 5M MSS</code>\n"
+                                f"📜 <b>Rules:</b> <code>$30 Risk/Trade | 1:2 RR ($60 Target) | 1:1 Breakeven | Max 2 Trades/Day</code>\n\n"
                                 f"🕒 <b>Active Session:</b> {sess_label}\n"
                                 f"🚦 <b>Trading Status:</b> {'🟢 READY' if can_tr else '🔴 PAUSED (' + reason + ')'}\n"
                                 f"🔢 <b>Trades Taken Today:</b> {st['trades_today']}/{MAX_DAILY_TRADES}\n"
@@ -1273,9 +1281,10 @@ def telegram_command_listener():
                                 f"💵 <b>Risk Per Trade:</b> ${RISK_PER_TRADE_USD:.2f}\n"
                                 f"📈 <b>Daily Net PnL:</b> ${st['daily_realized_pnl']:+.2f}\n"
                                 f"📂 <b>Open Positions:</b> {open_cnt}\n\n"
-                                f"• <b>BTC/USD:</b> 🟢 24/7 Active (Weekend Enabled)\n"
-                                f"• <b>XAU/USD:</b> {'🟢 Market Open' if is_forex_market_open() else '🔴 Weekend Closed'}\n\n"
-                                f"Commands: <code>/gold</code>, <code>/btc</code>, <code>/reset</code>"
+                                f"🔹 <b>PAIRS MONITORING:</b>\n"
+                                f"• <b>XAU/USD (Gold):</b> {'🟢 Active & Scanning (Market Open)' if is_forex_market_open() else '🔴 Weekend Closed'}\n"
+                                f"• <b>BTC/USD (Bitcoin):</b> 🟢 Active & Scanning (24/7 Enabled)\n\n"
+                                f"Commands: <code>/gold</code> (instant Gold chart), <code>/btc</code> (instant BTC chart), <code>/status</code>, <code>/reset</code>"
                             )
                             send_telegram_message(msg_out)
 
