@@ -240,6 +240,7 @@ state_mgr = StateManager()
 # Runtime in-memory caches
 last_candle_traded   = {name: None for name in PAIRS_CONFIG}
 last_pre_alert_time  = {name: datetime.min.replace(tzinfo=timezone.utc) for name in PAIRS_CONFIG}
+active_pre_alerts    = {name: None for name in PAIRS_CONFIG}
 pair_cooldown_until  = {name: datetime.min.replace(tzinfo=timezone.utc) for name in PAIRS_CONFIG}
 ohlc_cache           = {}
 
@@ -963,7 +964,9 @@ def async_dispatch_pre_alert(setup, info, df_1h, df_15m, df_5m, live_spot):
             f"🛑 <b>Tentative SL:</b> <code>{setup['sl']:.{dec}f}</code> (Risk: ${setup['risk_usd']:.2f})\n"
             f"🎯 <b>Tentative 1:2 TP:</b> <code>{setup['tp']:.{dec}f}</code> (+${setup['reward_usd']:.2f})\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ <i>Broker terminal khol kar ready rahein! 5M candle close hone par confirm signal aayega.</i>"
+            f"⛔ <b>सख्त नियम (Do NOT Enter Yet):</b>\n"
+            f"<i>यह केवल तैयारी का पूर्व-अलर्ट है। अग्रिम (Advance) में कोई ऑर्डर न लगाएं!\n"
+            f"5M कैंडल ठोस बॉडी के साथ क्लोज होने पर जब 'CONFIRMED SIGNAL' आएगा, तभी ट्रेड लें। यदि कैंडल कमजोर रही तो ट्रेड रद्द (Cancel) हो जाएगा।</i>"
         )
         chart_buf = generate_smc_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=setup, status_badge="SETUP FORMING")
         if chart_buf:
@@ -971,6 +974,21 @@ def async_dispatch_pre_alert(setup, info, df_1h, df_15m, df_5m, live_spot):
         else:
             send_telegram_message(caption)
 
+    CHART_EXECUTOR.submit(_worker)
+
+def async_dispatch_setup_cancelled(info, reason="5M candle closed without solid displacement body (Wick Rejection / Fakeout)."):
+    """Sends notification when a pre-alert setup is rejected/cancelled."""
+    def _worker():
+        caption = (
+            f"❌ <b>SMC SETUP CANCELLED: {info['symbol']}</b> ❌\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ <b>Status:</b> <b>Setup Invalidated (Trade Aborted)</b>\n"
+            f"🔍 <b>Reason:</b> {reason}\n"
+            f"🛡️ <b>Capital Protected:</b> <i>कमजोर कैंडल या फेक ब्रेकआउट से बचा लिया गया। कोई ट्रेड नहीं लिया गया!</i>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <i>अगले हाई-प्रोबेबिलिटी SMC सेटअप का इंतज़ार करें।</i>"
+        )
+        send_telegram_message(caption)
     CHART_EXECUTOR.submit(_worker)
 
 def async_dispatch_trade_signal(trade, info, df_1h, df_15m, df_5m, live_spot):
@@ -1354,6 +1372,14 @@ def run_scanner():
 
                     # Evaluate SMC Setup (Pre-Alert vs Confirmed Entry)
                     setup = evaluate_smc_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot)
+
+                    # Monitor active pre-alerts: If a new 5M candle closed without confirmation, notify cancellation
+                    prev_alert = active_pre_alerts.get(pair_name)
+                    if prev_alert and closed_candle_time > prev_alert["candle_time"]:
+                        if not setup or setup.get("stage") != "CONFIRMED":
+                            async_dispatch_setup_cancelled(info, "5M कैंडल क्लोज होने पर अपेक्षित डिस्प्लेसमेंट बॉडी नहीं मिली (Wick Rejection / Fakeout). फेक ब्रेकआउट से बचने के लिए ट्रेड कैंसिल!")
+                            active_pre_alerts[pair_name] = None
+
                     if not setup:
                         continue
 
@@ -1363,6 +1389,7 @@ def run_scanner():
                         if last_candle_traded[pair_name] != closed_candle_time:
                             last_candle_traded[pair_name] = closed_candle_time
                             pair_cooldown_until[pair_name] = get_utc_now() + timedelta(minutes=25)
+                            active_pre_alerts[pair_name] = None  # Cleared on confirmation
 
                             setup["is_open"] = True
                             setup["be_locked"] = False
@@ -1380,6 +1407,7 @@ def run_scanner():
                         now_utc = get_utc_now()
                         if (now_utc - last_pre_alert_time[pair_name]).total_seconds() > 900:  # 15m cooldown
                             last_pre_alert_time[pair_name] = now_utc
+                            active_pre_alerts[pair_name] = {"candle_time": closed_candle_time, "setup": setup}
                             async_dispatch_pre_alert(setup, info, df_1h, df_15m, df_5m, live_spot)
 
             time.sleep(0.5)
