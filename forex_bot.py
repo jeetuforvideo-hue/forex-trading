@@ -573,64 +573,21 @@ def get_smc_levels_and_1h_bias(df_1h, df_15m, decimals, live_spot=None):
     london_high = round(float(london_bars["High"].max()), decimals) if not london_bars.empty else pdh
     london_low  = round(float(london_bars["Low"].min()), decimals)  if not london_bars.empty else pdl
 
-    # New York Session (13:00 to 21:00 UTC / 06:30 PM to 02:30 AM IST)
-    ny_bars_today = today_bars[(today_bars["utc_hour"] >= 13.0) & (today_bars["utc_hour"] < 21.0)]
-    if not ny_bars_today.empty:
-        ny_high = round(float(ny_bars_today["High"].max()), decimals)
-        ny_low  = round(float(ny_bars_today["Low"].min()), decimals)
-        ny_label_h = "NY H"
-        ny_label_l = "NY L"
-    else:
-        prev_ny_bars = prev_day_bars[(prev_day_bars["utc_hour"] >= 13.0) & (prev_day_bars["utc_hour"] < 21.0)]
-        ny_high = round(float(prev_ny_bars["High"].max()), decimals) if not prev_ny_bars.empty else pdh
-        ny_low  = round(float(prev_ny_bars["Low"].min()), decimals)  if not prev_ny_bars.empty else pdl
-        ny_label_h = "PNY H"
-        ny_label_l = "PNY L"
-
     levels = [
-        # Major Daily Levels (Red / Green)
+        # 1. Daily Macro Key Liquidity (The #1 Institutional Targets)
         {"name": "Previous Day High", "short": "PDH", "price": pdh, "type": "BUY_SIDE_LIQUIDITY", "color": "#dc2626", "style": "--"},
         {"name": "Previous Day Low",  "short": "PDL", "price": pdl, "type": "SELL_SIDE_LIQUIDITY", "color": "#16a34a", "style": "--"},
 
-        # Session Ranges: Asian (Amber), London (Blue), New York (Purple)
+        # 2. Key Session Extrems (Asian & London Sessions)
         {"name": "Asian Session High",  "short": "ASIA H", "price": asian_high, "type": "BUY_SIDE_LIQUIDITY", "color": "#d97706", "style": "-."},
         {"name": "Asian Session Low",   "short": "ASIA L", "price": asian_low,  "type": "SELL_SIDE_LIQUIDITY", "color": "#d97706", "style": "-."},
         {"name": "London Session High", "short": "LON H", "price": london_high, "type": "BUY_SIDE_LIQUIDITY", "color": "#2563eb", "style": "-."},
         {"name": "London Session Low",  "short": "LON L", "price": london_low,  "type": "SELL_SIDE_LIQUIDITY", "color": "#2563eb", "style": "-."},
-        {"name": "New York Session High", "short": ny_label_h, "price": ny_high, "type": "BUY_SIDE_LIQUIDITY", "color": "#7c3aed", "style": "-."},
-        {"name": "New York Session Low",  "short": ny_label_l, "price": ny_low,  "type": "SELL_SIDE_LIQUIDITY", "color": "#7c3aed", "style": "-."},
 
-        # Macro HTF 4H Structure Swings (Solid Maroon / Forest)
+        # 3. Macro 4H Higher Timeframe Swings (Major Ceiling & Floor)
         {"name": "4H Major High", "short": "4H High", "price": h4_high, "type": "BUY_SIDE_LIQUIDITY", "color": "#991b1b", "style": "-"},
-        {"name": "4H Major Low",  "short": "4H Low",  "price": h4_low,  "type": "SELL_SIDE_LIQUIDITY", "color": "#065f46", "style": "-"},
-
-        # Institutional Daily Open Anchor (Slate)
-        {"name": "Daily Open", "short": "DO", "price": daily_open, "type": "EQUILIBRIUM", "color": "#64748b", "style": ":"}
+        {"name": "4H Major Low",  "short": "4H Low",  "price": h4_low,  "type": "SELL_SIDE_LIQUIDITY", "color": "#065f46", "style": "-"}
     ]
-
-    # Major 1H Structure Swings
-    if swing_highs:
-        levels.append({"name": "1H Swing High", "short": "1H High", "price": swing_highs[-1], "type": "BUY_SIDE_LIQUIDITY", "color": "#b91c1c", "style": ":"})
-    if swing_lows:
-        levels.append({"name": "1H Swing Low", "short": "1H Low", "price": swing_lows[-1], "type": "SELL_SIDE_LIQUIDITY", "color": "#047857", "style": ":"})
-
-    # Dynamic 15M Intraday Swing Points (Pullback Liquidity during Rallies/Dumps)
-    highs_15m = df_15m["High"].values
-    lows_15m  = df_15m["Low"].values
-    n_15m = len(df_15m)
-
-    recent_15m_lows = []
-    recent_15m_highs = []
-    for i in range(max(2, n_15m - 20), n_15m - 2):
-        if lows_15m[i] <= min(lows_15m[i-2:i]) and lows_15m[i] <= min(lows_15m[i+1:i+3]):
-            recent_15m_lows.append(round(float(lows_15m[i]), decimals))
-        if highs_15m[i] >= max(highs_15m[i-2:i]) and highs_15m[i] >= max(highs_15m[i+1:i+3]):
-            recent_15m_highs.append(round(float(highs_15m[i]), decimals))
-
-    if recent_15m_lows:
-        levels.append({"name": "15M Intraday Low", "short": "15M Low", "price": recent_15m_lows[-1], "type": "SELL_SIDE_LIQUIDITY", "color": "#059669", "style": ":"})
-    if recent_15m_highs:
-        levels.append({"name": "15M Intraday High", "short": "15M High", "price": recent_15m_highs[-1], "type": "BUY_SIDE_LIQUIDITY", "color": "#e11d48", "style": ":"})
 
     return {
         "h1_bias": h1_bias,
@@ -639,9 +596,7 @@ def get_smc_levels_and_1h_bias(df_1h, df_15m, decimals, live_spot=None):
         "pdh": pdh, "pdl": pdl,
         "london_high": london_high, "london_low": london_low,
         "asian_high": asian_high, "asian_low": asian_low,
-        "ny_high": ny_high, "ny_low": ny_low,
         "h4_high": h4_high, "h4_low": h4_low,
-        "daily_open": daily_open,
         "levels": levels
     }
 
@@ -714,8 +669,8 @@ def evaluate_smc_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot):
         lvl_type  = lv["type"]
 
         # BUY REVERSAL SETUP
-        # Catch sweeps of Sell-Side Liquidity (Asian Low, London Low, NY Low, PDL, 1H/4H Low)
-        is_major_sell_liq = lvl_short in ["ASIA L", "LON L", "NY L", "PNY L", "PDL", "1H Low", "4H Low"]
+        # Catch sweeps of Sell-Side Liquidity (Asian Low, London Low, PDL, 4H Low)
+        is_major_sell_liq = lvl_short in ["ASIA L", "LON L", "PDL", "4H Low"]
         allow_buy_check = (h1_bias == "BULLISH") or is_major_sell_liq
 
         if allow_buy_check and lvl_type == "SELL_SIDE_LIQUIDITY":
@@ -796,8 +751,8 @@ def evaluate_smc_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot):
                             })
 
         # SELL REVERSAL SETUP
-        # Catch sweeps of Buy-Side Liquidity (Asian High, London High, NY High, PDH, 1H/4H High)
-        is_major_buy_liq = lvl_short in ["ASIA H", "LON H", "NY H", "PNY H", "PDH", "1H High", "4H High"]
+        # Catch sweeps of Buy-Side Liquidity (Asian High, London High, PDH, 4H High)
+        is_major_buy_liq = lvl_short in ["ASIA H", "LON H", "PDH", "4H High"]
         allow_sell_check = (h1_bias == "BEARISH") or (is_major_buy_liq and h1_bias != "BULLISH")
 
         if allow_sell_check and lvl_type == "BUY_SIDE_LIQUIDITY":
@@ -1069,10 +1024,18 @@ def generate_smc_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None,
         ax.bar(x_vals[bulls], np.abs(closes[bulls] - opens[bulls]), bottom=np.minimum(opens[bulls], closes[bulls]), width=0.66, color="#089981", edgecolor="#089981", zorder=3)
         ax.bar(x_vals[bears], np.abs(closes[bears] - opens[bears]), bottom=np.minimum(opens[bears], closes[bears]), width=0.66, color="#f23645", edgecolor="#f23645", zorder=3)
 
-        # Plot Key SMC Levels (PDH, PDL, Asia H/L, London H/L, NY H/L, 4H Swings, Daily Open)
-        vis_min = c_min - (y_span * 0.22)
-        vis_max = c_max + (y_span * 0.22)
-        levels_to_draw = [lv for lv in smc_ctx["levels"] if lv.get("price") and vis_min <= lv["price"] <= vis_max]
+        # Plot ONLY the closest, high-priority levels (Clean, uncluttered, pro-trader look)
+        nearby_levels = []
+        for lv in smc_ctx["levels"]:
+            p = lv["price"]
+            if p is not None and p > 0:
+                # Must be reasonably close to 5M candles (within 10% of visible range)
+                if (c_min - y_span * 0.10) <= p <= (c_max + y_span * 0.10):
+                    nearby_levels.append(lv)
+
+        # Pick at most the top 3 closest levels to live spot to prevent any chart clutter ("Kachra")
+        nearby_levels.sort(key=lambda x: abs(x["price"] - live_spot))
+        levels_to_draw = nearby_levels[:3]
         levels_to_draw.sort(key=lambda x: x["price"])
 
         last_drawn_y = -1e9
@@ -1093,7 +1056,7 @@ def generate_smc_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None,
             # Clean TradingView style rounded pill badge on left
             ax.text(
                 1.0, badge_y, f" {lv['short']} {p:.{dec}f} ",
-                color=col, fontsize=7.0, fontweight="bold", va="center", ha="left",
+                color=col, fontsize=7.2, fontweight="bold", va="center", ha="left",
                 bbox=dict(boxstyle="round,pad=0.20", facecolor="#ffffff", edgecolor=col, linewidth=0.65, alpha=0.92),
                 zorder=4
             )
