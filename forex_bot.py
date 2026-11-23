@@ -167,6 +167,23 @@ def is_forex_market_open():
         return False
     return True
 
+def is_london_or_ny_session_active():
+    """
+    STRICT SESSION FILTER (London & New York Only):
+    Trading setups and Pre-Alerts are ONLY permitted during:
+    - London Session: 12:30 PM to 06:30 PM IST (07:00 to 13:00 UTC)
+    - London / NY Overlap: 06:30 PM to 10:00 PM IST (13:00 to 16:30 UTC)
+    - New York Session: 06:30 PM to 02:30 AM IST (13:00 to 21:00 UTC)
+    Total Allowed Trading Window: 12:30 PM IST to 02:30 AM IST (07:00 to 21:00 UTC)
+
+    Asian Session (05:30 AM to 12:30 PM IST) & Late Night (02:30 AM to 05:30 AM IST):
+    STRICTLY FORBIDDEN! No Pre-Alerts and No Confirmed Trades!
+    Asian session is exclusively used to establish Asian High & Low levels for London/NY sweeps.
+    """
+    now_utc = get_utc_now()
+    utc_hr = now_utc.hour + (now_utc.minute / 60.0)
+    return (7.0 <= utc_hr < 21.0)
+
 # ---------------------------------------------------------------------------
 # Persistent State Manager
 # ---------------------------------------------------------------------------
@@ -227,6 +244,8 @@ class StateManager:
 
     def can_trade_today(self):
         self.check_new_day()
+        if not is_london_or_ny_session_active():
+            return False, "Asian / Off-Session (Trading ONLY allowed in London & NY: 12:30 PM – 2:30 AM IST)"
         if self.state["trades_today"] >= MAX_DAILY_TRADES:
             return False, f"Max {MAX_DAILY_TRADES} trades completed for today"
         if self.state["losses_today"] >= MAX_DAILY_LOSSES:
@@ -1357,7 +1376,13 @@ def run_scanner():
                     # 1. First monitor any existing open trades for SL / TP / Breakeven
                     monitor_open_positions(pair_name, info, df_1h, df_15m, df_5m, live_spot)
 
-                    # 2. Check if account is eligible for a new trade
+                    # 2. STRICT SESSION GATE: Only London & New York (12:30 PM to 02:30 AM IST)
+                    # Asian Session (05:30 AM to 12:30 PM IST) & Late Night (02:30 AM to 05:30 AM IST):
+                    # STRICTLY FORBIDDEN! No Pre-Alerts and No Confirmed Trades!
+                    if not is_london_or_ny_session_active():
+                        continue
+
+                    # 3. Check if account is eligible for a new trade
                     can_trade, _ = state_mgr.can_trade_today()
                     if not can_trade:
                         continue
