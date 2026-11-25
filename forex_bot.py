@@ -84,8 +84,9 @@ FOREX_PAIRS = {
         "mt5_name": "XAUUSD",
         "tv_header_name": "Gold Spot / U.S. Dollar",
         "cmd_keys": ["/xauusd", "xauusd", "/gold", "gold"],
-        "tv_tickers": ["OANDA:XAUUSD", "FOREXCOM:XAUUSD", "FX_IDC:XAUUSD"],
+        "tv_tickers": ["ICMARKETS:XAUUSD", "PEPPERSTONE:XAUUSD", "OANDA:XAUUSD", "FOREXCOM:XAUUSD", "FX_IDC:XAUUSD"],
         "tv_screener": "cfd",
+        "coinbase_symbol": None,
         "binance_symbol": "PAXGUSDT",
         "yf_symbols": ["GC=F"],
         "currencies": ["USD"],
@@ -104,8 +105,9 @@ FOREX_PAIRS = {
         "mt5_name": "BTCUSD",
         "tv_header_name": "Bitcoin / U.S. Dollar",
         "cmd_keys": ["/btcusd", "btcusd", "/btc", "btc"],
-        "tv_tickers": ["BITSTAMP:BTCUSD", "COINBASE:BTCUSD", "BINANCE:BTCUSDT"],
+        "tv_tickers": ["ICMARKETS:BTCUSD", "PEPPERSTONE:BTCUSD", "BITSTAMP:BTCUSD", "COINBASE:BTCUSD", "BINANCE:BTCUSDT"],
         "tv_screener": "crypto",
+        "coinbase_symbol": "BTC-USD",
         "binance_symbol": "BTCUSDT",
         "yf_symbols": ["BTC-USD"],
         "currencies": ["USD"],
@@ -131,6 +133,7 @@ pending_pre_alerts      = {name: None for name in FOREX_PAIRS}
 pair_cooldown_until     = {name: datetime.min.replace(tzinfo=timezone.utc) for name in FOREX_PAIRS}
 pre_alert_cooldown      = {name: datetime.min.replace(tzinfo=timezone.utc) for name in FOREX_PAIRS}
 live_bars_memory        = {name: {} for name in FOREX_PAIRS}
+mt5_candle_memory       = {name: {"5m": {}, "15m": {}, "1h": {}} for name in FOREX_PAIRS}
 ohlc_history_cache      = {}
 
 cached_news_events      = []
@@ -470,7 +473,7 @@ def append_to_trading_journal(trade_record, result_r_val, net_pnl_usd, result_la
     threading.Thread(target=_write_csv, daemon=True).start()
 
 # =====================================================================
-# 5. HIGH-SPEED PARALLEL DATA & TELEGRAM PHOTO ENGINE
+# 5. HIGH-SPEED PARALLEL DATA (MT5-EXACT SYNC) & TELEGRAM PHOTO ENGINE
 # =====================================================================
 def send_telegram_chat_action(action="upload_photo", target_chat_id=CHAT_ID):
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
@@ -505,27 +508,80 @@ def format_tv_comma_price(price, decimals):
     return f"{price:,.{decimals}f}"
 
 def fetch_tradingview_live_candle_and_spot(tv_tickers, screener="cfd"):
+    """Fetches exact MT5-broker live spot + 5m, 15m, and 1h OHLC candles from TradingView."""
     if isinstance(tv_tickers, str):
         tv_tickers = [tv_tickers]
-    url = f"https://scanner.tradingview.com/{screener}/scan?cb={time.time_ns()}"
-    cols = ["close", "open|5", "high|5", "low|5", "close|5"]
-    payload = {"symbols": {"tickers": tv_tickers, "query": {"types": []}}, "columns": cols}
-    try:
-        res = HTTP_SESSION.post(url, json=payload, timeout=2.0)
-        if res.status_code == 200:
-            data = res.json().get("data", [])
-            for item in data:
-                d = item.get("d", [])
-                if d and len(d) >= 5 and d[0] is not None:
+    screeners_to_try = [screener] + (["cfd"] if screener != "cfd" else [])
+    cols = [
+        "close",
+        "open|5", "high|5", "low|5", "close|5",
+        "open|15", "high|15", "low|15", "close|15",
+        "open|60", "high|60", "low|60", "close|60"
+    ]
+    for scr in screeners_to_try:
+        url = f"https://scanner.tradingview.com/{scr}/scan?cb={time.time_ns()}"
+        payload = {"symbols": {"tickers": tv_tickers, "query": {"types": []}}, "columns": cols}
+        try:
+            res = HTTP_SESSION.post(url, json=payload, timeout=2.2)
+            if res.status_code == 200:
+                data = res.json().get("data", [])
+                ticker_map = {}
+                for item in data:
+                    s_name = item.get("s", "")
+                    d = item.get("d", [])
+                    if d and len(d) >= 5 and d[0] is not None:
+                        ticker_map[s_name] = d
+                for tk in tv_tickers:
+                    d = ticker_map.get(tk)
+                    if d is None:
+                        continue
                     spot = float(d[0])
                     o5   = float(d[1]) if d[1] is not None else spot
                     h5   = float(d[2]) if d[2] is not None else max(spot, o5)
                     l5   = float(d[3]) if d[3] is not None else min(spot, o5)
                     c5   = float(d[4]) if d[4] is not None else spot
+
+                    o15  = float(d[5]) if (len(d) > 8 and d[5] is not None) else o5
+                    h15  = float(d[6]) if (len(d) > 8 and d[6] is not None) else max(spot, o15)
+                    l15  = float(d[7]) if (len(d) > 8 and d[7] is not None) else min(spot, o15)
+                    c15  = float(d[8]) if (len(d) > 8 and d[8] is not None) else spot
+
+                    o60  = float(d[9])  if (len(d) > 12 and d[9]  is not None) else o15
+                    h60  = float(d[10]) if (len(d) > 12 and d[10] is not None) else max(spot, o60)
+                    l60  = float(d[11]) if (len(d) > 12 and d[11] is not None) else min(spot, o60)
+                    c60  = float(d[12]) if (len(d) > 12 and d[12] is not None) else spot
+
                     return {
                         "spot": spot,
-                        "o5": o5, "h5": max(h5, o5, c5), "l5": min(l5, o5, c5), "c5": c5
+                        "o5": o5,   "h5": max(h5, o5, c5, spot),     "l5": min(l5, o5, c5, spot),     "c5": spot,
+                        "o15": o15, "h15": max(h15, o15, c15, spot), "l15": min(l15, o15, c15, spot), "c15": spot,
+                        "o60": o60, "h60": max(h60, o60, c60, spot), "l60": min(l60, o60, c60, spot), "c60": spot
                     }
+        except Exception:
+            pass
+    return None
+
+def fetch_coinbase_usd_ohlc(product_id, interval_str="5m", limit=220):
+    """Fetches true BTC-USD (non-USDT) OHLC candles closely matching MT5 BTCUSD feeds."""
+    if not product_id:
+        return None
+    gran_map = {"5m": 300, "15m": 900, "1h": 3600}
+    gran = gran_map.get(interval_str)
+    if gran is None:
+        return None
+    url = f"https://api.exchange.coinbase.com/products/{product_id}/candles"
+    try:
+        res = HTTP_SESSION.get(url, params={"granularity": gran}, timeout=3.0)
+        if res.status_code == 200:
+            r = res.json()
+            if isinstance(r, list) and len(r) >= 40:
+                df = pd.DataFrame(r, columns=["open_time", "Low", "High", "Open", "Close", "Volume"])
+                df["Date"] = pd.to_datetime(df["open_time"], unit="s", utc=True)
+                df.set_index("Date", inplace=True)
+                df.sort_index(inplace=True)
+                for col in ["Open", "High", "Low", "Close", "Volume"]:
+                    df[col] = df[col].astype(float)
+                return df[["Open", "High", "Low", "Close", "Volume"]].iloc[-limit:]
     except Exception:
         pass
     return None
@@ -554,7 +610,13 @@ def sanitize_ohlc_dataframe(df, min_bars=40):
     df = df.copy()
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
+    if isinstance(df.index, pd.DatetimeIndex):
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        else:
+            df.index = df.index.tz_convert("UTC")
     df = df[~df.index.duplicated(keep="last")]
+    df.sort_index(inplace=True)
     for col in ["Open", "High", "Low", "Close"]:
         if col not in df.columns:
             return None
@@ -574,11 +636,11 @@ def sanitize_ohlc_dataframe(df, min_bars=40):
     return df[["Open", "High", "Low", "Close", "Volume"]]
 
 def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=True):
-    now_ts     = time.time()
-    now_utc    = get_utc_now()
-    bucket_min = (now_utc.minute // 5) * 5
-    bucket_ts  = now_utc.replace(minute=bucket_min, second=0, microsecond=0)
-    hour_ts    = now_utc.replace(minute=0, second=0, microsecond=0)
+    now_ts      = time.time()
+    now_utc     = get_utc_now()
+    bucket_5m   = now_utc.replace(minute=(now_utc.minute // 5) * 5, second=0, microsecond=0)
+    bucket_15m  = now_utc.replace(minute=(now_utc.minute // 15) * 15, second=0, microsecond=0)
+    bucket_1h   = now_utc.replace(minute=0, second=0, microsecond=0)
 
     raw_df_1h, raw_df_15m, raw_df_5m = None, None, None
     tv_future = DATA_EXECUTOR.submit(
@@ -589,15 +651,26 @@ def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=True):
 
     if use_fast_cache and pair_name in ohlc_history_cache:
         cached = ohlc_history_cache[pair_name]
-        if (now_ts - cached["ts"]) <= 45.0 and cached.get("bucket_ts") == bucket_ts:
+        if (now_ts - cached["ts"]) <= 45.0 and cached.get("bucket_ts") == bucket_5m:
             raw_df_1h  = cached["raw_df_1h"].copy()
             raw_df_15m = cached["raw_df_15m"].copy()
             raw_df_5m  = cached["raw_df_5m"].copy()
 
     if raw_df_1h is None or raw_df_15m is None or raw_df_5m is None:
-        if info.get("binance_symbol"):
+        h1_limit = 240 if info.get("is_crypto", False) else 140
+
+        if info.get("coinbase_symbol"):
+            cb_sym = info["coinbase_symbol"]
+            f_1h  = DATA_EXECUTOR.submit(fetch_coinbase_usd_ohlc, cb_sym, "1h", h1_limit)
+            f_15m = DATA_EXECUTOR.submit(fetch_coinbase_usd_ohlc, cb_sym, "15m", 180)
+            f_5m  = DATA_EXECUTOR.submit(fetch_coinbase_usd_ohlc, cb_sym, "5m", 160)
+            raw_df_1h  = f_1h.result()
+            raw_df_15m = f_15m.result()
+            raw_df_5m  = f_5m.result()
+
+        if (raw_df_1h is None or raw_df_15m is None or raw_df_5m is None) and info.get("binance_symbol"):
             sym = info["binance_symbol"]
-            f_1h  = DATA_EXECUTOR.submit(fetch_binance_vision_ohlc, sym, "1h", 140)
+            f_1h  = DATA_EXECUTOR.submit(fetch_binance_vision_ohlc, sym, "1h", h1_limit)
             f_15m = DATA_EXECUTOR.submit(fetch_binance_vision_ohlc, sym, "15m", 180)
             f_5m  = DATA_EXECUTOR.submit(fetch_binance_vision_ohlc, sym, "5m", 160)
             raw_df_1h  = f_1h.result()
@@ -628,7 +701,7 @@ def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=True):
 
         ohlc_history_cache[pair_name] = {
             "ts": now_ts,
-            "bucket_ts": bucket_ts,
+            "bucket_ts": bucket_5m,
             "raw_df_1h": raw_df_1h.copy(),
             "raw_df_15m": raw_df_15m.copy(),
             "raw_df_5m": raw_df_5m.copy()
@@ -641,25 +714,42 @@ def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=True):
 
     if tv_data is not None and tv_data["spot"] > 0:
         tv_spot = tv_data["spot"]
-        mem     = live_bars_memory[pair_name]
 
-        raw_open_5m = float(df_5m.iloc[-1]["Open"])
-        if mem.get("hour_ts") != hour_ts:
-            fixed_basis = tv_data["o5"] - raw_open_5m
-            if abs(fixed_basis) > (tv_spot * 0.05):
-                fixed_basis = 0.0
-            mem["hour_ts"]     = hour_ts
-            mem["fixed_basis"] = fixed_basis
-        else:
-            fixed_basis = mem.get("fixed_basis", 0.0)
+        # Continuous real-time MT5 basis alignment (eliminates broker vs proxy drift)
+        raw_close_5m = float(df_5m.iloc[-1]["Close"])
+        live_basis = tv_spot - raw_close_5m
+        if abs(live_basis) > (tv_spot * 0.05):
+            live_basis = 0.0
 
-        if abs(fixed_basis) > 0:
+        if abs(live_basis) > 0:
             for col in ["Open", "High", "Low", "Close"]:
-                df_5m[col]  = df_5m[col] + fixed_basis
-                df_15m[col] = df_15m[col] + fixed_basis
-                df_1h[col]  = df_1h[col] + fixed_basis
+                df_5m[col]  = df_5m[col] + live_basis
+                df_15m[col] = df_15m[col] + live_basis
+                df_1h[col]  = df_1h[col] + live_basis
 
         if info.get("is_crypto", False) or is_forex_market_open():
+            # Record exact MT5-broker candles into memory for 100% MT5 parity
+            mem_pair = mt5_candle_memory[pair_name]
+            mem_pair["5m"][pd.Timestamp(bucket_5m)]   = (tv_data["o5"],  tv_data["h5"],  tv_data["l5"],  tv_data["c5"])
+            mem_pair["15m"][pd.Timestamp(bucket_15m)] = (tv_data["o15"], tv_data["h15"], tv_data["l15"], tv_data["c15"])
+            mem_pair["1h"][pd.Timestamp(bucket_1h)]   = (tv_data["o60"], tv_data["h60"], tv_data["l60"], tv_data["c60"])
+
+            for tf_key in ("5m", "15m", "1h"):
+                if len(mem_pair[tf_key]) > 260:
+                    oldest_keys = sorted(mem_pair[tf_key].keys())[:-240]
+                    for ok in oldest_keys:
+                        mem_pair[tf_key].pop(ok, None)
+
+            # Stamp recorded MT5-broker OHLC bars onto dataframes
+            for tf_key, df_target in (("5m", df_5m), ("15m", df_15m), ("1h", df_1h)):
+                for ts_k, (mo, mh, ml, mc) in mem_pair[tf_key].items():
+                    if ts_k in df_target.index:
+                        df_target.loc[ts_k, "Open"]  = mo
+                        df_target.loc[ts_k, "High"]  = max(mh, mo, mc)
+                        df_target.loc[ts_k, "Low"]   = min(ml, mo, mc)
+                        df_target.loc[ts_k, "Close"] = mc
+
+            # Guarantee active live candle matches MT5 broker OHLC tick-for-tick
             last_idx_5m = df_5m.index[-1]
             df_5m.loc[last_idx_5m, "Open"]  = tv_data["o5"]
             df_5m.loc[last_idx_5m, "High"]  = max(tv_data["h5"], tv_spot)
@@ -667,14 +757,16 @@ def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=True):
             df_5m.loc[last_idx_5m, "Close"] = tv_spot
 
             last_idx_15m = df_15m.index[-1]
+            df_15m.loc[last_idx_15m, "Open"]  = tv_data["o15"]
+            df_15m.loc[last_idx_15m, "High"]  = max(tv_data["h15"], tv_spot)
+            df_15m.loc[last_idx_15m, "Low"]   = min(tv_data["l15"], tv_spot)
             df_15m.loc[last_idx_15m, "Close"] = tv_spot
-            df_15m.loc[last_idx_15m, "High"]  = max(float(df_15m.loc[last_idx_15m, "High"]), tv_spot)
-            df_15m.loc[last_idx_15m, "Low"]   = min(float(df_15m.loc[last_idx_15m, "Low"]), tv_spot)
 
             last_idx_1h = df_1h.index[-1]
+            df_1h.loc[last_idx_1h, "Open"]  = tv_data["o60"]
+            df_1h.loc[last_idx_1h, "High"]  = max(tv_data["h60"], tv_spot)
+            df_1h.loc[last_idx_1h, "Low"]   = min(tv_data["l60"], tv_spot)
             df_1h.loc[last_idx_1h, "Close"] = tv_spot
-            df_1h.loc[last_idx_1h, "High"]  = max(float(df_1h.loc[last_idx_1h, "High"]), tv_spot)
-            df_1h.loc[last_idx_1h, "Low"]   = min(float(df_1h.loc[last_idx_1h, "Low"]), tv_spot)
 
         live_spot_price = tv_spot
     else:
@@ -706,7 +798,7 @@ def enrich_price_action_metrics(df):
         df["utc_hour"] = utc_idx.hour + (utc_idx.minute / 60.0)
     return df
 
-def extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, decimals):
+def extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, decimals, is_crypto=False):
     closed_1h = df_1h.iloc[:-1] if len(df_1h) > 25 else df_1h
     atr_1h    = float(closed_1h.iloc[-1]["ATR"])
     if np.isnan(atr_1h) or atr_1h <= 0:
@@ -776,44 +868,125 @@ def extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, decimal
         else:
             h1_bias = "BULLISH" if h1_close >= h1_ema20 else "BEARISH"
 
-    raw_levels = [
-        {"name": "PDH (Prev Day High)", "short": "PDH", "price": pdh_price, "type": "HIGH_POOL", "color": "#b91c1c"},
-        {"name": "PDL (Prev Day Low)",  "short": "PDL", "price": pdl_price, "type": "LOW_POOL",  "color": "#047857"},
-        {"name": "London High",         "short": "LON H", "price": london_high, "type": "HIGH_POOL", "color": "#dc2626"},
-        {"name": "London Low",          "short": "LON L", "price": london_low,  "type": "LOW_POOL",  "color": "#059669"},
-        {"name": "Asian High",          "short": "ASIA H", "price": asian_high, "type": "HIGH_POOL", "color": "#7c3aed"},
-        {"name": "Asian Low",           "short": "ASIA L", "price": asian_low,  "type": "LOW_POOL",  "color": "#2563eb"}
-    ]
+    htf_4h_high = pdh_price
+    htf_4h_low  = pdl_price
+    wk_high     = round(float(closed_1h.iloc[-168:]["High"].max()), decimals)
+    wk_low      = round(float(closed_1h.iloc[-168:]["Low"].min()), decimals)
 
-    if swing_highs_1h:
-        sh_last = swing_highs_1h[-1]
-        is_eqh  = any(abs(sh_last - prev_sh) <= atr_1h * 0.12 for prev_sh in swing_highs_1h[:-1])
-        lbl_h   = "1H EQH (Equal Highs)" if is_eqh else "1H Swing High"
-        raw_levels.append({"name": lbl_h, "short": "1H EQH" if is_eqh else "1H SH", "price": sh_last, "type": "HIGH_POOL", "color": "#1e293b"})
+    if is_crypto:
+        # Higher Timeframe (1H / 4H / Daily / Weekly) Major Levels for BTC (no 200-400 pt micro levels)
+        df_1h_utc = closed_1h.copy()
+        if "utc_date" not in df_1h_utc.columns:
+            df_1h_utc["utc_date"] = [to_utc_timestamp(ts).date() for ts in df_1h_utc.index]
+        u_dates_1h = sorted(pd.unique(df_1h_utc["utc_date"]))
+        if len(u_dates_1h) >= 2:
+            prev_day_1h = df_1h_utc[df_1h_utc["utc_date"] == u_dates_1h[-2]]
+            if not prev_day_1h.empty:
+                pdh_price = round(float(prev_day_1h["High"].max()), decimals)
+                pdl_price = round(float(prev_day_1h["Low"].min()), decimals)
 
-    if swing_lows_1h:
-        sl_last = swing_lows_1h[-1]
-        is_eql  = any(abs(sl_last - prev_sl) <= atr_1h * 0.12 for prev_sl in swing_lows_1h[:-1])
-        lbl_l   = "1H EQL (Equal Lows)" if is_eql else "1H Swing Low"
-        raw_levels.append({"name": lbl_l, "short": "1H EQL" if is_eql else "1H SL", "price": sl_last, "type": "LOW_POOL", "color": "#1e293b"})
+        df_4h = closed_1h.resample("4h").agg({
+            "Open": "first", "High": "max", "Low": "min", "Close": "last"
+        }).dropna()
 
-    merged_levels = []
-    for lv in raw_levels:
-        merged = False
+        sw_4h_highs, sw_4h_lows = [], []
+        if len(df_4h) >= 6:
+            h4 = df_4h["High"].values.astype(float)
+            l4 = df_4h["Low"].values.astype(float)
+            for i in range(2, len(df_4h) - 1):
+                if h4[i] >= max(h4[i - 2:i]) and h4[i] >= h4[i + 1]:
+                    sw_4h_highs.append(round(float(h4[i]), decimals))
+                if l4[i] <= min(l4[i - 2:i]) and l4[i] <= l4[i + 1]:
+                    sw_4h_lows.append(round(float(l4[i]), decimals))
+
+        if sw_4h_highs:
+            htf_4h_high = sw_4h_highs[-1]
+        if sw_4h_lows:
+            htf_4h_low = sw_4h_lows[-1]
+
+        # Wider 1H major fractal swings (3 bars each side)
+        major_1h_highs, major_1h_lows = [], []
+        for i in range(3, n_1h - 3):
+            if highs_1h[i] >= max(highs_1h[i - 3:i]) and highs_1h[i] >= max(highs_1h[i + 1:i + 4]):
+                major_1h_highs.append(round(float(highs_1h[i]), decimals))
+            if lows_1h[i] <= min(lows_1h[i - 3:i]) and lows_1h[i] <= min(lows_1h[i + 1:i + 4]):
+                major_1h_lows.append(round(float(lows_1h[i]), decimals))
+
+        raw_htf_levels = [
+            {"name": "PDH (Prev Day High)", "short": "PDH",   "price": pdh_price,   "type": "HIGH_POOL", "color": "#b91c1c"},
+            {"name": "PDL (Prev Day Low)",  "short": "PDL",   "price": pdl_price,   "type": "LOW_POOL",  "color": "#047857"},
+            {"name": "4H Swing High",       "short": "4H SH", "price": htf_4h_high, "type": "HIGH_POOL", "color": "#dc2626"},
+            {"name": "4H Swing Low",        "short": "4H SL", "price": htf_4h_low,  "type": "LOW_POOL",  "color": "#059669"},
+            {"name": "Weekly High (HTF)",   "short": "WK H",  "price": wk_high,     "type": "HIGH_POOL", "color": "#7c3aed"},
+            {"name": "Weekly Low (HTF)",    "short": "WK L",  "price": wk_low,      "type": "LOW_POOL",  "color": "#2563eb"}
+        ]
+        if len(sw_4h_highs) >= 2:
+            raw_htf_levels.append({"name": "4H Major High", "short": "4H MH", "price": sw_4h_highs[-2], "type": "HIGH_POOL", "color": "#991b1b"})
+        if len(sw_4h_lows) >= 2:
+            raw_htf_levels.append({"name": "4H Major Low",  "short": "4H ML", "price": sw_4h_lows[-2],  "type": "LOW_POOL",  "color": "#065f46"})
+        if major_1h_highs:
+            raw_htf_levels.append({"name": "1H Major Swing High", "short": "1H SH", "price": major_1h_highs[-1], "type": "HIGH_POOL", "color": "#1e293b"})
+        if major_1h_lows:
+            raw_htf_levels.append({"name": "1H Major Swing Low",  "short": "1H SL", "price": major_1h_lows[-1],  "type": "LOW_POOL",  "color": "#1e293b"})
+
+        # Enforce minimum 650+ point spacing so 200-400 pt micro-range levels are eliminated
+        min_btc_level_gap = max(atr_1h * 1.5, 650.0)
+        merged_levels = []
+        for lv in raw_htf_levels:
+            too_close = False
+            for m in merged_levels:
+                if abs(lv["price"] - m["price"]) < min_btc_level_gap:
+                    if lv["type"] == m["type"] and lv["short"] not in m["short"] and len(m["short"]) < 14:
+                        m["short"] = f"{m['short']}/{lv['short']}"
+                        m["name"]  = f"{m['name']} + {lv['name']}"
+                    too_close = True
+                    break
+            if not too_close:
+                merged_levels.append(lv.copy())
+
+        zone_half_thickness = round(max(atr_1h * 0.14, 75.0), decimals)
         for m in merged_levels:
-            if abs(lv["price"] - m["price"]) <= (atr_1h * 0.08) and lv["type"] == m["type"]:
-                if lv["short"] not in m["short"]:
-                    m["short"] = f"{m['short']}/{lv['short']}"
-                    m["name"]  = f"{m['name']} + {lv['name']}"
-                merged = True
-                break
-        if not merged:
-            merged_levels.append(lv.copy())
+            m["top"] = round(m["price"] + zone_half_thickness, decimals)
+            m["bot"] = round(m["price"] - zone_half_thickness, decimals)
+    else:
+        raw_levels = [
+            {"name": "PDH (Prev Day High)", "short": "PDH", "price": pdh_price, "type": "HIGH_POOL", "color": "#b91c1c"},
+            {"name": "PDL (Prev Day Low)",  "short": "PDL", "price": pdl_price, "type": "LOW_POOL",  "color": "#047857"},
+            {"name": "London High",         "short": "LON H", "price": london_high, "type": "HIGH_POOL", "color": "#dc2626"},
+            {"name": "London Low",          "short": "LON L", "price": london_low,  "type": "LOW_POOL",  "color": "#059669"},
+            {"name": "Asian High",          "short": "ASIA H", "price": asian_high, "type": "HIGH_POOL", "color": "#7c3aed"},
+            {"name": "Asian Low",           "short": "ASIA L", "price": asian_low,  "type": "LOW_POOL",  "color": "#2563eb"}
+        ]
 
-    zone_half_thickness = round(atr_1h * 0.08, decimals)
-    for m in merged_levels:
-        m["top"] = round(m["price"] + zone_half_thickness, decimals)
-        m["bot"] = round(m["price"] - zone_half_thickness, decimals)
+        if swing_highs_1h:
+            sh_last = swing_highs_1h[-1]
+            is_eqh  = any(abs(sh_last - prev_sh) <= atr_1h * 0.12 for prev_sh in swing_highs_1h[:-1])
+            lbl_h   = "1H EQH (Equal Highs)" if is_eqh else "1H Swing High"
+            raw_levels.append({"name": lbl_h, "short": "1H EQH" if is_eqh else "1H SH", "price": sh_last, "type": "HIGH_POOL", "color": "#1e293b"})
+
+        if swing_lows_1h:
+            sl_last = swing_lows_1h[-1]
+            is_eql  = any(abs(sl_last - prev_sl) <= atr_1h * 0.12 for prev_sl in swing_lows_1h[:-1])
+            lbl_l   = "1H EQL (Equal Lows)" if is_eql else "1H Swing Low"
+            raw_levels.append({"name": lbl_l, "short": "1H EQL" if is_eql else "1H SL", "price": sl_last, "type": "LOW_POOL", "color": "#1e293b"})
+
+        merged_levels = []
+        for lv in raw_levels:
+            merged = False
+            for m in merged_levels:
+                if abs(lv["price"] - m["price"]) <= (atr_1h * 0.08) and lv["type"] == m["type"]:
+                    if lv["short"] not in m["short"]:
+                        m["short"] = f"{m['short']}/{lv['short']}"
+                        m["name"]  = f"{m['name']} + {lv['name']}"
+                    merged = True
+                    break
+            if not merged:
+                merged_levels.append(lv.copy())
+
+        zone_half_thickness = round(atr_1h * 0.08, decimals)
+        for m in merged_levels:
+            m["top"] = round(m["price"] + zone_half_thickness, decimals)
+            m["bot"] = round(m["price"] - zone_half_thickness, decimals)
 
     return {
         "h1_bias": h1_bias,
@@ -824,6 +997,10 @@ def extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, decimal
         "london_low": london_low,
         "asian_high": asian_high,
         "asian_low": asian_low,
+        "htf_4h_high": htf_4h_high,
+        "htf_4h_low": htf_4h_low,
+        "wk_high": wk_high,
+        "wk_low": wk_low,
         "levels": merged_levels
     }
 
@@ -887,7 +1064,9 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
         return (None, "EXTENDED_CLIMAX_CANDLE") if return_skip_reason else None
 
     dec     = info["decimals"]
-    roadmap = extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, dec)
+    roadmap = extract_roadmap_session_levels_and_1h_bias(
+        df_1h, df_15m, live_spot, dec, is_crypto=info.get("is_crypto", False)
+    )
     h1_bias = roadmap["h1_bias"]
     levels  = roadmap["levels"]
 
@@ -1188,7 +1367,7 @@ def compute_day_wise_breakdown(trades_list):
     return {"days": day_stats, "best_day": best_day, "worst_day": worst_day}
 
 # =====================================================================
-# 9. HIGH-SPEED CLEAN CHARTS (NO BOS / FVG / OB) & TELEGRAM REPORTS
+# 9. HIGH-SPEED MT5-SYNCED CHARTS (BTC 1H HTF / XAU 5M) & REPORTS
 # =====================================================================
 def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, day_breakdown):
     try:
@@ -1379,7 +1558,9 @@ def draw_tradingview_arrow(ax, x_pos, y_pos, y_span, is_up=True):
 
 def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None):
     try:
-        sub = df_5m.iloc[-56:].copy()
+        is_btc = info.get("is_crypto", False)
+        # BTC plots Higher Timeframe (1H, 64 candles) with wide HTF levels; XAU plots 5m
+        sub = df_1h.iloc[-64:].copy() if is_btc else df_5m.iloc[-56:].copy()
         if sub.empty or len(sub) < 20:
             return None
 
@@ -1387,7 +1568,9 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         mt5_sym = info["mt5_name"]
         hdr_nam = info.get("tv_header_name", mt5_sym)
 
-        roadmap = extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, dec)
+        roadmap = extract_roadmap_session_levels_and_1h_bias(
+            df_1h, df_15m, live_spot, dec, is_crypto=is_btc
+        )
         h1_bias = roadmap["h1_bias"]
         levels  = roadmap["levels"]
 
@@ -1404,9 +1587,10 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         ax.spines["right"].set_color("#e0e3eb")
         ax.spines["bottom"].set_color("#e0e3eb")
 
+        wm_txt = f"{mt5_sym} · MT5 1H HTF" if is_btc else f"{mt5_sym} · MT5 1H ➔ 15M ➔ 5M"
         ax.text(
-            0.45, 0.50, f"{mt5_sym} · 1H ➔ 15M ➔ 5M", transform=ax.transAxes,
-            fontsize=30, fontweight="bold", color="#131722", alpha=0.07,
+            0.45, 0.50, wm_txt, transform=ax.transAxes,
+            fontsize=28 if is_btc else 30, fontweight="bold", color="#131722", alpha=0.07,
             ha="center", va="center", zorder=1
         )
 
@@ -1418,11 +1602,29 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         c_min, c_max = float(np.min(lows)), float(np.max(highs))
         c_span = max(c_max - c_min, float(sub.iloc[-2]["ATR"]) * 4.0)
 
-        visible_levels = [
-            lv for lv in levels
-            if (c_min - c_span * 0.45) <= lv["price"] <= (c_max + c_span * 0.45)
-        ]
-        if not visible_levels:
+        if is_btc:
+            visible_levels = [
+                lv for lv in levels
+                if (c_min - c_span * 0.30) <= lv["price"] <= (c_max + c_span * 0.30)
+            ]
+            # Always include nearest major resistance above and support below on HTF BTC chart
+            above_lvs = [lv for lv in levels if lv["price"] >= live_spot]
+            below_lvs = [lv for lv in levels if lv["price"] < live_spot]
+            if above_lvs:
+                near_hi = min(above_lvs, key=lambda l: abs(l["price"] - live_spot))
+                if near_hi not in visible_levels:
+                    visible_levels.append(near_hi)
+            if below_lvs:
+                near_lo = min(below_lvs, key=lambda l: abs(l["price"] - live_spot))
+                if near_lo not in visible_levels:
+                    visible_levels.append(near_lo)
+        else:
+            visible_levels = [
+                lv for lv in levels
+                if (c_min - c_span * 0.45) <= lv["price"] <= (c_max + c_span * 0.45)
+            ]
+
+        if not visible_levels and levels:
             nearest_lv = min(levels, key=lambda l: abs(l["price"] - live_spot))
             visible_levels = [nearest_lv]
 
@@ -1446,7 +1648,8 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         ax.bar(x_vals[bull_mask], body_heights[bull_mask], bottom=bot_bodies[bull_mask], width=0.68, color="#089981", edgecolor="#089981", linewidth=0.40, zorder=4)
         ax.bar(x_vals[bear_mask], body_heights[bear_mask], bottom=bot_bodies[bear_mask], width=0.68, color="#f23645", edgecolor="#f23645", linewidth=0.40, zorder=4)
 
-        for lv in visible_levels:
+        placed_label_ys = []
+        for lv in sorted(visible_levels, key=lambda x: x["price"]):
             z_top = lv["top"]
             z_mid = lv["price"]
             z_bot = lv["bot"]
@@ -1462,8 +1665,16 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
             ))
             ax.plot([s_idx, right_edge_idx], [z_mid, z_mid], color=lbl_c, linewidth=0.80, linestyle="--", alpha=0.75, zorder=3)
 
+            lbl_y = z_top + total_span * 0.005
+            lbl_x = s_idx + 1
+            for py in placed_label_ys:
+                if abs(lbl_y - py) < (total_span * 0.042):
+                    lbl_x = s_idx + 15
+                    break
+            placed_label_ys.append(lbl_y)
+
             ax.text(
-                s_idx + 1, z_top + total_span * 0.005,
+                lbl_x, lbl_y,
                 f"{lv['short']} ({format_price(z_mid, dec)})",
                 fontsize=7.2, fontweight="bold", color=lbl_c, ha="left", va="bottom",
                 bbox=dict(boxstyle="round,pad=0.14", facecolor="#ffffff", edgecolor=lbl_c, alpha=0.88, linewidth=0.6),
@@ -1537,7 +1748,10 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
                 )
 
         now_utc = get_utc_now()
-        rem_sec = max(0, (5 - (now_utc.minute % 5)) * 60 - now_utc.second)
+        if is_btc:
+            rem_sec = max(0, (60 - now_utc.minute) * 60 - now_utc.second)
+        else:
+            rem_sec = max(0, (5 - (now_utc.minute % 5)) * 60 - now_utc.second)
         mm, ss  = divmod(rem_sec, 60)
         live_tag_txt = f" {format_tv_comma_price(live_spot, dec)} \n {mm:02d}:{ss:02d} "
         ax.text(
@@ -1566,9 +1780,13 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
 
         top_ax = fig.add_axes([0.015, 0.915, 0.96, 0.075], facecolor="#ffffff")
         top_ax.axis("off")
+        hdr_title = (
+            f"{hdr_nam} ({mt5_sym}) · MT5-Synced HTF Major Levels (1H)"
+            if is_btc else
+            f"{hdr_nam} ({mt5_sym}) · MT5-Synced 15M Sweep + 5M MSS Map (5m)"
+        )
         top_ax.text(
-            0.0, 0.72,
-            f"{hdr_nam} ({mt5_sym}) · 15M Sweep + 5M MSS Liquidity Map (5m)",
+            0.0, 0.72, hdr_title,
             fontsize=9.5, fontweight="bold", color="#131722", va="center", ha="left"
         )
         top_ax.text(
@@ -1583,7 +1801,12 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
             bbox=dict(boxstyle="round,pad=0.24", facecolor=bias_bg, edgecolor="#cbd5e1", linewidth=0.7)
         )
 
-        fig.text(0.015, 0.018, "Telegram Bot · Strategy 1 Only · London + NY · Low-Spread", fontsize=9.0, fontweight="bold", color="#131722")
+        footer_txt = (
+            "Telegram Bot · MT5-Synced · BTC 1H HTF Major Levels (650+ Pts)"
+            if is_btc else
+            "Telegram Bot · MT5-Synced · Strategy 1 Only · London + NY · Low-Spread"
+        )
+        fig.text(0.015, 0.018, footer_txt, fontsize=9.0, fontweight="bold", color="#131722")
 
         buf = io.BytesIO()
         plt.savefig(buf, format="png", dpi=100, facecolor="#ffffff")
@@ -1634,6 +1857,7 @@ def send_instant_preview_chart(pair_key=None):
         chart_rotation_index += 1
 
     info = FOREX_PAIRS.get(pair_key, FOREX_PAIRS["XAU/USD"])
+    is_btc = info.get("is_crypto", False)
     df_1h, df_15m, df_5m, live_spot = get_roadmap_3tf_spot_data(pair_key, info, use_fast_cache=True)
     if df_1h is None or df_15m is None or df_5m is None or live_spot is None:
         send_telegram_message("⚠️ Data loading, please try again in a few seconds.")
@@ -1644,25 +1868,40 @@ def send_instant_preview_chart(pair_key=None):
     df_5m  = enrich_price_action_metrics(df_5m)
     dec    = info["decimals"]
 
-    roadmap = extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, dec)
+    roadmap = extract_roadmap_session_levels_and_1h_bias(
+        df_1h, df_15m, live_spot, dec, is_crypto=is_btc
+    )
 
     # Preview chart shows live market structure without triggering or displaying manual trade signals
     chart_buf = generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None)
-    _, _, sess_status_txt, sessions_str = get_active_sessions_info(info.get("is_crypto", False))
+    _, _, sess_status_txt, sessions_str = get_active_sessions_info(is_btc)
     _, spread_status_txt                = check_low_spread_window(info)
 
     no_trade_note = "⚠️ <b>1H is RANGING/CHOPPY — Stand Aside!</b>\n" if roadmap["h1_bias"] == "RANGING" else ""
+
+    if is_btc:
+        levels_block = (
+            f"📌 <b>Major HTF Levels (1H / 4H / Weekly):</b>\n"
+            f"• <b>PDH / PDL:</b> <code>{format_price(roadmap['pdh'], dec)}</code> / <code>{format_price(roadmap['pdl'], dec)}</code>\n"
+            f"• <b>4H Swing H / L:</b> <code>{format_price(roadmap['htf_4h_high'], dec)}</code> / <code>{format_price(roadmap['htf_4h_low'], dec)}</code>\n"
+            f"• <b>Weekly H / L:</b> <code>{format_price(roadmap['wk_high'], dec)}</code> / <code>{format_price(roadmap['wk_low'], dec)}</code>\n\n"
+        )
+    else:
+        levels_block = (
+            f"📌 <b>Nearby Pair Levels:</b>\n"
+            f"• <b>PDH / PDL:</b> <code>{format_price(roadmap['pdh'], dec)}</code> / <code>{format_price(roadmap['pdl'], dec)}</code>\n"
+            f"• <b>London H / L:</b> <code>{format_price(roadmap['london_high'], dec)}</code> / <code>{format_price(roadmap['london_low'], dec)}</code>\n"
+            f"• <b>Asian H / L:</b> <code>{format_price(roadmap['asian_high'], dec)}</code> / <code>{format_price(roadmap['asian_low'], dec)}</code>\n\n"
+        )
+
     caption = (
-        f"📊 <b>{info['mt5_name']} • LIVE MARKET CHART</b>\n"
+        f"📊 <b>{info['mt5_name']} • LIVE MARKET CHART ({'1H HTF' if is_btc else '5M'})</b>\n"
         f"🕒 <b>Session:</b> {sess_status_txt}\n"
         f"🕒 <b>Sessions:</b> {sessions_str}\n"
         f"💧 <b>Spread Window:</b> {spread_status_txt}\n"
         f"🧭 <b>1H Context:</b> <b>{roadmap['h1_bias']}</b> | 📍 <b>Live:</b> <code>{format_price(live_spot, dec)}</code>\n"
         f"{no_trade_note}\n"
-        f"📌 <b>Nearby Pair Levels:</b>\n"
-        f"• <b>PDH / PDL:</b> <code>{format_price(roadmap['pdh'], dec)}</code> / <code>{format_price(roadmap['pdl'], dec)}</code>\n"
-        f"• <b>London H / L:</b> <code>{format_price(roadmap['london_high'], dec)}</code> / <code>{format_price(roadmap['london_low'], dec)}</code>\n"
-        f"• <b>Asian H / L:</b> <code>{format_price(roadmap['asian_high'], dec)}</code> / <code>{format_price(roadmap['asian_low'], dec)}</code>\n\n"
+        f"{levels_block}"
         f"🤖 <b>Auto-Trade Mode:</b> Bot automatically sends alerts when 1H Bias + 15M Sweep + 5M MSS forms."
     )
 
@@ -1693,7 +1932,9 @@ def send_live_status_summary():
             if df_1h is not None and df_15m is not None and live_spot is not None:
                 df_1h  = enrich_price_action_metrics(df_1h)
                 df_15m = enrich_price_action_metrics(df_15m)
-                rm     = extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, info["decimals"])
+                rm     = extract_roadmap_session_levels_and_1h_bias(
+                    df_1h, df_15m, live_spot, info["decimals"], is_crypto=info.get("is_crypto", False)
+                )
                 pend   = pending_pre_alerts.get(name)
                 st_str = f"⏳ Pre-Alert @ {format_price(pend['entry_spot'], info['decimals'])}" if pend else f"PDH:{format_price(rm['pdh'], info['decimals'])} | PDL:{format_price(rm['pdl'], info['decimals'])}"
                 report += f"🔹 <b>{info['mt5_name']}:</b> <code>{format_price(live_spot, info['decimals'])}</code> | {sp_txt} | 1H: <b>{rm['h1_bias']}</b> ({st_str})\n"
@@ -2080,6 +2321,7 @@ if __name__ == "__main__":
         f"• <b>Active Strategy:</b> 1H Bias + 15M Sweep + 5M MSS + Pair Radar\n"
         f"• <b>Sessions:</b> London + New York Active (BTC/USD 24/7)\n"
         f"• <b>Spread Filter:</b> Active (Low-Spread Hours Only)\n"
+        f"• <b>Chart Sync:</b> MT5-Broker Live Sync (BTC 1H HTF Levels · 650+ Pts)\n"
         f"• <b>Commands:</b> <code>/gold</code>, <code>/btc</code>, <code>/backtest</code>, <code>/status</code>, <code>/reset</code>"
     )
 
