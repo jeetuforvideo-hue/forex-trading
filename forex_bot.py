@@ -657,7 +657,7 @@ def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=True):
             raw_df_5m  = cached["raw_df_5m"].copy()
 
     if raw_df_1h is None or raw_df_15m is None or raw_df_5m is None:
-        h1_limit = 240 if info.get("is_crypto", False) else 140
+        h1_limit = 240
 
         if info.get("coinbase_symbol"):
             cb_sym = info["coinbase_symbol"]
@@ -775,7 +775,7 @@ def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=True):
     return df_1h, df_15m, df_5m, live_spot_price
 
 # =====================================================================
-# 6. PRE-SESSION KEY LEVELS & 1H CONTEXT ENGINE
+# 6. HIGHER TIMEFRAME (1H / 4H / WEEKLY) MAJOR LEVELS & 1H CONTEXT ENGINE
 # =====================================================================
 def enrich_price_action_metrics(df):
     df = df.copy()
@@ -868,125 +868,81 @@ def extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, decimal
         else:
             h1_bias = "BULLISH" if h1_close >= h1_ema20 else "BEARISH"
 
-    htf_4h_high = pdh_price
-    htf_4h_low  = pdl_price
-    wk_high     = round(float(closed_1h.iloc[-168:]["High"].max()), decimals)
-    wk_low      = round(float(closed_1h.iloc[-168:]["Low"].min()), decimals)
+    # Higher Timeframe (1H / 4H / Daily / Weekly) Major Levels for BOTH XAUUSD & BTCUSD
+    df_1h_utc = closed_1h.copy()
+    if "utc_date" not in df_1h_utc.columns:
+        df_1h_utc["utc_date"] = [to_utc_timestamp(ts).date() for ts in df_1h_utc.index]
+    u_dates_1h = sorted(pd.unique(df_1h_utc["utc_date"]))
+    if len(u_dates_1h) >= 2:
+        prev_day_1h = df_1h_utc[df_1h_utc["utc_date"] == u_dates_1h[-2]]
+        if not prev_day_1h.empty:
+            pdh_price = round(float(prev_day_1h["High"].max()), decimals)
+            pdl_price = round(float(prev_day_1h["Low"].min()), decimals)
 
-    if is_crypto:
-        # Higher Timeframe (1H / 4H / Daily / Weekly) Major Levels for BTC (no 200-400 pt micro levels)
-        df_1h_utc = closed_1h.copy()
-        if "utc_date" not in df_1h_utc.columns:
-            df_1h_utc["utc_date"] = [to_utc_timestamp(ts).date() for ts in df_1h_utc.index]
-        u_dates_1h = sorted(pd.unique(df_1h_utc["utc_date"]))
-        if len(u_dates_1h) >= 2:
-            prev_day_1h = df_1h_utc[df_1h_utc["utc_date"] == u_dates_1h[-2]]
-            if not prev_day_1h.empty:
-                pdh_price = round(float(prev_day_1h["High"].max()), decimals)
-                pdl_price = round(float(prev_day_1h["Low"].min()), decimals)
+    wk_high = round(float(closed_1h.iloc[-168:]["High"].max()), decimals)
+    wk_low  = round(float(closed_1h.iloc[-168:]["Low"].min()), decimals)
 
-        df_4h = closed_1h.resample("4h").agg({
-            "Open": "first", "High": "max", "Low": "min", "Close": "last"
-        }).dropna()
+    df_4h = closed_1h.resample("4h").agg({
+        "Open": "first", "High": "max", "Low": "min", "Close": "last"
+    }).dropna()
 
-        sw_4h_highs, sw_4h_lows = [], []
-        if len(df_4h) >= 6:
-            h4 = df_4h["High"].values.astype(float)
-            l4 = df_4h["Low"].values.astype(float)
-            for i in range(2, len(df_4h) - 1):
-                if h4[i] >= max(h4[i - 2:i]) and h4[i] >= h4[i + 1]:
-                    sw_4h_highs.append(round(float(h4[i]), decimals))
-                if l4[i] <= min(l4[i - 2:i]) and l4[i] <= l4[i + 1]:
-                    sw_4h_lows.append(round(float(l4[i]), decimals))
+    sw_4h_highs, sw_4h_lows = [], []
+    if len(df_4h) >= 6:
+        h4 = df_4h["High"].values.astype(float)
+        l4 = df_4h["Low"].values.astype(float)
+        for i in range(2, len(df_4h) - 1):
+            if h4[i] >= max(h4[i - 2:i]) and h4[i] >= h4[i + 1]:
+                sw_4h_highs.append(round(float(h4[i]), decimals))
+            if l4[i] <= min(l4[i - 2:i]) and l4[i] <= l4[i + 1]:
+                sw_4h_lows.append(round(float(l4[i]), decimals))
 
-        if sw_4h_highs:
-            htf_4h_high = sw_4h_highs[-1]
-        if sw_4h_lows:
-            htf_4h_low = sw_4h_lows[-1]
+    htf_4h_high = sw_4h_highs[-1] if sw_4h_highs else pdh_price
+    htf_4h_low  = sw_4h_lows[-1]  if sw_4h_lows  else pdl_price
 
-        # Wider 1H major fractal swings (3 bars each side)
-        major_1h_highs, major_1h_lows = [], []
-        for i in range(3, n_1h - 3):
-            if highs_1h[i] >= max(highs_1h[i - 3:i]) and highs_1h[i] >= max(highs_1h[i + 1:i + 4]):
-                major_1h_highs.append(round(float(highs_1h[i]), decimals))
-            if lows_1h[i] <= min(lows_1h[i - 3:i]) and lows_1h[i] <= min(lows_1h[i + 1:i + 4]):
-                major_1h_lows.append(round(float(lows_1h[i]), decimals))
+    # Wider 1H major fractal swings (3 bars each side)
+    major_1h_highs, major_1h_lows = [], []
+    for i in range(3, n_1h - 3):
+        if highs_1h[i] >= max(highs_1h[i - 3:i]) and highs_1h[i] >= max(highs_1h[i + 1:i + 4]):
+            major_1h_highs.append(round(float(highs_1h[i]), decimals))
+        if lows_1h[i] <= min(lows_1h[i - 3:i]) and lows_1h[i] <= min(lows_1h[i + 1:i + 4]):
+            major_1h_lows.append(round(float(lows_1h[i]), decimals))
 
-        raw_htf_levels = [
-            {"name": "PDH (Prev Day High)", "short": "PDH",   "price": pdh_price,   "type": "HIGH_POOL", "color": "#b91c1c"},
-            {"name": "PDL (Prev Day Low)",  "short": "PDL",   "price": pdl_price,   "type": "LOW_POOL",  "color": "#047857"},
-            {"name": "4H Swing High",       "short": "4H SH", "price": htf_4h_high, "type": "HIGH_POOL", "color": "#dc2626"},
-            {"name": "4H Swing Low",        "short": "4H SL", "price": htf_4h_low,  "type": "LOW_POOL",  "color": "#059669"},
-            {"name": "Weekly High (HTF)",   "short": "WK H",  "price": wk_high,     "type": "HIGH_POOL", "color": "#7c3aed"},
-            {"name": "Weekly Low (HTF)",    "short": "WK L",  "price": wk_low,      "type": "LOW_POOL",  "color": "#2563eb"}
-        ]
-        if len(sw_4h_highs) >= 2:
-            raw_htf_levels.append({"name": "4H Major High", "short": "4H MH", "price": sw_4h_highs[-2], "type": "HIGH_POOL", "color": "#991b1b"})
-        if len(sw_4h_lows) >= 2:
-            raw_htf_levels.append({"name": "4H Major Low",  "short": "4H ML", "price": sw_4h_lows[-2],  "type": "LOW_POOL",  "color": "#065f46"})
-        if major_1h_highs:
-            raw_htf_levels.append({"name": "1H Major Swing High", "short": "1H SH", "price": major_1h_highs[-1], "type": "HIGH_POOL", "color": "#1e293b"})
-        if major_1h_lows:
-            raw_htf_levels.append({"name": "1H Major Swing Low",  "short": "1H SL", "price": major_1h_lows[-1],  "type": "LOW_POOL",  "color": "#1e293b"})
+    raw_htf_levels = [
+        {"name": "PDH (Prev Day High)", "short": "PDH",   "price": pdh_price,   "type": "HIGH_POOL", "color": "#b91c1c"},
+        {"name": "PDL (Prev Day Low)",  "short": "PDL",   "price": pdl_price,   "type": "LOW_POOL",  "color": "#047857"},
+        {"name": "4H Swing High",       "short": "4H SH", "price": htf_4h_high, "type": "HIGH_POOL", "color": "#dc2626"},
+        {"name": "4H Swing Low",        "short": "4H SL", "price": htf_4h_low,  "type": "LOW_POOL",  "color": "#059669"},
+        {"name": "Weekly High (HTF)",   "short": "WK H",  "price": wk_high,     "type": "HIGH_POOL", "color": "#7c3aed"},
+        {"name": "Weekly Low (HTF)",    "short": "WK L",  "price": wk_low,      "type": "LOW_POOL",  "color": "#2563eb"}
+    ]
+    if len(sw_4h_highs) >= 2:
+        raw_htf_levels.append({"name": "4H Major High", "short": "4H MH", "price": sw_4h_highs[-2], "type": "HIGH_POOL", "color": "#991b1b"})
+    if len(sw_4h_lows) >= 2:
+        raw_htf_levels.append({"name": "4H Major Low",  "short": "4H ML", "price": sw_4h_lows[-2],  "type": "LOW_POOL",  "color": "#065f46"})
+    if major_1h_highs:
+        raw_htf_levels.append({"name": "1H Major Swing High", "short": "1H SH", "price": major_1h_highs[-1], "type": "HIGH_POOL", "color": "#1e293b"})
+    if major_1h_lows:
+        raw_htf_levels.append({"name": "1H Major Swing Low",  "short": "1H SL", "price": major_1h_lows[-1],  "type": "LOW_POOL",  "color": "#1e293b"})
 
-        # Enforce minimum 650+ point spacing so 200-400 pt micro-range levels are eliminated
-        min_btc_level_gap = max(atr_1h * 1.5, 650.0)
-        merged_levels = []
-        for lv in raw_htf_levels:
-            too_close = False
-            for m in merged_levels:
-                if abs(lv["price"] - m["price"]) < min_btc_level_gap:
-                    if lv["type"] == m["type"] and lv["short"] not in m["short"] and len(m["short"]) < 14:
-                        m["short"] = f"{m['short']}/{lv['short']}"
-                        m["name"]  = f"{m['name']} + {lv['name']}"
-                    too_close = True
-                    break
-            if not too_close:
-                merged_levels.append(lv.copy())
-
-        zone_half_thickness = round(max(atr_1h * 0.14, 75.0), decimals)
+    # Enforce wide minimum spacing so micro-range levels are eliminated (BTC: 650+ Pts, Gold: $10+ Pts)
+    min_level_gap = max(atr_1h * 1.5, 650.0) if is_crypto else max(atr_1h * 1.5, 10.0)
+    merged_levels = []
+    for lv in raw_htf_levels:
+        too_close = False
         for m in merged_levels:
-            m["top"] = round(m["price"] + zone_half_thickness, decimals)
-            m["bot"] = round(m["price"] - zone_half_thickness, decimals)
-    else:
-        raw_levels = [
-            {"name": "PDH (Prev Day High)", "short": "PDH", "price": pdh_price, "type": "HIGH_POOL", "color": "#b91c1c"},
-            {"name": "PDL (Prev Day Low)",  "short": "PDL", "price": pdl_price, "type": "LOW_POOL",  "color": "#047857"},
-            {"name": "London High",         "short": "LON H", "price": london_high, "type": "HIGH_POOL", "color": "#dc2626"},
-            {"name": "London Low",          "short": "LON L", "price": london_low,  "type": "LOW_POOL",  "color": "#059669"},
-            {"name": "Asian High",          "short": "ASIA H", "price": asian_high, "type": "HIGH_POOL", "color": "#7c3aed"},
-            {"name": "Asian Low",           "short": "ASIA L", "price": asian_low,  "type": "LOW_POOL",  "color": "#2563eb"}
-        ]
+            if abs(lv["price"] - m["price"]) < min_level_gap:
+                if lv["type"] == m["type"] and lv["short"] not in m["short"] and len(m["short"]) < 14:
+                    m["short"] = f"{m['short']}/{lv['short']}"
+                    m["name"]  = f"{m['name']} + {lv['name']}"
+                too_close = True
+                break
+        if not too_close:
+            merged_levels.append(lv.copy())
 
-        if swing_highs_1h:
-            sh_last = swing_highs_1h[-1]
-            is_eqh  = any(abs(sh_last - prev_sh) <= atr_1h * 0.12 for prev_sh in swing_highs_1h[:-1])
-            lbl_h   = "1H EQH (Equal Highs)" if is_eqh else "1H Swing High"
-            raw_levels.append({"name": lbl_h, "short": "1H EQH" if is_eqh else "1H SH", "price": sh_last, "type": "HIGH_POOL", "color": "#1e293b"})
-
-        if swing_lows_1h:
-            sl_last = swing_lows_1h[-1]
-            is_eql  = any(abs(sl_last - prev_sl) <= atr_1h * 0.12 for prev_sl in swing_lows_1h[:-1])
-            lbl_l   = "1H EQL (Equal Lows)" if is_eql else "1H Swing Low"
-            raw_levels.append({"name": lbl_l, "short": "1H EQL" if is_eql else "1H SL", "price": sl_last, "type": "LOW_POOL", "color": "#1e293b"})
-
-        merged_levels = []
-        for lv in raw_levels:
-            merged = False
-            for m in merged_levels:
-                if abs(lv["price"] - m["price"]) <= (atr_1h * 0.08) and lv["type"] == m["type"]:
-                    if lv["short"] not in m["short"]:
-                        m["short"] = f"{m['short']}/{lv['short']}"
-                        m["name"]  = f"{m['name']} + {lv['name']}"
-                    merged = True
-                    break
-            if not merged:
-                merged_levels.append(lv.copy())
-
-        zone_half_thickness = round(atr_1h * 0.08, decimals)
-        for m in merged_levels:
-            m["top"] = round(m["price"] + zone_half_thickness, decimals)
-            m["bot"] = round(m["price"] - zone_half_thickness, decimals)
+    zone_half_thickness = round(max(atr_1h * 0.14, 75.0) if is_crypto else max(atr_1h * 0.14, 1.50), decimals)
+    for m in merged_levels:
+        m["top"] = round(m["price"] + zone_half_thickness, decimals)
+        m["bot"] = round(m["price"] - zone_half_thickness, decimals)
 
     return {
         "h1_bias": h1_bias,
@@ -1367,7 +1323,7 @@ def compute_day_wise_breakdown(trades_list):
     return {"days": day_stats, "best_day": best_day, "worst_day": worst_day}
 
 # =====================================================================
-# 9. HIGH-SPEED MT5-SYNCED CHARTS (BTC 1H HTF / XAU 5M) & REPORTS
+# 9. HIGH-SPEED MT5-SYNCED CHARTS (XAU + BTC 1H HTF) & REPORTS
 # =====================================================================
 def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, day_breakdown):
     try:
@@ -1559,8 +1515,8 @@ def draw_tradingview_arrow(ax, x_pos, y_pos, y_span, is_up=True):
 def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None):
     try:
         is_btc = info.get("is_crypto", False)
-        # BTC plots Higher Timeframe (1H, 64 candles) with wide HTF levels; XAU plots 5m
-        sub = df_1h.iloc[-64:].copy() if is_btc else df_5m.iloc[-56:].copy()
+        # Both XAUUSD & BTCUSD plot Higher Timeframe (1H, 64 candles) with wide HTF Major Levels
+        sub = df_1h.iloc[-64:].copy()
         if sub.empty or len(sub) < 20:
             return None
 
@@ -1587,10 +1543,9 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         ax.spines["right"].set_color("#e0e3eb")
         ax.spines["bottom"].set_color("#e0e3eb")
 
-        wm_txt = f"{mt5_sym} · MT5 1H HTF" if is_btc else f"{mt5_sym} · MT5 1H ➔ 15M ➔ 5M"
         ax.text(
-            0.45, 0.50, wm_txt, transform=ax.transAxes,
-            fontsize=28 if is_btc else 30, fontweight="bold", color="#131722", alpha=0.07,
+            0.45, 0.50, f"{mt5_sym} · MT5 1H HTF", transform=ax.transAxes,
+            fontsize=28, fontweight="bold", color="#131722", alpha=0.07,
             ha="center", va="center", zorder=1
         )
 
@@ -1602,27 +1557,21 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         c_min, c_max = float(np.min(lows)), float(np.max(highs))
         c_span = max(c_max - c_min, float(sub.iloc[-2]["ATR"]) * 4.0)
 
-        if is_btc:
-            visible_levels = [
-                lv for lv in levels
-                if (c_min - c_span * 0.30) <= lv["price"] <= (c_max + c_span * 0.30)
-            ]
-            # Always include nearest major resistance above and support below on HTF BTC chart
-            above_lvs = [lv for lv in levels if lv["price"] >= live_spot]
-            below_lvs = [lv for lv in levels if lv["price"] < live_spot]
-            if above_lvs:
-                near_hi = min(above_lvs, key=lambda l: abs(l["price"] - live_spot))
-                if near_hi not in visible_levels:
-                    visible_levels.append(near_hi)
-            if below_lvs:
-                near_lo = min(below_lvs, key=lambda l: abs(l["price"] - live_spot))
-                if near_lo not in visible_levels:
-                    visible_levels.append(near_lo)
-        else:
-            visible_levels = [
-                lv for lv in levels
-                if (c_min - c_span * 0.45) <= lv["price"] <= (c_max + c_span * 0.45)
-            ]
+        visible_levels = [
+            lv for lv in levels
+            if (c_min - c_span * 0.30) <= lv["price"] <= (c_max + c_span * 0.30)
+        ]
+        # Always include nearest major resistance above and support below on HTF chart
+        above_lvs = [lv for lv in levels if lv["price"] >= live_spot]
+        below_lvs = [lv for lv in levels if lv["price"] < live_spot]
+        if above_lvs:
+            near_hi = min(above_lvs, key=lambda l: abs(l["price"] - live_spot))
+            if near_hi not in visible_levels:
+                visible_levels.append(near_hi)
+        if below_lvs:
+            near_lo = min(below_lvs, key=lambda l: abs(l["price"] - live_spot))
+            if near_lo not in visible_levels:
+                visible_levels.append(near_lo)
 
         if not visible_levels and levels:
             nearest_lv = min(levels, key=lambda l: abs(l["price"] - live_spot))
@@ -1748,10 +1697,7 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
                 )
 
         now_utc = get_utc_now()
-        if is_btc:
-            rem_sec = max(0, (60 - now_utc.minute) * 60 - now_utc.second)
-        else:
-            rem_sec = max(0, (5 - (now_utc.minute % 5)) * 60 - now_utc.second)
+        rem_sec = max(0, (60 - now_utc.minute) * 60 - now_utc.second)
         mm, ss  = divmod(rem_sec, 60)
         live_tag_txt = f" {format_tv_comma_price(live_spot, dec)} \n {mm:02d}:{ss:02d} "
         ax.text(
@@ -1780,13 +1726,9 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
 
         top_ax = fig.add_axes([0.015, 0.915, 0.96, 0.075], facecolor="#ffffff")
         top_ax.axis("off")
-        hdr_title = (
-            f"{hdr_nam} ({mt5_sym}) · MT5-Synced HTF Major Levels (1H)"
-            if is_btc else
-            f"{hdr_nam} ({mt5_sym}) · MT5-Synced 15M Sweep + 5M MSS Map (5m)"
-        )
         top_ax.text(
-            0.0, 0.72, hdr_title,
+            0.0, 0.72,
+            f"{hdr_nam} ({mt5_sym}) · MT5-Synced HTF Major Levels (1H)",
             fontsize=9.5, fontweight="bold", color="#131722", va="center", ha="left"
         )
         top_ax.text(
@@ -1801,12 +1743,12 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
             bbox=dict(boxstyle="round,pad=0.24", facecolor=bias_bg, edgecolor="#cbd5e1", linewidth=0.7)
         )
 
-        footer_txt = (
-            "Telegram Bot · MT5-Synced · BTC 1H HTF Major Levels (650+ Pts)"
-            if is_btc else
-            "Telegram Bot · MT5-Synced · Strategy 1 Only · London + NY · Low-Spread"
+        gap_label = "650+ Pts" if is_btc else "$10+ Pts"
+        fig.text(
+            0.015, 0.018,
+            f"Telegram Bot · MT5-Synced · {mt5_sym} 1H HTF Major Levels ({gap_label})",
+            fontsize=9.0, fontweight="bold", color="#131722"
         )
-        fig.text(0.015, 0.018, footer_txt, fontsize=9.0, fontweight="bold", color="#131722")
 
         buf = io.BytesIO()
         plt.savefig(buf, format="png", dpi=100, facecolor="#ffffff")
@@ -1879,23 +1821,15 @@ def send_instant_preview_chart(pair_key=None):
 
     no_trade_note = "⚠️ <b>1H is RANGING/CHOPPY — Stand Aside!</b>\n" if roadmap["h1_bias"] == "RANGING" else ""
 
-    if is_btc:
-        levels_block = (
-            f"📌 <b>Major HTF Levels (1H / 4H / Weekly):</b>\n"
-            f"• <b>PDH / PDL:</b> <code>{format_price(roadmap['pdh'], dec)}</code> / <code>{format_price(roadmap['pdl'], dec)}</code>\n"
-            f"• <b>4H Swing H / L:</b> <code>{format_price(roadmap['htf_4h_high'], dec)}</code> / <code>{format_price(roadmap['htf_4h_low'], dec)}</code>\n"
-            f"• <b>Weekly H / L:</b> <code>{format_price(roadmap['wk_high'], dec)}</code> / <code>{format_price(roadmap['wk_low'], dec)}</code>\n\n"
-        )
-    else:
-        levels_block = (
-            f"📌 <b>Nearby Pair Levels:</b>\n"
-            f"• <b>PDH / PDL:</b> <code>{format_price(roadmap['pdh'], dec)}</code> / <code>{format_price(roadmap['pdl'], dec)}</code>\n"
-            f"• <b>London H / L:</b> <code>{format_price(roadmap['london_high'], dec)}</code> / <code>{format_price(roadmap['london_low'], dec)}</code>\n"
-            f"• <b>Asian H / L:</b> <code>{format_price(roadmap['asian_high'], dec)}</code> / <code>{format_price(roadmap['asian_low'], dec)}</code>\n\n"
-        )
+    levels_block = (
+        f"📌 <b>Major HTF Levels (1H / 4H / Weekly):</b>\n"
+        f"• <b>PDH / PDL:</b> <code>{format_price(roadmap['pdh'], dec)}</code> / <code>{format_price(roadmap['pdl'], dec)}</code>\n"
+        f"• <b>4H Swing H / L:</b> <code>{format_price(roadmap['htf_4h_high'], dec)}</code> / <code>{format_price(roadmap['htf_4h_low'], dec)}</code>\n"
+        f"• <b>Weekly H / L:</b> <code>{format_price(roadmap['wk_high'], dec)}</code> / <code>{format_price(roadmap['wk_low'], dec)}</code>\n\n"
+    )
 
     caption = (
-        f"📊 <b>{info['mt5_name']} • LIVE MARKET CHART ({'1H HTF' if is_btc else '5M'})</b>\n"
+        f"📊 <b>{info['mt5_name']} • LIVE MARKET CHART (1H HTF)</b>\n"
         f"🕒 <b>Session:</b> {sess_status_txt}\n"
         f"🕒 <b>Sessions:</b> {sessions_str}\n"
         f"💧 <b>Spread Window:</b> {spread_status_txt}\n"
@@ -2321,7 +2255,7 @@ if __name__ == "__main__":
         f"• <b>Active Strategy:</b> 1H Bias + 15M Sweep + 5M MSS + Pair Radar\n"
         f"• <b>Sessions:</b> London + New York Active (BTC/USD 24/7)\n"
         f"• <b>Spread Filter:</b> Active (Low-Spread Hours Only)\n"
-        f"• <b>Chart Sync:</b> MT5-Broker Live Sync (BTC 1H HTF Levels · 650+ Pts)\n"
+        f"• <b>Chart Sync:</b> MT5-Broker Live Sync (XAU + BTC 1H HTF Major Levels)\n"
         f"• <b>Commands:</b> <code>/gold</code>, <code>/btc</code>, <code>/backtest</code>, <code>/status</code>, <code>/reset</code>"
     )
 
