@@ -72,9 +72,10 @@ BREAKEVEN_LOCK_R             = 1.00      # Lock SL to Entry at 1:1 (+1R) to prot
 PRE_ALERT_EXPIRY_MINUTES     = 25
 MAX_TRADE_HOLD_MINUTES       = 90
 
-STRICT_SESSION_ONLY          = True      # London + New York active windows
-LOW_SPREAD_FILTER_ENABLED    = True      # Trade only during low-spread liquidity hours
-JOURNAL_CSV_PATH             = "trading_journal.csv"
+STRICT_SESSION_ONLY              = True  # London + New York active windows
+LOW_SPREAD_FILTER_ENABLED        = True  # Trade only during low-spread liquidity hours
+ORDERFLOW_HEATMAP_FILTER_ENABLED = True  # Confirmation filter: Orderflow Delta + Liquidity Heatmap Walls
+JOURNAL_CSV_PATH                 = "trading_journal.csv"
 
 WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 WEEKDAY_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -99,6 +100,8 @@ FOREX_PAIRS = {
         "max_sl_dist": 12.15,
         "min_lot": 0.01,
         "max_lot_cap": 0.05,
+        "heatmap_bin_size": 1.50,
+        "heatmap_min_wall_gap": 6.0,
         "is_crypto": False
     },
     "BTC/USD": {
@@ -120,6 +123,8 @@ FOREX_PAIRS = {
         "max_sl_dist": 1200.0,
         "min_lot": 0.01,
         "max_lot_cap": 0.05,
+        "heatmap_bin_size": 50.0,
+        "heatmap_min_wall_gap": 280.0,
         "is_crypto": True
     }
 }
@@ -135,6 +140,7 @@ pre_alert_cooldown      = {name: datetime.min.replace(tzinfo=timezone.utc) for n
 live_bars_memory        = {name: {} for name in FOREX_PAIRS}
 mt5_candle_memory       = {name: {"5m": {}, "15m": {}, "1h": {}} for name in FOREX_PAIRS}
 ohlc_history_cache      = {}
+orderflow_heatmap_cache = {}
 
 cached_news_events      = []
 last_news_fetch_time    = 0
@@ -444,8 +450,8 @@ def append_to_trading_journal(trade_record, result_r_val, net_pnl_usd, result_la
         "Market": trade_record["mt5_name"],
         "Direction": trade_record.get("direction", "BUY"),
         "1H bias": trade_record.get("h1_bias", "N/A"),
-        "Level / sweep": trade_record.get("swept_level_name", "Key Level Sweep"),
-        "5M confirmation": trade_record.get("mss_confirmation", "5M MSS + Close"),
+        "Level / sweep": trade_record.get("swept_level_name", "SMC/ICT Setup"),
+        "5M confirmation": trade_record.get("mss_confirmation", "5M FVG / OTE"),
         "Entry / SL / TP": f"E:{trade_record['entry']} | SL:{trade_record['sl']} | TP:{trade_record['target']}",
         "Lot": trade_record.get("lot_size", 0.01),
         "Risk $": f"${trade_record['max_risk']:.2f}",
@@ -473,7 +479,7 @@ def append_to_trading_journal(trade_record, result_r_val, net_pnl_usd, result_la
     threading.Thread(target=_write_csv, daemon=True).start()
 
 # =====================================================================
-# 5. HIGH-SPEED PARALLEL DATA (MT5-EXACT SYNC) & TELEGRAM PHOTO ENGINE
+# 5. HIGH-SPEED PARALLEL DATA (MT5-EXACT SYNC) & ORDERFLOW / HEATMAP ENGINE
 # =====================================================================
 def send_telegram_chat_action(action="upload_photo", target_chat_id=CHAT_ID):
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
@@ -604,6 +610,209 @@ def fetch_binance_vision_ohlc(binance_symbol, interval_str="5m", limit=220):
             pass
     return None
 
+def fetch_live_orderbook_heatmap(binance_symbol, live_spot, bin_size, min_wall_gap, decimals):
+    """Clusters live orderbook limit orders into Ask/Bid Liquidity Heatmap Walls aligned to MT5 live_spot."""
+    if not binance_symbol or live_spot is None or live_spot <= 0:
+        return {"ask_walls": [], "bid_walls": [], "book_imbalance_pct": 0.0, "ok": False}
+
+    for base_url in ["https://data-api.binance.vision/api/v3/depth", "https://api.binance.com/api/v3/depth"]:
+        try:
+            res = HTTP_SESSION.get(base_url, params={"symbol": binance_symbol, "limit": 500}, timeout=2.5)
+            if res.status_code != 200:
+                continue
+            data = res.json()
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+            if not bids or not asks:
+                continue
+
+            best_bid = float(bids[0][0])
+            best_ask = float(asks[0][0])
+            mid_book = (best_bid + best_ask) / 2.0
+            book_shift = live_spot - mid_book
+            if abs(book_shift) > (live_spot * 0.05):
+                book_shift = 0.0
+
+            ask_bins, bid_bins = {}, {}
+            total_ask_usd, total_bid_usd = 0.0, 0.0
+
+            for p_str, q_str in asks:
+                p = float(p_str) + book_shift
+                q = float(q_str)
+                notional = p * q
+                total_ask_usd += notional
+                b_key = round(round(p / bin_size) * bin_size, decimals)
+                ask_bins[b_key] = ask_bins.get(b_key, 0.0) + notional
+
+            for p_str, q_str in bids:
+                p = float(p_str) + book_shift
+                q = float(q_str)
+                notional = p * q
+                total_bid_usd += notional
+                b_key = round(round(p / bin_size) * bin_size, decimals)
+                bid_bins[b_key] = bid_bins.get(b_key, 0.0) + notional
+
+            def _select_top_walls(bins_dict, is_ask=True):
+                if not bins_dict:
+                    return []
+                max_notional = max(bins_dict.values())
+                if max_notional <= 0:
+                    return []
+                sorted_bins = sorted(bins_dict.items(), key=lambda kv: kv[1], reverse=True)
+                chosen = []
+                for price_lvl, usd_val in sorted_bins:
+                    if is_ask and price_lvl <= live_spot:
+                        continue
+                    if (not is_ask) and price_lvl >= live_spot:
+                        continue
+                    if any(abs(price_lvl - w["price"]) < min_wall_gap for w in chosen):
+                        continue
+                    strength = round(min(1.0, usd_val / max_notional), 2)
+                    if strength < 0.35 and len(chosen) >= 1:
+                        continue
+                    chosen.append({
+                        "price": round(price_lvl, decimals),
+                        "usd_val": round(usd_val, 0),
+                        "strength": strength,
+                        "side": "ASK" if is_ask else "BID"
+                    })
+                    if len(chosen) >= 3:
+                        break
+                return chosen
+
+            ask_walls = _select_top_walls(ask_bins, is_ask=True)
+            bid_walls = _select_top_walls(bid_bins, is_ask=False)
+            denom = max(total_bid_usd + total_ask_usd, 1e-9)
+            imb_pct = round(((total_bid_usd - total_ask_usd) / denom) * 100.0, 1)
+
+            return {
+                "ask_walls": ask_walls,
+                "bid_walls": bid_walls,
+                "book_imbalance_pct": imb_pct,
+                "ok": True
+            }
+        except Exception:
+            continue
+
+    return {"ask_walls": [], "bid_walls": [], "book_imbalance_pct": 0.0, "ok": False}
+
+def fetch_live_orderflow_delta(binance_symbol):
+    """Fetches real executed Taker Buy vs. Taker Sell Volume (Delta, CVD, & Absorption) on 5m candles."""
+    if not binance_symbol:
+        return {
+            "delta_pct": 0.0, "cvd_5_pct": 0.0, "vol_ratio": 1.0,
+            "bullish_absorption": False, "bearish_absorption": False,
+            "flow_label": "Neutral", "ok": False
+        }
+
+    for base_url in ["https://data-api.binance.vision/api/v3/klines", "https://api.binance.com/api/v3/klines"]:
+        try:
+            r = HTTP_SESSION.get(base_url, params={"symbol": binance_symbol, "interval": "5m", "limit": 24}, timeout=2.5).json()
+            if not isinstance(r, list) or len(r) < 12:
+                continue
+
+            rows = []
+            for item in r:
+                o = float(item[1])
+                h = float(item[2])
+                l = float(item[3])
+                c = float(item[4])
+                v = float(item[5])
+                tb = float(item[9])
+                ts = max(0.0, v - tb)
+                rng = max(h - l, 1e-9)
+                rows.append({
+                    "o": o, "h": h, "l": l, "c": c, "v": v,
+                    "buy": tb, "sell": ts, "delta": tb - ts,
+                    "close_pos": (c - l) / rng,
+                    "upper_wick_r": (h - max(o, c)) / rng,
+                    "lower_wick_r": (min(o, c) - l) / rng
+                })
+
+            closed = rows[:-1]
+            c0 = closed[-1]
+            avg_vol = sum(x["v"] for x in closed[-16:-1]) / max(len(closed[-16:-1]), 1)
+            vol_ratio = round(c0["v"] / max(avg_vol, 1e-9), 2)
+            delta_pct = round((c0["delta"] / max(c0["v"], 1e-9)) * 100.0, 1)
+
+            last5 = closed[-5:]
+            tot_v5 = sum(x["v"] for x in last5)
+            tot_d5 = sum(x["delta"] for x in last5)
+            cvd_5_pct = round((tot_d5 / max(tot_v5, 1e-9)) * 100.0, 1)
+
+            bull_abs, bear_abs = False, False
+            for bar in closed[-2:]:
+                b_vr = bar["v"] / max(avg_vol, 1e-9)
+                if b_vr >= 1.25 and bar["lower_wick_r"] >= 0.35 and bar["close_pos"] >= 0.55:
+                    bull_abs = True
+                if b_vr >= 1.25 and bar["upper_wick_r"] >= 0.35 and bar["close_pos"] <= 0.45:
+                    bear_abs = True
+
+            if bull_abs:
+                flow_label = f"🟢 Bullish Absorption ({delta_pct:+.1f}%)"
+            elif bear_abs:
+                flow_label = f"🔴 Bearish Absorption ({delta_pct:+.1f}%)"
+            elif delta_pct >= 8.0:
+                flow_label = f"🟢 Buyers Control ({delta_pct:+.1f}%)"
+            elif delta_pct <= -8.0:
+                flow_label = f"🔴 Sellers Control ({delta_pct:+.1f}%)"
+            else:
+                flow_label = f"⚪ Balanced Flow ({delta_pct:+.1f}%)"
+
+            return {
+                "delta_pct": delta_pct,
+                "cvd_5_pct": cvd_5_pct,
+                "vol_ratio": vol_ratio,
+                "bullish_absorption": bull_abs,
+                "bearish_absorption": bear_abs,
+                "flow_label": flow_label,
+                "ok": True
+            }
+        except Exception:
+            continue
+
+    return {
+        "delta_pct": 0.0, "cvd_5_pct": 0.0, "vol_ratio": 1.0,
+        "bullish_absorption": False, "bearish_absorption": False,
+        "flow_label": "⚪ Feed N/A", "ok": False
+    }
+
+def get_orderflow_and_heatmap_snapshot(pair_name, info, live_spot):
+    """Cached (15s) parallel fetch of Orderbook Liquidity Heatmap + 5M Orderflow Delta."""
+    now_ts = time.time()
+    cached = orderflow_heatmap_cache.get(pair_name)
+    if cached and (now_ts - cached["ts"]) <= 15.0:
+        return cached["data"]
+
+    sym = info.get("binance_symbol")
+    dec = info["decimals"]
+    bin_sz = info.get("heatmap_bin_size", 50.0 if info.get("is_crypto", False) else 1.50)
+    min_gap = info.get("heatmap_min_wall_gap", 280.0 if info.get("is_crypto", False) else 6.0)
+
+    f_book = DATA_EXECUTOR.submit(fetch_live_orderbook_heatmap, sym, live_spot, bin_sz, min_gap, dec)
+    f_flow = DATA_EXECUTOR.submit(fetch_live_orderflow_delta, sym)
+
+    book_res = f_book.result()
+    flow_res = f_flow.result()
+
+    snap = {
+        "available": bool(book_res["ok"] or flow_res["ok"]),
+        "book_ok": book_res["ok"],
+        "flow_ok": flow_res["ok"],
+        "ask_walls": book_res["ask_walls"],
+        "bid_walls": book_res["bid_walls"],
+        "book_imbalance_pct": book_res["book_imbalance_pct"],
+        "delta_pct": flow_res["delta_pct"],
+        "cvd_5_pct": flow_res["cvd_5_pct"],
+        "vol_ratio": flow_res["vol_ratio"],
+        "bullish_absorption": flow_res["bullish_absorption"],
+        "bearish_absorption": flow_res["bearish_absorption"],
+        "flow_label": flow_res["flow_label"],
+        "source_note": "Direct Orderbook/Delta" if info.get("is_crypto", False) else "Gold Proxy (PAXG) Orderbook/Delta"
+    }
+    orderflow_heatmap_cache[pair_name] = {"ts": now_ts, "data": snap}
+    return snap
+
 def sanitize_ohlc_dataframe(df, min_bars=40):
     if df is None or df.empty:
         return None
@@ -715,7 +924,6 @@ def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=True):
     if tv_data is not None and tv_data["spot"] > 0:
         tv_spot = tv_data["spot"]
 
-        # Continuous real-time MT5 basis alignment (eliminates broker vs proxy drift)
         raw_close_5m = float(df_5m.iloc[-1]["Close"])
         live_basis = tv_spot - raw_close_5m
         if abs(live_basis) > (tv_spot * 0.05):
@@ -728,7 +936,6 @@ def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=True):
                 df_1h[col]  = df_1h[col] + live_basis
 
         if info.get("is_crypto", False) or is_forex_market_open():
-            # Record exact MT5-broker candles into memory for 100% MT5 parity
             mem_pair = mt5_candle_memory[pair_name]
             mem_pair["5m"][pd.Timestamp(bucket_5m)]   = (tv_data["o5"],  tv_data["h5"],  tv_data["l5"],  tv_data["c5"])
             mem_pair["15m"][pd.Timestamp(bucket_15m)] = (tv_data["o15"], tv_data["h15"], tv_data["l15"], tv_data["c15"])
@@ -740,7 +947,6 @@ def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=True):
                     for ok in oldest_keys:
                         mem_pair[tf_key].pop(ok, None)
 
-            # Stamp recorded MT5-broker OHLC bars onto dataframes
             for tf_key, df_target in (("5m", df_5m), ("15m", df_15m), ("1h", df_1h)):
                 for ts_k, (mo, mh, ml, mc) in mem_pair[tf_key].items():
                     if ts_k in df_target.index:
@@ -749,7 +955,6 @@ def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=True):
                         df_target.loc[ts_k, "Low"]   = min(ml, mo, mc)
                         df_target.loc[ts_k, "Close"] = mc
 
-            # Guarantee active live candle matches MT5 broker OHLC tick-for-tick
             last_idx_5m = df_5m.index[-1]
             df_5m.loc[last_idx_5m, "Open"]  = tv_data["o5"]
             df_5m.loc[last_idx_5m, "High"]  = max(tv_data["h5"], tv_spot)
@@ -775,7 +980,7 @@ def get_roadmap_3tf_spot_data(pair_name, info, use_fast_cache=True):
     return df_1h, df_15m, df_5m, live_spot_price
 
 # =====================================================================
-# 6. HIGHER TIMEFRAME (1H / 4H / WEEKLY) MAJOR LEVELS & 1H CONTEXT ENGINE
+# 6. HIGHER TIMEFRAME (1H / 4H / WEEKLY) MAJOR LEVELS & BIAS ENGINE
 # =====================================================================
 def enrich_price_action_metrics(df):
     df = df.copy()
@@ -853,7 +1058,7 @@ def extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, decimal
     span_8_1h   = float(recent_8_1h["High"].max() - recent_8_1h["Low"].min())
     ema_gap     = abs(h1_ema20 - h1_ema50)
 
-    if span_8_1h < (atr_1h * 1.40) and ema_gap < (atr_1h * 0.12):
+    if span_8_1h < (atr_1h * 1.35) and ema_gap < (atr_1h * 0.12):
         h1_bias = "RANGING"
     else:
         hh_hl = (len(swing_highs_1h) >= 2 and len(swing_lows_1h) >= 2 and swing_highs_1h[-1] > swing_highs_1h[-2] - atr_1h * 0.15 and swing_lows_1h[-1] >= swing_lows_1h[-2] - atr_1h * 0.10)
@@ -863,10 +1068,23 @@ def extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, decimal
             h1_bias = "BULLISH"
         elif (h1_close < h1_ema20 and h1_ema20 <= h1_ema50) or (lh_ll and h1_close <= h1_ema50):
             h1_bias = "BEARISH"
-        elif abs(h1_close - h1_ema20) <= (atr_1h * 0.16) and ema_gap <= (atr_1h * 0.16):
+        elif abs(h1_close - h1_ema20) <= (atr_1h * 0.15) and ema_gap <= (atr_1h * 0.15):
             h1_bias = "RANGING"
         else:
             h1_bias = "BULLISH" if h1_close >= h1_ema20 else "BEARISH"
+
+    # 15M Bias for intraday alignment & ranging-day ICT 2022 confluence
+    closed_15m = df_15m.iloc[:-1] if len(df_15m) > 25 else df_15m
+    m15_last   = closed_15m.iloc[-1]
+    m15_close  = float(m15_last["Close"])
+    m15_ema20  = float(m15_last["EMA20"])
+    m15_ema50  = float(m15_last["EMA50"])
+    if m15_close > m15_ema20 and m15_ema20 >= m15_ema50:
+        m15_bias = "BULLISH"
+    elif m15_close < m15_ema20 and m15_ema20 <= m15_ema50:
+        m15_bias = "BEARISH"
+    else:
+        m15_bias = "BULLISH" if m15_close >= m15_ema20 else "BEARISH"
 
     # Higher Timeframe (1H / 4H / Daily / Weekly) Major Levels for BOTH XAUUSD & BTCUSD
     df_1h_utc = closed_1h.copy()
@@ -899,7 +1117,6 @@ def extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, decimal
     htf_4h_high = sw_4h_highs[-1] if sw_4h_highs else pdh_price
     htf_4h_low  = sw_4h_lows[-1]  if sw_4h_lows  else pdl_price
 
-    # Wider 1H major fractal swings (3 bars each side)
     major_1h_highs, major_1h_lows = [], []
     for i in range(3, n_1h - 3):
         if highs_1h[i] >= max(highs_1h[i - 3:i]) and highs_1h[i] >= max(highs_1h[i + 1:i + 4]):
@@ -924,7 +1141,6 @@ def extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, decimal
     if major_1h_lows:
         raw_htf_levels.append({"name": "1H Major Swing Low",  "short": "1H SL", "price": major_1h_lows[-1],  "type": "LOW_POOL",  "color": "#1e293b"})
 
-    # Enforce wide minimum spacing so micro-range levels are eliminated (BTC: 650+ Pts, Gold: $10+ Pts)
     min_level_gap = max(atr_1h * 1.5, 650.0) if is_crypto else max(atr_1h * 1.5, 10.0)
     merged_levels = []
     for lv in raw_htf_levels:
@@ -946,6 +1162,7 @@ def extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, decimal
 
     return {
         "h1_bias": h1_bias,
+        "m15_bias": m15_bias,
         "atr_1h": atr_1h,
         "pdh": pdh_price,
         "pdl": pdl_price,
@@ -961,10 +1178,12 @@ def extract_roadmap_session_levels_and_1h_bias(df_1h, df_15m, live_spot, decimal
     }
 
 # =====================================================================
-# 7. STRATEGY 1 ENGINE: 1H BIAS + 15M KEY LEVEL SWEEP + 5M MSS + PAIR RADAR
+# 7. SMC + ICT DUAL STRATEGY ENGINE
+#    MODEL A: ICT 2022 (15M Internal/HTF Sweep + 5M MSS + FVG Entry)
+#    MODEL B: SMC BOS + OTE (50%-79% Fib) + Order Block / FVG Pullback
 # =====================================================================
 def check_sweep_proximity_radar(pair_name, info, roadmap, live_spot, atr_5m):
-    """Alerts when live price approaches any aligned key liquidity area around the pair."""
+    """Alerts when live price approaches any aligned HTF key liquidity area."""
     if roadmap["h1_bias"] == "RANGING" or atr_5m <= 0:
         return
     sess_ok, _, _, _ = get_active_sessions_info(info.get("is_crypto", False))
@@ -974,7 +1193,7 @@ def check_sweep_proximity_radar(pair_name, info, roadmap, live_spot, atr_5m):
     if pending_pre_alerts.get(pair_name) is not None:
         return
 
-    prox_band = atr_5m * 0.45
+    prox_band = atr_5m * 0.55
     for lv in roadmap["levels"]:
         aligned = (roadmap["h1_bias"] == "BULLISH" and lv["type"] == "LOW_POOL") or \
                   (roadmap["h1_bias"] == "BEARISH" and lv["type"] == "HIGH_POOL")
@@ -986,13 +1205,674 @@ def check_sweep_proximity_radar(pair_name, info, roadmap, live_spot, atr_5m):
                 last_radar_key[pair_name] = radar_key
                 dec = info["decimals"]
                 send_telegram_message(
-                    f"📡 <b>PAIR LEVEL RADAR — {info['mt5_name']} NEAR KEY AREA</b>\n"
+                    f"📡 <b>LIQUIDITY RADAR — {info['mt5_name']} NEAR KEY POOL</b>\n"
                     f"🧭 <b>1H Bias:</b> <b>{roadmap['h1_bias']}</b> | 🧲 <b>Level:</b> <b>{lv['short']} (<code>{format_price(lv['price'], dec)}</code>)</b>\n"
-                    f"📍 <b>Live Price:</b> <code>{format_price(live_spot, dec)}</code> — Watching 15M sweep + 5M MSS."
+                    f"📍 <b>Live Price:</b> <code>{format_price(live_spot, dec)}</code> — Watching ICT 2022 Sweep + 5M FVG."
                 )
             break
 
-def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot, ignore_locks=False, return_skip_reason=False):
+def validate_orderflow_and_heatmap_confirmation(direction, entry_spot, sl_dist, of_heat, decimals):
+    """
+    Balanced SMC/ICT confirmation filter using 5M Orderflow Delta/Absorption and Heatmap Walls.
+    Blocks heavy opposing wall roadblocks or extreme flow conflicts without choking healthy FVG/OTE pullbacks.
+    """
+    if not ORDERFLOW_HEATMAP_FILTER_ENABLED or of_heat is None or not of_heat.get("available", False):
+        return True, 0, "4️⃣ <b>Orderflow & Heatmap:</b> Standby (SMC/ICT structure verified).", "OK"
+
+    delta_pct = float(of_heat.get("delta_pct", 0.0))
+    cvd_5_pct = float(of_heat.get("cvd_5_pct", 0.0))
+    book_imb  = float(of_heat.get("book_imbalance_pct", 0.0))
+    ask_walls = of_heat.get("ask_walls", [])
+    bid_walls = of_heat.get("bid_walls", [])
+    flow_ok   = of_heat.get("flow_ok", False)
+    book_ok   = of_heat.get("book_ok", False)
+
+    bonus = 0
+    if direction == "BUY":
+        if flow_ok:
+            heavy_bear_conflict = (delta_pct <= -12.0) and (cvd_5_pct <= -8.0) and (not of_heat.get("bullish_absorption", False))
+            if heavy_bear_conflict:
+                return False, 0, "", "ORDERFLOW_HEAVY_SELL_CONFLICT"
+            if delta_pct >= 5.0 or of_heat.get("bullish_absorption", False):
+                bonus += 4
+
+        if book_ok and ask_walls:
+            for aw in ask_walls:
+                if aw["strength"] >= 0.80 and entry_spot < aw["price"] <= (entry_spot + sl_dist * 0.40):
+                    return False, 0, "", "HEATMAP_ASK_WALL_BLOCK"
+            if book_imb >= 5.0:
+                bonus += 2
+
+        nearest_bid = f"Bid Wall <code>{format_price(bid_walls[0]['price'], decimals)}</code>" if bid_walls else "Book Clear"
+        nearest_ask = f"Ask Pool <code>{format_price(ask_walls[0]['price'], decimals)}</code>" if ask_walls else "Open Upside"
+        line = (
+            f"4️⃣ <b>Orderflow & Heatmap:</b> <b>{of_heat['flow_label']}</b> (5-bar CVD: {cvd_5_pct:+.1f}%) | "
+            f"🔥 {nearest_bid} · Target {nearest_ask}."
+        )
+        return True, bonus, line, "OK"
+
+    else:
+        if flow_ok:
+            heavy_bull_conflict = (delta_pct >= 12.0) and (cvd_5_pct >= 8.0) and (not of_heat.get("bearish_absorption", False))
+            if heavy_bull_conflict:
+                return False, 0, "", "ORDERFLOW_HEAVY_BUY_CONFLICT"
+            if delta_pct <= -5.0 or of_heat.get("bearish_absorption", False):
+                bonus += 4
+
+        if book_ok and bid_walls:
+            for bw in bid_walls:
+                if bw["strength"] >= 0.80 and (entry_spot - sl_dist * 0.40) <= bw["price"] < entry_spot:
+                    return False, 0, "", "HEATMAP_BID_WALL_BLOCK"
+            if book_imb <= -5.0:
+                bonus += 2
+
+        nearest_ask = f"Ask Wall <code>{format_price(ask_walls[0]['price'], decimals)}</code>" if ask_walls else "Book Clear"
+        nearest_bid = f"Bid Pool <code>{format_price(bid_walls[0]['price'], decimals)}</code>" if bid_walls else "Open Downside"
+        line = (
+            f"4️⃣ <b>Orderflow & Heatmap:</b> <b>{of_heat['flow_label']}</b> (5-bar CVD: {cvd_5_pct:+.1f}%) | "
+            f"🔥 {nearest_ask} · Target {nearest_bid}."
+        )
+        return True, bonus, line, "OK"
+
+def extract_intraday_15m_liquidity_pools(df_15m, roadmap, decimals):
+    """Combines HTF levels + fresh 15M internal swing highs/lows & Asian H/L for ICT 2022 sweeps."""
+    pools = []
+    for lv in roadmap["levels"]:
+        pools.append({
+            "name": lv["name"],
+            "short": lv["short"],
+            "price": lv["price"],
+            "type": lv["type"],
+            "priority": 2
+        })
+
+    pools.append({"name": "Asian High", "short": "ASIA H", "price": roadmap["asian_high"], "type": "HIGH_POOL", "priority": 2})
+    pools.append({"name": "Asian Low",  "short": "ASIA L", "price": roadmap["asian_low"],  "type": "LOW_POOL",  "priority": 2})
+
+    closed_15m = df_15m.iloc[-30:-2] if len(df_15m) >= 34 else df_15m.iloc[:-2]
+    if len(closed_15m) >= 7:
+        h15 = closed_15m["High"].values.astype(float)
+        l15 = closed_15m["Low"].values.astype(float)
+        n15 = len(closed_15m)
+        sh_15, sl_15 = [], []
+        for i in range(2, n15 - 2):
+            if h15[i] >= max(h15[i - 2:i]) and h15[i] >= max(h15[i + 1:i + 3]):
+                sh_15.append(round(float(h15[i]), decimals))
+            if l15[i] <= min(l15[i - 2:i]) and l15[i] <= min(l15[i + 1:i + 3]):
+                sl_15.append(round(float(l15[i]), decimals))
+
+        for p in sh_15[-2:]:
+            pools.append({"name": "15M Internal Swing High", "short": "15M SH", "price": p, "type": "HIGH_POOL", "priority": 1})
+        for p in sl_15[-2:]:
+            pools.append({"name": "15M Internal Swing Low",  "short": "15M SL", "price": p, "type": "LOW_POOL",  "priority": 1})
+
+    return pools
+
+def find_recent_5m_fvg(closed_5m, direction, atr_5m, decimals, start_idx=0):
+    """Finds the freshest valid 5M Fair Value Gap (FVG) formed from start_idx onward."""
+    n = len(closed_5m)
+    if n < 5:
+        return None
+    min_gap = atr_5m * 0.14
+    best_fvg = None
+
+    for i in range(max(2, start_idx), n):
+        c_prev2 = closed_5m.iloc[i - 2]
+        c_mid   = closed_5m.iloc[i - 1]
+        c_curr  = closed_5m.iloc[i]
+
+        if direction == "BUY":
+            gap = float(c_curr["Low"]) - float(c_prev2["High"])
+            if gap >= min_gap and float(c_mid["Close"]) > float(c_mid["Open"]) and float(c_mid["Body_Ratio"]) >= 0.45:
+                best_fvg = {
+                    "idx": i,
+                    "top": round(float(c_curr["Low"]), decimals),
+                    "bot": round(float(c_prev2["High"]), decimals),
+                    "mid": round((float(c_curr["Low"]) + float(c_prev2["High"])) / 2.0, decimals)
+                }
+        else:
+            gap = float(c_prev2["Low"]) - float(c_curr["High"])
+            if gap >= min_gap and float(c_mid["Close"]) < float(c_mid["Open"]) and float(c_mid["Body_Ratio"]) >= 0.45:
+                best_fvg = {
+                    "idx": i,
+                    "top": round(float(c_prev2["Low"]), decimals),
+                    "bot": round(float(c_curr["High"]), decimals),
+                    "mid": round((float(c_prev2["Low"]) + float(c_curr["High"])) / 2.0, decimals)
+                }
+    return best_fvg
+
+def evaluate_ict_2022_model(pair_name, info, df_15m, df_5m, roadmap, live_spot, of_heat, ignore_locks=False):
+    """
+    MODEL A — ICT 2022 Model:
+    1) 15M Internal/HTF Liquidity Sweep
+    2) 5M Displacement + Market Structure Shift (MSS)
+    3) 5M Fair Value Gap (FVG) Pullback Entry (Instant on rejection OR Pullback Pre-Alert)
+    """
+    dec = info["decimals"]
+    closed_5m = df_5m.iloc[-28:-1] if len(df_5m) >= 30 else df_5m.iloc[:-1]
+    if len(closed_5m) < 15:
+        return [], False, None
+
+    c0     = closed_5m.iloc[-1]
+    atr_5m = float(c0["ATR"])
+    if np.isnan(atr_5m) or atr_5m <= 0:
+        return [], False, None
+
+    h1_bias  = roadmap["h1_bias"]
+    m15_bias = roadmap["m15_bias"]
+    if h1_bias == "BULLISH":
+        allowed_dirs = ["BUY"]
+        bias_label = h1_bias
+    elif h1_bias == "BEARISH":
+        allowed_dirs = ["SELL"]
+        bias_label = h1_bias
+    else:
+        allowed_dirs = ["BUY"] if m15_bias == "BULLISH" else ["SELL"]
+        bias_label = f"15M {m15_bias} (1H Range)"
+
+    pools = extract_intraday_15m_liquidity_pools(df_15m, roadmap, dec)
+    recent_10 = closed_5m.iloc[-10:]
+    n_c = len(closed_5m)
+
+    candidates = []
+    skipped_for_risk = False
+    last_of_reject = None
+
+    for lv in pools:
+        lvl_price = lv["price"]
+        lvl_name  = lv["name"]
+        lvl_short = lv["short"]
+        lvl_type  = lv["type"]
+
+        # ---------- BULLISH ICT 2022 ----------
+        if "BUY" in allowed_dirs and lvl_type == "LOW_POOL":
+            lows_r = recent_10["Low"].values.astype(float)
+            min_low_val = float(np.min(lows_r))
+            sweep_rel_idx = int(np.argmin(lows_r))
+            sweep_abs_idx = (n_c - len(recent_10)) + sweep_rel_idx
+
+            swept = (min_low_val <= lvl_price + atr_5m * 0.15) and (min_low_val >= lvl_price - atr_5m * 2.50) and (float(c0["Close"]) > lvl_price - atr_5m * 0.10)
+            if not swept or sweep_abs_idx >= (n_c - 1):
+                continue
+
+            pre_sweep_slice = closed_5m.iloc[max(0, sweep_abs_idx - 5):sweep_abs_idx + 1]
+            mss_level = float(pre_sweep_slice["High"].max())
+            post_sweep = closed_5m.iloc[sweep_abs_idx + 1:]
+
+            if not (post_sweep["Close"] > mss_level).any():
+                continue
+
+            fvg = find_recent_5m_fvg(closed_5m, "BUY", atr_5m, dec, start_idx=max(2, sweep_abs_idx + 1))
+            if fvg is None:
+                continue
+
+            if float(post_sweep["Low"].min()) < min_low_val - atr_5m * 0.05:
+                continue
+
+            c0_o, c0_h, c0_l, c0_c = float(c0["Open"]), float(c0["High"]), float(c0["Low"]), float(c0["Close"])
+            c0_br, c0_cp = float(c0["Body_Ratio"]), float(c0["Close_Pos"])
+
+            fvg_tapped_and_rejected = (
+                (fvg["idx"] < (n_c - 1)) and
+                (c0_l <= fvg["top"] + atr_5m * 0.10) and
+                (c0_c >= fvg["bot"]) and
+                (c0_c > c0_o) and
+                (c0_br >= 0.35 or c0_cp >= 0.58) and
+                (live_spot >= fvg["bot"])
+            )
+            fresh_fvg_pullback_wait = (
+                (not fvg_tapped_and_rejected) and
+                (fvg["idx"] >= (n_c - 3)) and
+                (live_spot > fvg["top"]) and
+                ((live_spot - fvg["top"]) <= atr_5m * 1.45)
+            )
+
+            if not (fvg_tapped_and_rejected or fresh_fvg_pullback_wait):
+                continue
+
+            if fvg_tapped_and_rejected:
+                entry_spot   = round(c0_c, dec)
+                stage_type   = "CONFIRMED_BREAKOUT"
+                trigger_mode = "BREAKOUT"
+                mss_desc     = f"5M MSS + FVG Tap Rejection ({format_price(fvg['bot'], dec)}–{format_price(fvg['top'], dec)})"
+            else:
+                entry_spot   = round(fvg["top"], dec)
+                stage_type   = "PRE_ALERT"
+                trigger_mode = "PULLBACK"
+                mss_desc     = f"5M MSS + Fresh FVG Pullback Wait ({format_price(fvg['bot'], dec)}–{format_price(fvg['top'], dec)})"
+
+            invalidation_sl = round(min(min_low_val, fvg["bot"]) - (atr_5m * 0.25), dec)
+            sl_dist         = round(abs(entry_spot - invalidation_sl), dec)
+            if sl_dist < info["min_sl_dist"]:
+                sl_dist = info["min_sl_dist"]
+                invalidation_sl = round(entry_spot - sl_dist, dec)
+
+            lot_size, planned_risk_usd, cost_usd = calculate_roadmap_position_size(pair_name, info, sl_dist, RISK_PER_TRADE_USD)
+            if lot_size is None or sl_dist > info["max_sl_dist"]:
+                skipped_for_risk = True
+                continue
+
+            of_ok, of_bonus, of_line, of_reason = validate_orderflow_and_heatmap_confirmation("BUY", entry_spot, sl_dist, of_heat, dec)
+            if (not ignore_locks) and (not of_ok):
+                last_of_reject = of_reason
+                continue
+
+            tp1_price = round(entry_spot + (sl_dist * BREAKEVEN_LOCK_R), dec)
+            tp2_price = round(entry_spot + (sl_dist * PRIMARY_RR_TARGET), dec)
+
+            candidates.append({
+                "model_name": "ICT 2022 (Sweep + MSS + FVG)",
+                "stage": stage_type,
+                "trigger_mode": trigger_mode,
+                "direction": "BUY",
+                "action": "BUY (LONG) 🟢",
+                "h1_bias": bias_label,
+                "swept_level_name": f"{lvl_short} ({format_price(lvl_price, dec)})",
+                "swept_level_short": lvl_short,
+                "swept_level_price": lvl_price,
+                "mss_confirmation": mss_desc,
+                "short_tag": f"ICT 2022 · {lvl_short} Sweep + 5M FVG",
+                "setup_id": f"ICT2022_BUY_{lvl_short}_{fvg['top']}",
+                "entry_spot": entry_spot,
+                "sl_price": invalidation_sl,
+                "sl_dist": sl_dist,
+                "lock_level": tp1_price,
+                "tp1_price": tp1_price,
+                "tp2_price": tp2_price,
+                "tp2_dist": round(sl_dist * PRIMARY_RR_TARGET, dec),
+                "zone_top": fvg["top"],
+                "zone_bot": fvg["bot"],
+                "zone_label": "5M Bullish FVG",
+                "lot_size": lot_size,
+                "planned_risk_usd": planned_risk_usd,
+                "cost_usd": cost_usd,
+                "rr": PRIMARY_RR_TARGET,
+                "score": (93 if fvg_tapped_and_rejected else 87) + lv["priority"] + of_bonus,
+                "why_text": (
+                    f"1️⃣ <b>Bias & Model:</b> <b>ICT 2022</b> aligned with <b>{bias_label}</b>.\n"
+                    f"2️⃣ <b>Liquidity Sweep:</b> Swept <b>{lvl_name} (<code>{format_price(lvl_price, dec)}</code>)</b>.\n"
+                    f"3️⃣ <b>5M MSS + FVG:</b> <b>{mss_desc}</b> · SL below sweep (<code>{format_price(invalidation_sl, dec)}</code>).\n"
+                    f"{of_line}"
+                )
+            })
+
+        # ---------- BEARISH ICT 2022 ----------
+        if "SELL" in allowed_dirs and lvl_type == "HIGH_POOL":
+            highs_r = recent_10["High"].values.astype(float)
+            max_high_val = float(np.max(highs_r))
+            sweep_rel_idx = int(np.argmax(highs_r))
+            sweep_abs_idx = (n_c - len(recent_10)) + sweep_rel_idx
+
+            swept = (max_high_val >= lvl_price - atr_5m * 0.15) and (max_high_val <= lvl_price + atr_5m * 2.50) and (float(c0["Close"]) < lvl_price + atr_5m * 0.10)
+            if not swept or sweep_abs_idx >= (n_c - 1):
+                continue
+
+            pre_sweep_slice = closed_5m.iloc[max(0, sweep_abs_idx - 5):sweep_abs_idx + 1]
+            mss_level = float(pre_sweep_slice["Low"].min())
+            post_sweep = closed_5m.iloc[sweep_abs_idx + 1:]
+
+            if not (post_sweep["Close"] < mss_level).any():
+                continue
+
+            fvg = find_recent_5m_fvg(closed_5m, "SELL", atr_5m, dec, start_idx=max(2, sweep_abs_idx + 1))
+            if fvg is None:
+                continue
+
+            if float(post_sweep["High"].max()) > max_high_val + atr_5m * 0.05:
+                continue
+
+            c0_o, c0_h, c0_l, c0_c = float(c0["Open"]), float(c0["High"]), float(c0["Low"]), float(c0["Close"])
+            c0_br, c0_cp = float(c0["Body_Ratio"]), float(c0["Close_Pos"])
+
+            fvg_tapped_and_rejected = (
+                (fvg["idx"] < (n_c - 1)) and
+                (c0_h >= fvg["bot"] - atr_5m * 0.10) and
+                (c0_c <= fvg["top"]) and
+                (c0_c < c0_o) and
+                (c0_br >= 0.35 or c0_cp <= 0.42) and
+                (live_spot <= fvg["top"])
+            )
+            fresh_fvg_pullback_wait = (
+                (not fvg_tapped_and_rejected) and
+                (fvg["idx"] >= (n_c - 3)) and
+                (live_spot < fvg["bot"]) and
+                ((fvg["bot"] - live_spot) <= atr_5m * 1.45)
+            )
+
+            if not (fvg_tapped_and_rejected or fresh_fvg_pullback_wait):
+                continue
+
+            if fvg_tapped_and_rejected:
+                entry_spot   = round(c0_c, dec)
+                stage_type   = "CONFIRMED_BREAKOUT"
+                trigger_mode = "BREAKOUT"
+                mss_desc     = f"5M MSS + FVG Tap Rejection ({format_price(fvg['bot'], dec)}–{format_price(fvg['top'], dec)})"
+            else:
+                entry_spot   = round(fvg["bot"], dec)
+                stage_type   = "PRE_ALERT"
+                trigger_mode = "PULLBACK"
+                mss_desc     = f"5M MSS + Fresh FVG Pullback Wait ({format_price(fvg['bot'], dec)}–{format_price(fvg['top'], dec)})"
+
+            invalidation_sl = round(max(max_high_val, fvg["top"]) + (atr_5m * 0.25), dec)
+            sl_dist         = round(abs(invalidation_sl - entry_spot), dec)
+            if sl_dist < info["min_sl_dist"]:
+                sl_dist = info["min_sl_dist"]
+                invalidation_sl = round(entry_spot + sl_dist, dec)
+
+            lot_size, planned_risk_usd, cost_usd = calculate_roadmap_position_size(pair_name, info, sl_dist, RISK_PER_TRADE_USD)
+            if lot_size is None or sl_dist > info["max_sl_dist"]:
+                skipped_for_risk = True
+                continue
+
+            of_ok, of_bonus, of_line, of_reason = validate_orderflow_and_heatmap_confirmation("SELL", entry_spot, sl_dist, of_heat, dec)
+            if (not ignore_locks) and (not of_ok):
+                last_of_reject = of_reason
+                continue
+
+            tp1_price = round(entry_spot - (sl_dist * BREAKEVEN_LOCK_R), dec)
+            tp2_price = round(entry_spot - (sl_dist * PRIMARY_RR_TARGET), dec)
+
+            candidates.append({
+                "model_name": "ICT 2022 (Sweep + MSS + FVG)",
+                "stage": stage_type,
+                "trigger_mode": trigger_mode,
+                "direction": "SELL",
+                "action": "SELL (SHORT) 🔴",
+                "h1_bias": bias_label,
+                "swept_level_name": f"{lvl_short} ({format_price(lvl_price, dec)})",
+                "swept_level_short": lvl_short,
+                "swept_level_price": lvl_price,
+                "mss_confirmation": mss_desc,
+                "short_tag": f"ICT 2022 · {lvl_short} Sweep + 5M FVG",
+                "setup_id": f"ICT2022_SELL_{lvl_short}_{fvg['bot']}",
+                "entry_spot": entry_spot,
+                "sl_price": invalidation_sl,
+                "sl_dist": sl_dist,
+                "lock_level": tp1_price,
+                "tp1_price": tp1_price,
+                "tp2_price": tp2_price,
+                "tp2_dist": round(sl_dist * PRIMARY_RR_TARGET, dec),
+                "zone_top": fvg["top"],
+                "zone_bot": fvg["bot"],
+                "zone_label": "5M Bearish FVG",
+                "lot_size": lot_size,
+                "planned_risk_usd": planned_risk_usd,
+                "cost_usd": cost_usd,
+                "rr": PRIMARY_RR_TARGET,
+                "score": (93 if fvg_tapped_and_rejected else 87) + lv["priority"] + of_bonus,
+                "why_text": (
+                    f"1️⃣ <b>Bias & Model:</b> <b>ICT 2022</b> aligned with <b>{bias_label}</b>.\n"
+                    f"2️⃣ <b>Liquidity Sweep:</b> Swept <b>{lvl_name} (<code>{format_price(lvl_price, dec)}</code>)</b>.\n"
+                    f"3️⃣ <b>5M MSS + FVG:</b> <b>{mss_desc}</b> · SL above sweep (<code>{format_price(invalidation_sl, dec)}</code>).\n"
+                    f"{of_line}"
+                )
+            })
+
+    return candidates, skipped_for_risk, last_of_reject
+
+def evaluate_smc_bos_ote_model(pair_name, info, df_5m, roadmap, live_spot, of_heat, ignore_locks=False):
+    """
+    MODEL B — SMC BOS + OTE (50%–79% Fib) + Order Block / FVG Pullback:
+    Catches clean trend-continuation trades on trending days when no sweep occurs.
+    """
+    h1_bias  = roadmap["h1_bias"]
+    m15_bias = roadmap["m15_bias"]
+    if h1_bias not in ("BULLISH", "BEARISH") or h1_bias != m15_bias:
+        return [], False, None
+
+    dec = info["decimals"]
+    closed_5m = df_5m.iloc[-26:-1] if len(df_5m) >= 28 else df_5m.iloc[:-1]
+    if len(closed_5m) < 16:
+        return [], False, None
+
+    c0     = closed_5m.iloc[-1]
+    atr_5m = float(c0["ATR"])
+    if np.isnan(atr_5m) or atr_5m <= 0:
+        return [], False, None
+
+    c0_o, c0_h, c0_l, c0_c = float(c0["Open"]), float(c0["High"]), float(c0["Low"]), float(c0["Close"])
+    c0_br, c0_cp = float(c0["Body_Ratio"]), float(c0["Close_Pos"])
+
+    candidates = []
+    skipped_for_risk = False
+    last_of_reject = None
+
+    leg_window = closed_5m.iloc[-18:-1]
+    highs_w = leg_window["High"].values.astype(float)
+    lows_w  = leg_window["Low"].values.astype(float)
+
+    if h1_bias == "BULLISH":
+        low_pos = int(np.argmin(lows_w))
+        if low_pos >= len(highs_w) - 2:
+            return [], False, None
+        high_pos = low_pos + int(np.argmax(highs_w[low_pos:]))
+        leg_low  = float(lows_w[low_pos])
+        leg_high = float(highs_w[high_pos])
+        leg_span = leg_high - leg_low
+
+        prior_slice = closed_5m.iloc[:max(3, len(closed_5m) - 18 + low_pos)]
+        if prior_slice.empty or leg_span < (atr_5m * 2.20):
+            return [], False, None
+        prior_high = float(prior_slice["High"].tail(8).max())
+        if leg_high <= prior_high:
+            return [], False, None
+
+        ote_top = round(leg_high - (leg_span * 0.50), dec)
+        ote_bot = round(leg_high - (leg_span * 0.79), dec)
+        ote_mid = round(leg_high - (leg_span * 0.62), dec)
+
+        ob_top, ob_bot = ote_top, ote_bot
+        zone_lbl = "5M OTE Discount (50–79%)"
+        for k in range(max(0, low_pos - 2), min(len(leg_window), low_pos + 2)):
+            bar_k = leg_window.iloc[k]
+            if float(bar_k["Close"]) < float(bar_k["Open"]):
+                ob_top = round(float(bar_k["High"]), dec)
+                ob_bot = round(float(bar_k["Low"]), dec)
+                zone_lbl = "5M OTE + Bullish OB"
+                break
+
+        z_top = max(ote_top, ob_top)
+        z_bot = min(ote_bot, ob_bot)
+
+        tapped_and_rejected = (
+            (c0_l <= z_top + atr_5m * 0.08) and
+            (c0_l >= leg_low - atr_5m * 0.15) and
+            (c0_c >= z_bot) and
+            (c0_c > c0_o) and
+            (c0_br >= 0.42) and
+            (c0_cp >= 0.60) and
+            (live_spot > leg_low)
+        )
+        approaching_ote = (
+            (not tapped_and_rejected) and
+            (high_pos >= len(highs_w) - 5) and
+            (live_spot > ote_top) and
+            ((live_spot - ote_top) <= atr_5m * 1.15)
+        )
+
+        if tapped_and_rejected or approaching_ote:
+            if tapped_and_rejected:
+                entry_spot   = round(c0_c, dec)
+                stage_type   = "CONFIRMED_BREAKOUT"
+                trigger_mode = "BREAKOUT"
+                conf_desc    = f"5M {zone_lbl} Bullish Rejection"
+            else:
+                entry_spot   = round(ote_mid, dec)
+                stage_type   = "PRE_ALERT"
+                trigger_mode = "PULLBACK"
+                conf_desc    = f"5M {zone_lbl} Pullback Wait (62% OTE)"
+
+            invalidation_sl = round(leg_low - (atr_5m * 0.25), dec)
+            sl_dist         = round(abs(entry_spot - invalidation_sl), dec)
+            if sl_dist < info["min_sl_dist"]:
+                sl_dist = info["min_sl_dist"]
+                invalidation_sl = round(entry_spot - sl_dist, dec)
+
+            lot_size, planned_risk_usd, cost_usd = calculate_roadmap_position_size(pair_name, info, sl_dist, RISK_PER_TRADE_USD)
+            if lot_size is None or sl_dist > info["max_sl_dist"]:
+                skipped_for_risk = True
+            else:
+                of_ok, of_bonus, of_line, of_reason = validate_orderflow_and_heatmap_confirmation("BUY", entry_spot, sl_dist, of_heat, dec)
+                if (not ignore_locks) and (not of_ok):
+                    last_of_reject = of_reason
+                else:
+                    tp1_price = round(entry_spot + (sl_dist * BREAKEVEN_LOCK_R), dec)
+                    tp2_price = round(entry_spot + (sl_dist * PRIMARY_RR_TARGET), dec)
+
+                    candidates.append({
+                        "model_name": "SMC BOS + OTE Pullback",
+                        "stage": stage_type,
+                        "trigger_mode": trigger_mode,
+                        "direction": "BUY",
+                        "action": "BUY (LONG) 🟢",
+                        "h1_bias": f"{h1_bias} (1H+15M Aligned)",
+                        "swept_level_name": f"BOS > {format_price(prior_high, dec)} · OTE {format_price(ote_mid, dec)}",
+                        "swept_level_short": "BOS+OTE",
+                        "swept_level_price": ote_mid,
+                        "mss_confirmation": conf_desc,
+                        "short_tag": f"SMC BOS + {zone_lbl}",
+                        "setup_id": f"SMC_OTE_BUY_{round(leg_low, 1)}_{round(leg_high, 1)}",
+                        "entry_spot": entry_spot,
+                        "sl_price": invalidation_sl,
+                        "sl_dist": sl_dist,
+                        "lock_level": tp1_price,
+                        "tp1_price": tp1_price,
+                        "tp2_price": tp2_price,
+                        "tp2_dist": round(sl_dist * PRIMARY_RR_TARGET, dec),
+                        "zone_top": z_top,
+                        "zone_bot": z_bot,
+                        "zone_label": zone_lbl,
+                        "lot_size": lot_size,
+                        "planned_risk_usd": planned_risk_usd,
+                        "cost_usd": cost_usd,
+                        "rr": PRIMARY_RR_TARGET,
+                        "score": (90 if tapped_and_rejected else 84) + of_bonus,
+                        "why_text": (
+                            f"1️⃣ <b>Trend & Model:</b> <b>SMC BOS + OTE</b> (1H + 15M <b>BULLISH</b>).\n"
+                            f"2️⃣ <b>Impulse BOS:</b> Broke structure above <code>{format_price(prior_high, dec)}</code> to <code>{format_price(leg_high, dec)}</code>.\n"
+                            f"3️⃣ <b>Discount Entry:</b> <b>{conf_desc}</b> · SL below swing low (<code>{format_price(invalidation_sl, dec)}</code>).\n"
+                            f"{of_line}"
+                        )
+                    })
+
+    else:
+        high_pos = int(np.argmax(highs_w))
+        if high_pos >= len(lows_w) - 2:
+            return [], False, None
+        low_pos  = high_pos + int(np.argmin(lows_w[high_pos:]))
+        leg_high = float(highs_w[high_pos])
+        leg_low  = float(lows_w[low_pos])
+        leg_span = leg_high - leg_low
+
+        prior_slice = closed_5m.iloc[:max(3, len(closed_5m) - 18 + high_pos)]
+        if prior_slice.empty or leg_span < (atr_5m * 2.20):
+            return [], False, None
+        prior_low = float(prior_slice["Low"].tail(8).min())
+        if leg_low >= prior_low:
+            return [], False, None
+
+        ote_bot = round(leg_low + (leg_span * 0.50), dec)
+        ote_top = round(leg_low + (leg_span * 0.79), dec)
+        ote_mid = round(leg_low + (leg_span * 0.62), dec)
+
+        ob_top, ob_bot = ote_top, ote_bot
+        zone_lbl = "5M OTE Premium (50–79%)"
+        for k in range(max(0, high_pos - 2), min(len(leg_window), high_pos + 2)):
+            bar_k = leg_window.iloc[k]
+            if float(bar_k["Close"]) > float(bar_k["Open"]):
+                ob_top = round(float(bar_k["High"]), dec)
+                ob_bot = round(float(bar_k["Low"]), dec)
+                zone_lbl = "5M OTE + Bearish OB"
+                break
+
+        z_top = max(ote_top, ob_top)
+        z_bot = min(ote_bot, ob_bot)
+
+        tapped_and_rejected = (
+            (c0_h >= z_bot - atr_5m * 0.08) and
+            (c0_h <= leg_high + atr_5m * 0.15) and
+            (c0_c <= z_top) and
+            (c0_c < c0_o) and
+            (c0_br >= 0.42) and
+            (c0_cp <= 0.40) and
+            (live_spot < leg_high)
+        )
+        approaching_ote = (
+            (not tapped_and_rejected) and
+            (low_pos >= len(lows_w) - 5) and
+            (live_spot < ote_bot) and
+            ((ote_bot - live_spot) <= atr_5m * 1.15)
+        )
+
+        if tapped_and_rejected or approaching_ote:
+            if tapped_and_rejected:
+                entry_spot   = round(c0_c, dec)
+                stage_type   = "CONFIRMED_BREAKOUT"
+                trigger_mode = "BREAKOUT"
+                conf_desc    = f"5M {zone_lbl} Bearish Rejection"
+            else:
+                entry_spot   = round(ote_mid, dec)
+                stage_type   = "PRE_ALERT"
+                trigger_mode = "PULLBACK"
+                conf_desc    = f"5M {zone_lbl} Pullback Wait (62% OTE)"
+
+            invalidation_sl = round(leg_high + (atr_5m * 0.25), dec)
+            sl_dist         = round(abs(invalidation_sl - entry_spot), dec)
+            if sl_dist < info["min_sl_dist"]:
+                sl_dist = info["min_sl_dist"]
+                invalidation_sl = round(entry_spot + sl_dist, dec)
+
+            lot_size, planned_risk_usd, cost_usd = calculate_roadmap_position_size(pair_name, info, sl_dist, RISK_PER_TRADE_USD)
+            if lot_size is None or sl_dist > info["max_sl_dist"]:
+                skipped_for_risk = True
+            else:
+                of_ok, of_bonus, of_line, of_reason = validate_orderflow_and_heatmap_confirmation("SELL", entry_spot, sl_dist, of_heat, dec)
+                if (not ignore_locks) and (not of_ok):
+                    last_of_reject = of_reason
+                else:
+                    tp1_price = round(entry_spot - (sl_dist * BREAKEVEN_LOCK_R), dec)
+                    tp2_price = round(entry_spot - (sl_dist * PRIMARY_RR_TARGET), dec)
+
+                    candidates.append({
+                        "model_name": "SMC BOS + OTE Pullback",
+                        "stage": stage_type,
+                        "trigger_mode": trigger_mode,
+                        "direction": "SELL",
+                        "action": "SELL (SHORT) 🔴",
+                        "h1_bias": f"{h1_bias} (1H+15M Aligned)",
+                        "swept_level_name": f"BOS < {format_price(prior_low, dec)} · OTE {format_price(ote_mid, dec)}",
+                        "swept_level_short": "BOS+OTE",
+                        "swept_level_price": ote_mid,
+                        "mss_confirmation": conf_desc,
+                        "short_tag": f"SMC BOS + {zone_lbl}",
+                        "setup_id": f"SMC_OTE_SELL_{round(leg_low, 1)}_{round(leg_high, 1)}",
+                        "entry_spot": entry_spot,
+                        "sl_price": invalidation_sl,
+                        "sl_dist": sl_dist,
+                        "lock_level": tp1_price,
+                        "tp1_price": tp1_price,
+                        "tp2_price": tp2_price,
+                        "tp2_dist": round(sl_dist * PRIMARY_RR_TARGET, dec),
+                        "zone_top": z_top,
+                        "zone_bot": z_bot,
+                        "zone_label": zone_lbl,
+                        "lot_size": lot_size,
+                        "planned_risk_usd": planned_risk_usd,
+                        "cost_usd": cost_usd,
+                        "rr": PRIMARY_RR_TARGET,
+                        "score": (90 if tapped_and_rejected else 84) + of_bonus,
+                        "why_text": (
+                            f"1️⃣ <b>Trend & Model:</b> <b>SMC BOS + OTE</b> (1H + 15M <b>BEARISH</b>).\n"
+                            f"2️⃣ <b>Impulse BOS:</b> Broke structure below <code>{format_price(prior_low, dec)}</code> to <code>{format_price(leg_low, dec)}</code>.\n"
+                            f"3️⃣ <b>Premium Entry:</b> <b>{conf_desc}</b> · SL above swing high (<code>{format_price(invalidation_sl, dec)}</code>).\n"
+                            f"{of_line}"
+                        )
+                    })
+
+    return candidates, skipped_for_risk, last_of_reject
+
+def evaluate_smc_ict_combo_setup(pair_name, info, df_1h, df_15m, df_5m, live_spot, ignore_locks=False, return_skip_reason=False, of_heat=None):
+    """Master SMC + ICT evaluator combining Model A (ICT 2022) and Model B (SMC BOS + OTE)."""
     if not ignore_locks:
         sess_ok, _, _, _ = get_active_sessions_info(info.get("is_crypto", False))
         if not sess_ok:
@@ -1006,218 +1886,34 @@ def evaluate_roadmap_sweep_mss_setup(pair_name, info, df_1h, df_15m, df_5m, live
         if get_utc_now() < pair_cooldown_until.get(pair_name, datetime.min.replace(tzinfo=timezone.utc)):
             return (None, "COOLDOWN") if return_skip_reason else None
 
-    m5_c0   = df_5m.iloc[-2]
-    atr_5m  = float(m5_c0["ATR"])
-    body_r  = float(m5_c0["Body_Ratio"])
-    close_p = float(m5_c0["Close_Pos"])
-    rng_5   = float(m5_c0["Range"])
-
+    m5_c0  = df_5m.iloc[-2]
+    atr_5m = float(m5_c0["ATR"])
+    rng_5  = float(m5_c0["Range"])
     if np.isnan(atr_5m) or atr_5m <= 0:
         return (None, "INVALID_ATR") if return_skip_reason else None
-    if body_r < 0.40:
-        return (None, "WEAK_BODY") if return_skip_reason else None
-    if rng_5 > (atr_5m * 1.85):
+    if rng_5 > (atr_5m * 2.20):
         return (None, "EXTENDED_CLIMAX_CANDLE") if return_skip_reason else None
 
     dec     = info["decimals"]
     roadmap = extract_roadmap_session_levels_and_1h_bias(
         df_1h, df_15m, live_spot, dec, is_crypto=info.get("is_crypto", False)
     )
-    h1_bias = roadmap["h1_bias"]
-    levels  = roadmap["levels"]
 
     if not ignore_locks:
         check_sweep_proximity_radar(pair_name, info, roadmap, live_spot, atr_5m)
 
-    if h1_bias == "RANGING":
-        return (None, "1H_RANGING_CHOPPY") if return_skip_reason else None
+    if of_heat is None and ORDERFLOW_HEATMAP_FILTER_ENABLED:
+        of_heat = get_orderflow_and_heatmap_snapshot(pair_name, info, live_spot)
 
-    m15_recent = df_15m.iloc[-6:-1] if len(df_15m) >= 7 else df_15m.iloc[-5:]
-    m15_c0     = df_15m.iloc[-2] if len(df_15m) >= 2 else df_15m.iloc[-1]
+    cands_a, risk_a, rej_a = evaluate_ict_2022_model(pair_name, info, df_15m, df_5m, roadmap, live_spot, of_heat, ignore_locks=ignore_locks)
+    cands_b, risk_b, rej_b = evaluate_smc_bos_ote_model(pair_name, info, df_5m, roadmap, live_spot, of_heat, ignore_locks=ignore_locks)
 
-    m5_c1 = df_5m.iloc[-3]
-    m5_c2 = df_5m.iloc[-4]
-    m5_c3 = df_5m.iloc[-5]
-
-    p_close = float(m5_c0["Close"])
-    p_open  = float(m5_c0["Open"])
-
-    candidates = []
-    skipped_for_risk = False
-    spread_cost_now = get_dynamic_spread_cost(info)
-    buf_5m = round(max(atr_5m * 0.12, spread_cost_now * 0.5), dec)
-
-    # -----------------------------------------------------------------
-    # STRATEGY 1 ONLY: 15M LIQUIDITY SWEEP + 5M MSS (STRICT 1H BIAS MATCH)
-    # -----------------------------------------------------------------
-    for lv in levels:
-        lvl_price = lv["price"]
-        lvl_name  = lv["name"]
-        lvl_short = lv["short"]
-        lvl_type  = lv["type"]
-
-        if h1_bias == "BULLISH" and lvl_type == "LOW_POOL":
-            m15_min_low    = float(m15_recent["Low"].min())
-            m15_last_close = float(m15_c0["Close"])
-            swept_on_15m   = (m15_min_low <= lvl_price + atr_5m * 0.25) and (m15_min_low >= lvl_price - atr_5m * 2.20) and (m15_last_close >= lvl_price - atr_5m * 0.10)
-
-            if swept_on_15m:
-                mss_neck_high = max(float(m5_c1["High"]), float(m5_c2["High"]), float(m5_c3["High"]))
-                sweep_low_5m  = min(float(df_5m.iloc[-8:-1]["Low"].min()), m15_min_low)
-
-                mss_body_confirmed = (
-                    (p_close > mss_neck_high) and
-                    (p_close > p_open) and
-                    (body_r >= 0.45) and
-                    (close_p >= 0.62) and
-                    (live_spot >= lvl_price)
-                )
-                mss_pre_forming = (
-                    (not mss_body_confirmed) and
-                    (p_close > lvl_price) and
-                    (p_close > p_open) and
-                    (body_r >= 0.40) and
-                    ((mss_neck_high + buf_5m - p_close) <= atr_5m * 0.85) and
-                    (live_spot < mss_neck_high + buf_5m)
-                )
-
-                if mss_body_confirmed or mss_pre_forming:
-                    if mss_body_confirmed:
-                        entry_spot = round(p_close, dec)
-                        mss_desc   = "5M Bullish MSS Body Close"
-                        stage_type = "CONFIRMED_BREAKOUT"
-                    else:
-                        entry_spot = round(mss_neck_high + buf_5m, dec)
-                        mss_desc   = "5M Bullish MSS Trigger Forming"
-                        stage_type = "PRE_ALERT"
-
-                    invalidation_sl = round(min(sweep_low_5m, lvl_price) - (atr_5m * 0.22), dec)
-                    sl_dist         = round(abs(entry_spot - invalidation_sl), dec)
-
-                    if sl_dist < info["min_sl_dist"]:
-                        sl_dist = info["min_sl_dist"]
-                        invalidation_sl = round(entry_spot - sl_dist, dec)
-
-                    lot_size, planned_risk_usd, cost_usd = calculate_roadmap_position_size(pair_name, info, sl_dist, RISK_PER_TRADE_USD)
-                    if lot_size is None or sl_dist > info["max_sl_dist"]:
-                        skipped_for_risk = True
-                    else:
-                        tp1_price = round(entry_spot + (sl_dist * BREAKEVEN_LOCK_R), dec)
-                        tp2_price = round(entry_spot + (sl_dist * PRIMARY_RR_TARGET), dec)
-                        tp2_dist  = round(sl_dist * PRIMARY_RR_TARGET, dec)
-
-                        candidates.append({
-                            "stage": stage_type,
-                            "direction": "BUY",
-                            "action": "BUY (LONG) 🟢",
-                            "h1_bias": h1_bias,
-                            "swept_level_name": f"{lvl_short} ({format_price(lvl_price, dec)})",
-                            "swept_level_short": lvl_short,
-                            "swept_level_price": lvl_price,
-                            "mss_confirmation": mss_desc,
-                            "short_tag": f"{lvl_short} Sweep + {mss_desc}",
-                            "setup_id": f"BUY_{lvl_short}_{lvl_price}",
-                            "entry_spot": entry_spot,
-                            "sl_price": invalidation_sl,
-                            "sl_dist": sl_dist,
-                            "lock_level": tp1_price,
-                            "tp1_price": tp1_price,
-                            "tp2_price": tp2_price,
-                            "tp2_dist": tp2_dist,
-                            "lot_size": lot_size,
-                            "planned_risk_usd": planned_risk_usd,
-                            "cost_usd": cost_usd,
-                            "rr": PRIMARY_RR_TARGET,
-                            "score": 90 if mss_body_confirmed else 84,
-                            "why_text": (
-                                f"1️⃣ <b>1H Context:</b> <b>{h1_bias}</b> structure aligned.\n"
-                                f"2️⃣ <b>15M Level Sweep:</b> Swept <b>{lvl_name} (<code>{format_price(lvl_price, dec)}</code>)</b> and closed back above.\n"
-                                f"3️⃣ <b>5M Confirmation:</b> <b>{mss_desc}</b> with SL below sweep low (<code>{format_price(invalidation_sl, dec)}</code>)."
-                            )
-                        })
-
-        if h1_bias == "BEARISH" and lvl_type == "HIGH_POOL":
-            m15_max_high   = float(m15_recent["High"].max())
-            m15_last_close = float(m15_c0["Close"])
-            swept_on_15m   = (m15_max_high >= lvl_price - atr_5m * 0.25) and (m15_max_high <= lvl_price + atr_5m * 2.20) and (m15_last_close <= lvl_price + atr_5m * 0.10)
-
-            if swept_on_15m:
-                mss_neck_low  = min(float(m5_c1["Low"]), float(m5_c2["Low"]), float(m5_c3["Low"]))
-                sweep_high_5m = max(float(df_5m.iloc[-8:-1]["High"].max()), m15_max_high)
-
-                mss_body_confirmed = (
-                    (p_close < mss_neck_low) and
-                    (p_close < p_open) and
-                    (body_r >= 0.45) and
-                    (close_p <= 0.38) and
-                    (live_spot <= lvl_price)
-                )
-                mss_pre_forming = (
-                    (not mss_body_confirmed) and
-                    (p_close < lvl_price) and
-                    (p_close < p_open) and
-                    (body_r >= 0.40) and
-                    ((p_close - (mss_neck_low - buf_5m)) <= atr_5m * 0.85) and
-                    (live_spot > mss_neck_low - buf_5m)
-                )
-
-                if mss_body_confirmed or mss_pre_forming:
-                    if mss_body_confirmed:
-                        entry_spot = round(p_close, dec)
-                        mss_desc   = "5M Bearish MSS Body Close"
-                        stage_type = "CONFIRMED_BREAKOUT"
-                    else:
-                        entry_spot = round(mss_neck_low - buf_5m, dec)
-                        mss_desc   = "5M Bearish MSS Trigger Forming"
-                        stage_type = "PRE_ALERT"
-
-                    invalidation_sl = round(max(sweep_high_5m, lvl_price) + (atr_5m * 0.22), dec)
-                    sl_dist         = round(abs(invalidation_sl - entry_spot), dec)
-
-                    if sl_dist < info["min_sl_dist"]:
-                        sl_dist = info["min_sl_dist"]
-                        invalidation_sl = round(entry_spot + sl_dist, dec)
-
-                    lot_size, planned_risk_usd, cost_usd = calculate_roadmap_position_size(pair_name, info, sl_dist, RISK_PER_TRADE_USD)
-                    if lot_size is None or sl_dist > info["max_sl_dist"]:
-                        skipped_for_risk = True
-                    else:
-                        tp1_price = round(entry_spot - (sl_dist * BREAKEVEN_LOCK_R), dec)
-                        tp2_price = round(entry_spot - (sl_dist * PRIMARY_RR_TARGET), dec)
-                        tp2_dist  = round(sl_dist * PRIMARY_RR_TARGET, dec)
-
-                        candidates.append({
-                            "stage": stage_type,
-                            "direction": "SELL",
-                            "action": "SELL (SHORT) 🔴",
-                            "h1_bias": h1_bias,
-                            "swept_level_name": f"{lvl_short} ({format_price(lvl_price, dec)})",
-                            "swept_level_short": lvl_short,
-                            "swept_level_price": lvl_price,
-                            "mss_confirmation": mss_desc,
-                            "short_tag": f"{lvl_short} Sweep + {mss_desc}",
-                            "setup_id": f"SELL_{lvl_short}_{lvl_price}",
-                            "entry_spot": entry_spot,
-                            "sl_price": invalidation_sl,
-                            "sl_dist": sl_dist,
-                            "lock_level": tp1_price,
-                            "tp1_price": tp1_price,
-                            "tp2_price": tp2_price,
-                            "tp2_dist": tp2_dist,
-                            "lot_size": lot_size,
-                            "planned_risk_usd": planned_risk_usd,
-                            "cost_usd": cost_usd,
-                            "rr": PRIMARY_RR_TARGET,
-                            "score": 90 if mss_body_confirmed else 84,
-                            "why_text": (
-                                f"1️⃣ <b>1H Context:</b> <b>{h1_bias}</b> structure aligned.\n"
-                                f"2️⃣ <b>15M Level Sweep:</b> Swept <b>{lvl_name} (<code>{format_price(lvl_price, dec)}</code>)</b> and closed back below.\n"
-                                f"3️⃣ <b>5M Confirmation:</b> <b>{mss_desc}</b> with SL above sweep high (<code>{format_price(invalidation_sl, dec)}</code>)."
-                            )
-                        })
-
+    candidates = cands_a + cands_b
     if not candidates:
-        reason = "SKIPPED_SL_EXCEEDS_12_50_RISK" if skipped_for_risk else "NO_SETUP"
+        if rej_a or rej_b:
+            reason = rej_a or rej_b
+        else:
+            reason = "SKIPPED_SL_EXCEEDS_12_50_RISK" if (risk_a or risk_b) else "NO_SETUP"
         return (None, reason) if return_skip_reason else None
 
     candidates.sort(key=lambda x: (1 if x["stage"] == "CONFIRMED_BREAKOUT" else 0, x["score"]), reverse=True)
@@ -1323,7 +2019,7 @@ def compute_day_wise_breakdown(trades_list):
     return {"days": day_stats, "best_day": best_day, "worst_day": worst_day}
 
 # =====================================================================
-# 9. HIGH-SPEED MT5-SYNCED CHARTS (XAU + BTC 1H HTF) & REPORTS
+# 9. HIGH-SPEED MT5-SYNCED CHARTS (1H HTF PREVIEW + 5M FVG/OTE EXECUTION)
 # =====================================================================
 def generate_visual_backtest_report_chart(combined_stats, xau_stats, btc_stats, day_breakdown):
     try:
@@ -1512,11 +2208,13 @@ def draw_tradingview_arrow(ax, x_pos, y_pos, y_span, is_up=True):
     poly = Polygon(pts, closed=True, facecolor=col, edgecolor=col, linewidth=0.6, zorder=8)
     ax.add_patch(poly)
 
-def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None):
+def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None, of_heat=None):
     try:
         is_btc = info.get("is_crypto", False)
-        # Both XAUUSD & BTCUSD plot Higher Timeframe (1H, 64 candles) with wide HTF Major Levels
-        sub = df_1h.iloc[-64:].copy()
+        is_trade_view = active_trade is not None
+
+        # Preview (/gold, /btc) -> 1H HTF Major Levels chart; Trade Alert -> 5M Execution Chart showing FVG/OTE & SL/TP
+        sub = df_5m.iloc[-54:].copy() if is_trade_view else df_1h.iloc[-64:].copy()
         if sub.empty or len(sub) < 20:
             return None
 
@@ -1543,8 +2241,9 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         ax.spines["right"].set_color("#e0e3eb")
         ax.spines["bottom"].set_color("#e0e3eb")
 
+        wm_txt = f"{mt5_sym} · SMC/ICT 5M" if is_trade_view else f"{mt5_sym} · MT5 1H HTF"
         ax.text(
-            0.45, 0.50, f"{mt5_sym} · MT5 1H HTF", transform=ax.transAxes,
+            0.45, 0.50, wm_txt, transform=ax.transAxes,
             fontsize=28, fontweight="bold", color="#131722", alpha=0.07,
             ha="center", va="center", zorder=1
         )
@@ -1557,31 +2256,37 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         c_min, c_max = float(np.min(lows)), float(np.max(highs))
         c_span = max(c_max - c_min, float(sub.iloc[-2]["ATR"]) * 4.0)
 
-        visible_levels = [
-            lv for lv in levels
-            if (c_min - c_span * 0.30) <= lv["price"] <= (c_max + c_span * 0.30)
-        ]
-        # Always include nearest major resistance above and support below on HTF chart
-        above_lvs = [lv for lv in levels if lv["price"] >= live_spot]
-        below_lvs = [lv for lv in levels if lv["price"] < live_spot]
-        if above_lvs:
-            near_hi = min(above_lvs, key=lambda l: abs(l["price"] - live_spot))
-            if near_hi not in visible_levels:
-                visible_levels.append(near_hi)
-        if below_lvs:
-            near_lo = min(below_lvs, key=lambda l: abs(l["price"] - live_spot))
-            if near_lo not in visible_levels:
-                visible_levels.append(near_lo)
-
-        if not visible_levels and levels:
-            nearest_lv = min(levels, key=lambda l: abs(l["price"] - live_spot))
-            visible_levels = [nearest_lv]
+        if is_trade_view:
+            visible_levels = [
+                lv for lv in levels
+                if (c_min - c_span * 0.25) <= lv["price"] <= (c_max + c_span * 0.25)
+            ]
+        else:
+            visible_levels = [
+                lv for lv in levels
+                if (c_min - c_span * 0.30) <= lv["price"] <= (c_max + c_span * 0.30)
+            ]
+            above_lvs = [lv for lv in levels if lv["price"] >= live_spot]
+            below_lvs = [lv for lv in levels if lv["price"] < live_spot]
+            if above_lvs:
+                near_hi = min(above_lvs, key=lambda l: abs(l["price"] - live_spot))
+                if near_hi not in visible_levels:
+                    visible_levels.append(near_hi)
+            if below_lvs:
+                near_lo = min(below_lvs, key=lambda l: abs(l["price"] - live_spot))
+                if near_lo not in visible_levels:
+                    visible_levels.append(near_lo)
+            if not visible_levels and levels:
+                nearest_lv = min(levels, key=lambda l: abs(l["price"] - live_spot))
+                visible_levels = [nearest_lv]
 
         all_y = list(highs) + list(lows) + [live_spot]
         for lv in visible_levels:
             all_y.extend([lv["top"], lv["bot"]])
-        if active_trade is not None:
+        if is_trade_view:
             all_y.extend([active_trade["entry_spot"], active_trade["sl_price"], active_trade["tp2_price"]])
+            if "zone_top" in active_trade and "zone_bot" in active_trade:
+                all_y.extend([active_trade["zone_top"], active_trade["zone_bot"]])
 
         y_min, y_max = float(np.nanmin(all_y)), float(np.nanmax(all_y))
         total_span   = max(y_max - y_min, 1e-6)
@@ -1596,6 +2301,37 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         ax.vlines(x_vals[bear_mask], lows[bear_mask], highs[bear_mask], color="#f23645", linewidth=1.15, zorder=4)
         ax.bar(x_vals[bull_mask], body_heights[bull_mask], bottom=bot_bodies[bull_mask], width=0.68, color="#089981", edgecolor="#089981", linewidth=0.40, zorder=4)
         ax.bar(x_vals[bear_mask], body_heights[bear_mask], bottom=bot_bodies[bear_mask], width=0.68, color="#f23645", edgecolor="#f23645", linewidth=0.40, zorder=4)
+
+        # Plot Liquidity Heatmap Bands (Orderbook Ask & Bid Walls within visible price span)
+        if of_heat and of_heat.get("book_ok", False):
+            heat_band_h = total_span * 0.013
+            for wall in (of_heat.get("ask_walls", [])[:2] + of_heat.get("bid_walls", [])[:2]):
+                wp = wall["price"]
+                if not ((y_min - total_span * 0.05) <= wp <= (y_max + total_span * 0.05)):
+                    continue
+                is_ask_w = (wall["side"] == "ASK")
+                h_col = "#f59e0b" if is_ask_w else "#06b6d4"
+                h_txt_col = "#b45309" if is_ask_w else "#0e7490"
+                h_alpha = 0.10 + (0.14 * float(wall.get("strength", 0.5)))
+
+                ax.add_patch(mpatches.Rectangle(
+                    (int(n_bars * 0.45), wp - heat_band_h),
+                    right_edge_idx - int(n_bars * 0.45),
+                    heat_band_h * 2.0,
+                    facecolor=h_col, alpha=h_alpha, edgecolor="none", zorder=2
+                ))
+                ax.plot(
+                    [int(n_bars * 0.45), right_edge_idx], [wp, wp],
+                    color=h_col, linewidth=1.0, linestyle="-.", alpha=0.85, zorder=3
+                )
+                w_lbl = f"HEAT {'ASK' if is_ask_w else 'BID'} ({format_price(wp, dec)})"
+                ax.text(
+                    right_edge_idx - 1.0, wp,
+                    w_lbl,
+                    fontsize=6.6, fontweight="bold", color=h_txt_col, ha="right", va="center",
+                    bbox=dict(boxstyle="round,pad=0.12", facecolor="#fffbeb" if is_ask_w else "#ecfeff", edgecolor=h_col, alpha=0.90, linewidth=0.55),
+                    clip_on=True, zorder=6
+                )
 
         placed_label_ys = []
         for lv in sorted(visible_levels, key=lambda x: x["price"]):
@@ -1634,7 +2370,26 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         live_col  = "#089981" if last_bull else "#f23645"
         ax.axhline(live_spot, color=live_col, linewidth=0.85, linestyle=":", alpha=0.85, zorder=5)
 
-        if active_trade is not None:
+        if is_trade_view:
+            # Draw SMC/ICT FVG or OTE Entry Zone Box
+            if "zone_top" in active_trade and "zone_bot" in active_trade:
+                zt = active_trade["zone_top"]
+                zb = active_trade["zone_bot"]
+                z_col = "#10b981" if active_trade["direction"] == "BUY" else "#ef4444"
+                ax.add_patch(mpatches.Rectangle(
+                    (max(2, n_bars - 14), zb),
+                    right_edge_idx - max(2, n_bars - 14),
+                    max(zt - zb, total_span * 0.008),
+                    facecolor=z_col, alpha=0.14, edgecolor=z_col, linewidth=0.8, linestyle="--", zorder=3
+                ))
+                ax.text(
+                    max(3, n_bars - 13), zt + total_span * 0.004,
+                    f" {active_trade.get('zone_label', 'FVG / OTE Zone')} ",
+                    fontsize=7.0, fontweight="bold", color=z_col, ha="left", va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.12", facecolor="#ffffff", edgecolor=z_col, alpha=0.90, linewidth=0.6),
+                    clip_on=True, zorder=7
+                )
+
             ent_p = active_trade["entry_spot"]
             sl_p  = active_trade["sl_price"]
             tp1_p = active_trade["tp1_price"]
@@ -1663,11 +2418,11 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
                 total_span, is_up=is_buy_dir
             )
 
-            stage_prefix = "ENTER NOW @" if active_trade.get("stage") == "CONFIRMED_BREAKOUT" else "ENTRY SPOT @"
+            stage_prefix = "ENTER NOW @" if active_trade.get("stage") == "CONFIRMED_BREAKOUT" else "PULLBACK ENTRY @"
             ax.text(
                 p_x0 + (p_w * 0.52), ent_p,
                 f" 🎯 {stage_prefix} {format_price(ent_p, dec)} (1:2 RR) ",
-                fontsize=7.5, fontweight="bold", color="#ffffff", ha="center", va="center",
+                fontsize=7.3, fontweight="bold", color="#ffffff", ha="center", va="center",
                 bbox=dict(boxstyle="round,pad=0.22", facecolor="#1d4ed8", edgecolor="#1e3a8a", linewidth=0.8),
                 clip_on=True, zorder=9
             )
@@ -1683,7 +2438,7 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         ax.set_yticks(y_ticks)
         ax.set_yticklabels([format_tv_comma_price(yt, dec) for yt in y_ticks], fontsize=8.6, color="#131722")
 
-        if active_trade is not None:
+        if is_trade_view:
             for t_y, t_lbl, t_bg in [
                 (active_trade["tp2_price"], f" 1:2 TP {format_tv_comma_price(active_trade['tp2_price'], dec)} ", "#089981"),
                 (active_trade["entry_spot"], f" ENTRY {format_tv_comma_price(active_trade['entry_spot'], dec)} ", "#2563eb"),
@@ -1697,7 +2452,7 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
                 )
 
         now_utc = get_utc_now()
-        rem_sec = max(0, (60 - now_utc.minute) * 60 - now_utc.second)
+        rem_sec = max(0, (5 - (now_utc.minute % 5)) * 60 - now_utc.second) if is_trade_view else max(0, (60 - now_utc.minute) * 60 - now_utc.second)
         mm, ss  = divmod(rem_sec, 60)
         live_tag_txt = f" {format_tv_comma_price(live_spot, dec)} \n {mm:02d}:{ss:02d} "
         ax.text(
@@ -1726,9 +2481,13 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
 
         top_ax = fig.add_axes([0.015, 0.915, 0.96, 0.075], facecolor="#ffffff")
         top_ax.axis("off")
+        hdr_title = (
+            f"{hdr_nam} ({mt5_sym}) · {active_trade.get('model_name', 'SMC + ICT')} Execution (5m)"
+            if is_trade_view else
+            f"{hdr_nam} ({mt5_sym}) · MT5-Synced 1H HTF + Heatmap & Orderflow"
+        )
         top_ax.text(
-            0.0, 0.72,
-            f"{hdr_nam} ({mt5_sym}) · MT5-Synced HTF Major Levels (1H)",
+            0.0, 0.72, hdr_title,
             fontsize=9.5, fontweight="bold", color="#131722", va="center", ha="left"
         )
         top_ax.text(
@@ -1736,6 +2495,17 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
             f"O {format_tv_comma_price(o_val, dec)}   H {format_tv_comma_price(h_val, dec)}   L {format_tv_comma_price(l_val, dec)}   C {format_tv_comma_price(c_val, dec)}   {chg_val:+.{dec}f} ({chg_pct:+.2f}%)",
             fontsize=8.6, fontweight="bold", color=ohlc_col, va="center", ha="left"
         )
+
+        if of_heat and of_heat.get("available", False):
+            d_val = of_heat.get("delta_pct", 0.0)
+            b_imb = of_heat.get("book_imbalance_pct", 0.0)
+            of_bg = "#ecfdf5" if d_val >= 0 else "#fef2f2"
+            top_ax.text(
+                0.855, 0.50, f"OF: {d_val:+.1f}% | BOOK: {b_imb:+.0f}%",
+                fontsize=7.8, fontweight="bold", color="#131722", va="center", ha="right",
+                bbox=dict(boxstyle="round,pad=0.22", facecolor=of_bg, edgecolor="#cbd5e1", linewidth=0.7)
+            )
+
         bias_bg = "#ecfdf5" if h1_bias == "BULLISH" else ("#fef2f2" if h1_bias == "BEARISH" else "#f8fafc")
         top_ax.text(
             0.985, 0.50, f"1H: {h1_bias}",
@@ -1744,11 +2514,12 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         )
 
         gap_label = "650+ Pts" if is_btc else "$10+ Pts"
-        fig.text(
-            0.015, 0.018,
-            f"Telegram Bot · MT5-Synced · {mt5_sym} 1H HTF Major Levels ({gap_label})",
-            fontsize=9.0, fontweight="bold", color="#131722"
+        footer_txt = (
+            "Telegram Bot · MT5-Synced · SMC + ICT Dual Engine (ICT 2022 + BOS/OTE) · Orderflow & Heatmap"
+            if is_trade_view else
+            f"Telegram Bot · MT5-Synced · {mt5_sym} 1H HTF ({gap_label}) · SMC/ICT + Heatmap Active"
         )
+        fig.text(0.015, 0.018, footer_txt, fontsize=8.8, fontweight="bold", color="#131722")
 
         buf = io.BytesIO()
         plt.savefig(buf, format="png", dpi=100, facecolor="#ffffff")
@@ -1789,7 +2560,7 @@ def send_telegram_signal_with_chart(caption_html, chart_buf, target_chat_id=CHAT
     send_telegram_message(caption_html, target_chat_id)
 
 def send_instant_preview_chart(pair_key=None):
-    """Shows live chart and current market map only (/gold or /btc); auto-trades come automatically when setup forms."""
+    """Shows live 1H HTF chart, Major Levels, Heatmap & Orderflow only (/gold or /btc); auto-trades fire automatically."""
     global chart_rotation_index
     send_telegram_chat_action("upload_photo")
 
@@ -1813,19 +2584,23 @@ def send_instant_preview_chart(pair_key=None):
     roadmap = extract_roadmap_session_levels_and_1h_bias(
         df_1h, df_15m, live_spot, dec, is_crypto=is_btc
     )
+    of_heat = get_orderflow_and_heatmap_snapshot(pair_key, info, live_spot)
 
-    # Preview chart shows live market structure without triggering or displaying manual trade signals
-    chart_buf = generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None)
+    chart_buf = generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=None, of_heat=of_heat)
     _, _, sess_status_txt, sessions_str = get_active_sessions_info(is_btc)
     _, spread_status_txt                = check_low_spread_window(info)
 
-    no_trade_note = "⚠️ <b>1H is RANGING/CHOPPY — Stand Aside!</b>\n" if roadmap["h1_bias"] == "RANGING" else ""
+    ask_txt = format_price(of_heat["ask_walls"][0]["price"], dec) if of_heat["ask_walls"] else "N/A"
+    bid_txt = format_price(of_heat["bid_walls"][0]["price"], dec) if of_heat["bid_walls"] else "N/A"
 
     levels_block = (
         f"📌 <b>Major HTF Levels (1H / 4H / Weekly):</b>\n"
         f"• <b>PDH / PDL:</b> <code>{format_price(roadmap['pdh'], dec)}</code> / <code>{format_price(roadmap['pdl'], dec)}</code>\n"
         f"• <b>4H Swing H / L:</b> <code>{format_price(roadmap['htf_4h_high'], dec)}</code> / <code>{format_price(roadmap['htf_4h_low'], dec)}</code>\n"
         f"• <b>Weekly H / L:</b> <code>{format_price(roadmap['wk_high'], dec)}</code> / <code>{format_price(roadmap['wk_low'], dec)}</code>\n\n"
+        f"🔥 <b>Liquidity Heatmap ({of_heat['source_note']}):</b>\n"
+        f"• <b>Ask Wall / Bid Wall:</b> <code>{ask_txt}</code> / <code>{bid_txt}</code> (Imb: {of_heat['book_imbalance_pct']:+.1f}%)\n"
+        f"⚡ <b>Orderflow (5M):</b> {of_heat['flow_label']} | 5-Bar CVD: <b>{of_heat['cvd_5_pct']:+.1f}%</b>\n\n"
     )
 
     caption = (
@@ -1833,23 +2608,22 @@ def send_instant_preview_chart(pair_key=None):
         f"🕒 <b>Session:</b> {sess_status_txt}\n"
         f"🕒 <b>Sessions:</b> {sessions_str}\n"
         f"💧 <b>Spread Window:</b> {spread_status_txt}\n"
-        f"🧭 <b>1H Context:</b> <b>{roadmap['h1_bias']}</b> | 📍 <b>Live:</b> <code>{format_price(live_spot, dec)}</code>\n"
-        f"{no_trade_note}\n"
+        f"🧭 <b>1H / 15M Bias:</b> <b>{roadmap['h1_bias']} / {roadmap['m15_bias']}</b> | 📍 <b>Live:</b> <code>{format_price(live_spot, dec)}</code>\n\n"
         f"{levels_block}"
-        f"🤖 <b>Auto-Trade Mode:</b> Bot automatically sends alerts when 1H Bias + 15M Sweep + 5M MSS forms."
+        f"🤖 <b>Auto-Trade Engine:</b> SMC + ICT Dual Model (ICT 2022 FVG + BOS/OTE)."
     )
 
     send_telegram_signal_with_chart(caption, chart_buf)
 
 def send_live_status_summary():
     bal, eq, day_pnl, week_pnl = get_live_account_metrics()
-    _, _, sess_status_txt, _     = get_active_sessions_info(False)
+    _, _, sess_status_txt, _   = get_active_sessions_info(False)
     can_tr, _, guard_reason    = check_funded_account_risk_rules()
     dd_from_peak               = max(STARTING_CAPITAL_USD, HIGH_WATER_MARK_USD) - min(bal, eq)
     today_name                 = WEEKDAY_NAMES[get_ny_weekday_index(get_utc_now())]
 
     report = (
-        f"📊 <b>$5,000 TWO-STEP FUNDED STATUS (TELEGRAM 0-START)</b>\n\n"
+        f"📊 <b>$5,000 TWO-STEP FUNDED STATUS (SMC + ICT DUAL ENGINE)</b>\n\n"
         f"📅 <b>Day:</b> <b>{today_name}</b> | 🕒 <b>Session:</b> {sess_status_txt}\n"
         f"🚦 <b>Risk Guard:</b> <b>{'🟢 READY TO TRADE' if can_tr else '🔴 LOCKED (' + guard_reason + ')'}</b>\n"
         f"💰 <b>Balance / Equity:</b> <b>${bal:.2f} / ${eq:.2f}</b> (Peak: ${HIGH_WATER_MARK_USD:.2f})\n"
@@ -1869,8 +2643,9 @@ def send_live_status_summary():
                 rm     = extract_roadmap_session_levels_and_1h_bias(
                     df_1h, df_15m, live_spot, info["decimals"], is_crypto=info.get("is_crypto", False)
                 )
+                of_h   = get_orderflow_and_heatmap_snapshot(name, info, live_spot)
                 pend   = pending_pre_alerts.get(name)
-                st_str = f"⏳ Pre-Alert @ {format_price(pend['entry_spot'], info['decimals'])}" if pend else f"PDH:{format_price(rm['pdh'], info['decimals'])} | PDL:{format_price(rm['pdl'], info['decimals'])}"
+                st_str = f"⏳ Pullback @ {format_price(pend['entry_spot'], info['decimals'])}" if pend else f"OF:{of_h['delta_pct']:+.1f}% | 15M:{rm['m15_bias']}"
                 report += f"🔹 <b>{info['mt5_name']}:</b> <code>{format_price(live_spot, info['decimals'])}</code> | {sp_txt} | 1H: <b>{rm['h1_bias']}</b> ({st_str})\n"
             else:
                 report += f"🔹 <b>{info['mt5_name']}:</b> {sp_txt}\n"
@@ -1928,9 +2703,9 @@ def check_telegram_commands():
         pass
 
 # =====================================================================
-# 10. TRADE EXECUTION, LOCKED PRE-ALERTS & TRADE MANAGEMENT
+# 10. TRADE EXECUTION, PULLBACK/BREAKOUT PRE-ALERTS & TRADE MANAGEMENT
 # =====================================================================
-def dispatch_confirmed_trade_alert(name, info, df_1h, df_15m, df_5m, live_spot, cand, closed_time):
+def dispatch_confirmed_trade_alert(name, info, df_1h, df_15m, df_5m, live_spot, cand, closed_time, of_heat=None):
     global trades_today, last_candle_traded, last_setup_traded
 
     dec        = info["decimals"]
@@ -1947,6 +2722,7 @@ def dispatch_confirmed_trade_alert(name, info, df_1h, df_15m, df_5m, live_spot, 
     reward_usd = round((risk_usd * PRIMARY_RR_TARGET) - cost_usd, 2)
     day_name   = WEEKDAY_NAMES[get_ny_weekday_index(closed_time)]
     _, sp_txt  = check_low_spread_window(info)
+    model_lbl  = cand.get("model_name", "SMC + ICT")
 
     cand["stage"]            = "CONFIRMED_BREAKOUT"
     last_candle_traded[name] = closed_time
@@ -1967,21 +2743,24 @@ def dispatch_confirmed_trade_alert(name, info, df_1h, df_15m, df_5m, live_spot, 
     })
 
     msg = (
-        f"🚨 <b>ENTER NOW — {info['mt5_name']} (TRADE #{trades_today}/{MAX_DAILY_TRADES} · {day_name})</b> 🚨\n\n"
+        f"🚨 <b>ENTER NOW — {info['mt5_name']} (TRADE #{trades_today}/{MAX_DAILY_TRADES} · {day_name})</b> 🚨\n"
+        f"🧠 <b>Model:</b> <b>{model_lbl}</b>\n\n"
         f"📢 <b>Action:</b> <b>{signal}</b> | 💧 <b>Spread:</b> {sp_txt}\n"
         f"🎯 <b>ENTRY SPOT:</b> <b><code>{format_price(entry_spot, dec)}</code></b> (Live: <code>{format_price(live_spot, dec)}</code>)\n"
         f"💼 <b>Lot Size (0.25% Risk):</b> <b><code>{lot_size:.2f} Lot</code></b>\n\n"
         f"🛑 <b>Invalidation Stop-Loss:</b> <code>{format_price(sl_level, dec)}</code>\n"
         f"🛡️ <b>1:1 Breakeven Lock (TP1):</b> <code>{format_price(tp1_level, dec)}</code>\n"
         f"🎯 <b>1:2 Full Target (TP2):</b> <code>{format_price(tp2_level, dec)}</code>\n\n"
-        f"🔍 <b>Setup Checklist:</b>\n{cand['why_text']}\n\n"
+        f"🔍 <b>SMC/ICT Checklist:</b>\n{cand['why_text']}\n\n"
         f"⚖️ <b>Risk (incl. cost):</b> ${risk_usd:.2f}  |  <b>Net 1:2 Reward:</b> +${reward_usd:.2f}"
     )
 
-    chart_buf = generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=cand)
+    if of_heat is None:
+        of_heat = get_orderflow_and_heatmap_snapshot(name, info, live_spot)
+    chart_buf = generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=cand, of_heat=of_heat)
     send_telegram_signal_with_chart(msg, chart_buf)
 
-def dispatch_pre_alert_setup(name, info, df_1h, df_15m, df_5m, live_spot, cand, closed_time):
+def dispatch_pre_alert_setup(name, info, df_1h, df_15m, df_5m, live_spot, cand, closed_time, of_heat=None):
     dec        = info["decimals"]
     entry_spot = cand["entry_spot"]
     sl_level   = cand["sl_price"]
@@ -1991,6 +2770,8 @@ def dispatch_pre_alert_setup(name, info, df_1h, df_15m, df_5m, live_spot, cand, 
     risk_usd   = cand["planned_risk_usd"]
     reward_usd = round((risk_usd * PRIMARY_RR_TARGET) - cand.get("cost_usd", 0.35), 2)
     _, sp_txt  = check_low_spread_window(info)
+    model_lbl  = cand.get("model_name", "SMC + ICT")
+    wait_txt   = "Pullback into FVG/OTE Zone" if cand.get("trigger_mode") == "PULLBACK" else "Breakout Trigger"
 
     cand["created_utc"]         = get_utc_now()
     pending_pre_alerts[name]    = cand
@@ -1998,18 +2779,21 @@ def dispatch_pre_alert_setup(name, info, df_1h, df_15m, df_5m, live_spot, cand, 
     last_setup_traded[name]     = cand["setup_id"]
 
     msg = (
-        f"⏳ <b>PRE-ALERT LOCKED — {info['mt5_name']}</b> ⏳\n\n"
+        f"⏳ <b>PRE-ALERT LOCKED — {info['mt5_name']}</b> ⏳\n"
+        f"🧠 <b>Model:</b> <b>{model_lbl}</b> ({wait_txt})\n\n"
         f"📢 <b>Upcoming Action:</b> <b>{cand['action']}</b> | 💧 <b>Spread:</b> {sp_txt}\n"
-        f"🧲 <b>Swept Level:</b> <b>{cand['swept_level_name']}</b>\n"
+        f"🧲 <b>Setup Trigger:</b> <b>{cand['swept_level_name']}</b>\n"
         f"📍 <b>Current Live Price:</b> <code>{format_price(live_spot, dec)}</code>\n"
-        f"🎯 <b>LOCKED ENTRY SPOT:</b> <b><code>{format_price(entry_spot, dec)}</code></b>\n\n"
+        f"🎯 <b>LOCKED ENTRY ZONE:</b> <b><code>{format_price(entry_spot, dec)}</code></b>\n\n"
         f"💼 <b>Lot Size ($12.50 Max Risk):</b> <b><code>{lot_size:.2f} Lot</code></b>\n"
         f"🛑 <b>Invalidation SL:</b> <code>{format_price(sl_level, dec)}</code>\n"
         f"🛡️ <b>1:1 Lock (TP1):</b> <code>{format_price(tp1_level, dec)}</code>\n"
         f"🎯 <b>1:2 Target (TP2):</b> <code>{format_price(tp2_level, dec)}</code> (+${reward_usd:.2f})"
     )
 
-    chart_buf = generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=cand)
+    if of_heat is None:
+        of_heat = get_orderflow_and_heatmap_snapshot(name, info, live_spot)
+    chart_buf = generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=cand, of_heat=of_heat)
     send_telegram_signal_with_chart(msg, chart_buf)
 
 def check_pending_pre_alerts_realtime():
@@ -2044,29 +2828,45 @@ def check_pending_pre_alerts_realtime():
         closed_time = to_utc_timestamp(df_5m.index[-2])
         live_open   = float(df_5m.iloc[-1]["Open"])
 
-        if cand["direction"] == "BUY" and live_spot <= cand["sl_price"]:
-            pending_pre_alerts[name] = None
-            pre_alert_cooldown[name] = now_utc + timedelta(minutes=20)
-            send_telegram_message(
-                f"❌ <b>PRE-ALERT INVALIDATED — {info['mt5_name']}</b>\n"
-                f"Price broke below invalidation SL (<code>{format_price(cand['sl_price'], dec)}</code>). No trade taken."
-            )
-            continue
-        elif cand["direction"] == "SELL" and live_spot >= cand["sl_price"]:
-            pending_pre_alerts[name] = None
-            pre_alert_cooldown[name] = now_utc + timedelta(minutes=20)
-            send_telegram_message(
-                f"❌ <b>PRE-ALERT INVALIDATED — {info['mt5_name']}</b>\n"
-                f"Price broke above invalidation SL (<code>{format_price(cand['sl_price'], dec)}</code>). No trade taken."
-            )
-            continue
+        if cand["direction"] == "BUY":
+            if live_spot <= cand["sl_price"]:
+                pending_pre_alerts[name] = None
+                pre_alert_cooldown[name] = now_utc + timedelta(minutes=20)
+                send_telegram_message(
+                    f"❌ <b>PRE-ALERT INVALIDATED — {info['mt5_name']}</b>\n"
+                    f"Price broke below invalidation SL (<code>{format_price(cand['sl_price'], dec)}</code>). No trade taken."
+                )
+                continue
+            if cand.get("trigger_mode") == "PULLBACK" and live_spot >= cand["tp1_price"]:
+                pending_pre_alerts[name] = None
+                continue
+        else:
+            if live_spot >= cand["sl_price"]:
+                pending_pre_alerts[name] = None
+                pre_alert_cooldown[name] = now_utc + timedelta(minutes=20)
+                send_telegram_message(
+                    f"❌ <b>PRE-ALERT INVALIDATED — {info['mt5_name']}</b>\n"
+                    f"Price broke above invalidation SL (<code>{format_price(cand['sl_price'], dec)}</code>). No trade taken."
+                )
+                continue
+            if cand.get("trigger_mode") == "PULLBACK" and live_spot <= cand["tp1_price"]:
+                pending_pre_alerts[name] = None
+                continue
 
-        triggered_now = (
-            (cand["direction"] == "BUY" and live_spot >= cand["entry_spot"] and live_spot > live_open) or
-            (cand["direction"] == "SELL" and live_spot <= cand["entry_spot"] and live_spot < live_open)
-        )
+        if cand.get("trigger_mode") == "PULLBACK":
+            triggered_now = (
+                (cand["direction"] == "BUY" and live_spot <= cand["entry_spot"] and live_spot > cand["sl_price"]) or
+                (cand["direction"] == "SELL" and live_spot >= cand["entry_spot"] and live_spot < cand["sl_price"])
+            )
+        else:
+            triggered_now = (
+                (cand["direction"] == "BUY" and live_spot >= cand["entry_spot"] and live_spot > live_open) or
+                (cand["direction"] == "SELL" and live_spot <= cand["entry_spot"] and live_spot < live_open)
+            )
+
         if triggered_now:
-            dispatch_confirmed_trade_alert(name, info, df_1h, df_15m, df_5m, live_spot, cand, closed_time)
+            of_heat = get_orderflow_and_heatmap_snapshot(name, info, live_spot)
+            dispatch_confirmed_trade_alert(name, info, df_1h, df_15m, df_5m, live_spot, cand, closed_time, of_heat=of_heat)
 
 def manage_open_trades(pair_name, candle_time, live_spot, df_5m, decimals):
     global daily_realized_pnl, weekly_realized_pnl, total_account_pnl, losses_today, pair_cooldown_until
@@ -2096,184 +2896,4 @@ def manage_open_trades(pair_name, candle_time, live_spot, df_5m, decimals):
                 one_r_reached = (trade["direction"] == "BUY" and current_high >= trade["half_target"]) or \
                                 (trade["direction"] == "SELL" and current_low <= trade["half_target"])
                 if one_r_reached:
-                    trade["trailed_to_cost"] = True
-                    trade["sl"] = trade["entry"]
-                    send_telegram_message(
-                        f"🛡️ <b>1:1 (+1R) REACHED — {trade['mt5_name']}</b>\n"
-                        f"📍 <b>Live Price:</b> <code>{price_str}</code>\n"
-                        f"👉 Move Stop-Loss to Entry (<code>{entry_str}</code>) to make this trade 100% risk-free."
-                    )
-
-            hit_type = None
-            if trade["direction"] == "BUY":
-                if current_high >= trade["target"]:
-                    hit_type = "TARGET"
-                elif current_low <= trade["sl"]:
-                    hit_type = "BREAKEVEN_SL" if trade["trailed_to_cost"] else "SL"
-            else:
-                if current_low <= trade["target"]:
-                    hit_type = "TARGET"
-                elif current_high >= trade["sl"]:
-                    hit_type = "BREAKEVEN_SL" if trade["trailed_to_cost"] else "SL"
-
-            if hit_type == "TARGET":
-                trade["is_open"] = False
-                pair_cooldown_until[pair_name] = now_utc + timedelta(minutes=30)
-                net_win = trade["expected_profit"]
-                daily_realized_pnl  += net_win
-                weekly_realized_pnl += net_win
-                total_account_pnl   += net_win
-                append_to_trading_journal(trade, +2.0, net_win, "WIN")
-                send_telegram_message(
-                    f"🎯 <b>1:2 FULL TARGET HIT (+${net_win:.2f} / +2R) — {trade['mt5_name']}</b>\n"
-                    f"📒 Saved to 0-Start Telegram <code>/backtest</code>!"
-                )
-            elif hit_type == "BREAKEVEN_SL":
-                trade["is_open"] = False
-                pair_cooldown_until[pair_name] = now_utc + timedelta(minutes=20)
-                be_cost = -trade.get("cost_usd", 0.35)
-                daily_realized_pnl  += be_cost
-                weekly_realized_pnl += be_cost
-                total_account_pnl   += be_cost
-                append_to_trading_journal(trade, 0.0, be_cost, "BREAKEVEN")
-                send_telegram_message(
-                    f"🛡️ <b>BREAKEVEN EXIT (0R) — {trade['mt5_name']}</b>\n"
-                    f"📒 Capital preserved & logged in Telegram <code>/backtest</code>."
-                )
-            elif hit_type == "SL":
-                trade["is_open"] = False
-                losses_today += 1
-                pair_cooldown_until[pair_name] = now_utc + timedelta(minutes=45)
-                loss_amt = trade["max_risk"]
-                daily_realized_pnl  -= loss_amt
-                weekly_realized_pnl -= loss_amt
-                total_account_pnl   -= loss_amt
-                append_to_trading_journal(trade, -1.0, -loss_amt, "LOSS")
-                send_telegram_message(
-                    f"🛑 <b>INVALIDATION STOP-LOSS HIT (-${loss_amt:.2f} / -1R) — {trade['mt5_name']}</b> (<code>{sl_str}</code>)\n"
-                    f"Losses Today: {losses_today}/{MAX_DAILY_LOSS_COUNT}. Logged in Telegram <code>/backtest</code>."
-                )
-
-# =====================================================================
-# 11. MASTER SCANNER LOOP (TELEGRAM ONLY)
-# =====================================================================
-def scan_markets():
-    global trades_today, losses_today, current_day, current_week
-    global daily_trades_log, daily_realized_pnl, weekly_realized_pnl
-    global daily_halt_announced, weekly_halt_announced, pre_session_brief_sent
-
-    now_ist  = get_ist_now()
-    today    = now_ist.date()
-    iso_week = now_ist.isocalendar()[1]
-
-    if today != current_day:
-        current_day = today
-        trades_today = 0
-        losses_today = 0
-        daily_trades_log = []
-        daily_realized_pnl = 0.0
-        daily_halt_announced = False
-        for k in live_bars_memory:
-            live_bars_memory[k] = {}
-        for k in last_radar_key:
-            last_radar_key[k] = None
-
-    if iso_week != current_week:
-        current_week = iso_week
-        weekly_realized_pnl = 0.0
-        weekly_halt_announced = False
-
-    _, is_pre_session, _, sessions_str = get_active_sessions_info(False)
-    if is_pre_session and pre_session_brief_sent != today:
-        pre_session_brief_sent = today
-        today_name = WEEKDAY_NAMES[get_ny_weekday_index(get_utc_now())]
-        send_telegram_message(
-            f"🔔 <b>SESSION PRE-BRIEF ({today_name})</b> 🔔\n\n"
-            f"🕒 <b>Active Windows:</b> {sessions_str}\n"
-            f"💧 <b>Spread Filter:</b> Active (Low-spread hours only)\n"
-            f"📋 <b>Risk:</b> <b>$12.50 (0.25%)</b> | Max <b>2 trades</b>/day\n"
-            f"• Sending charts for <b>XAUUSD</b> and <b>BTCUSD</b>..."
-        )
-        send_instant_preview_chart("XAU/USD")
-        send_instant_preview_chart("BTC/USD")
-
-    check_pending_pre_alerts_realtime()
-
-    now_utc = get_utc_now()
-    live_prices_map = {}
-
-    for name, info in FOREX_PAIRS.items():
-        check_telegram_commands()
-
-        if not is_forex_market_open() and not info.get("is_crypto", False):
-            continue
-        try:
-            df_1h, df_15m, df_5m, live_spot = get_roadmap_3tf_spot_data(name, info, use_fast_cache=True)
-            if df_1h is None or df_15m is None or df_5m is None or live_spot is None:
-                continue
-
-            live_prices_map[name] = live_spot
-
-            df_1h  = enrich_price_action_metrics(df_1h)
-            df_15m = enrich_price_action_metrics(df_15m)
-            df_5m  = enrich_price_action_metrics(df_5m)
-
-            closed_time = to_utc_timestamp(df_5m.index[-2])
-            dec         = info["decimals"]
-
-            manage_open_trades(name, closed_time, live_spot, df_5m, dec)
-
-            can_trade, _, _ = check_funded_account_risk_rules(live_prices_map)
-            if not can_trade:
-                continue
-
-            if any(t["pair"] == name and t["is_open"] for t in daily_trades_log):
-                continue
-            if pending_pre_alerts.get(name) is not None:
-                continue
-            if last_candle_traded[name] == closed_time:
-                continue
-
-            cand = evaluate_roadmap_sweep_mss_setup(name, info, df_1h, df_15m, df_5m, live_spot, ignore_locks=False)
-
-            if cand is not None:
-                if cand["stage"] == "CONFIRMED_BREAKOUT":
-                    dispatch_confirmed_trade_alert(name, info, df_1h, df_15m, df_5m, live_spot, cand, closed_time)
-                elif cand["stage"] == "PRE_ALERT":
-                    if now_utc >= pre_alert_cooldown.get(name, datetime.min.replace(tzinfo=timezone.utc)) and last_pre_alert_candle.get(name) != closed_time:
-                        dispatch_pre_alert_setup(name, info, df_1h, df_15m, df_5m, live_spot, cand, closed_time)
-
-        except Exception as e:
-            print(f"Error scanning {name}: {e}")
-
-if __name__ == "__main__":
-    flush_old_telegram_updates()
-    threading.Thread(target=fetch_live_economic_calendar, daemon=True).start()
-
-    send_telegram_message(
-        f"⚡ <b>$5,000 Two-Step Funded Bot Active (Strategy 1 Only · 0-Start)</b>\n"
-        f"• <b>Active Strategy:</b> 1H Bias + 15M Sweep + 5M MSS + Pair Radar\n"
-        f"• <b>Sessions:</b> London + New York Active (BTC/USD 24/7)\n"
-        f"• <b>Spread Filter:</b> Active (Low-Spread Hours Only)\n"
-        f"• <b>Chart Sync:</b> MT5-Broker Live Sync (XAU + BTC 1H HTF Major Levels)\n"
-        f"• <b>Commands:</b> <code>/gold</code>, <code>/btc</code>, <code>/backtest</code>, <code>/status</code>, <code>/reset</code>"
-    )
-
-    start_run      = time.time()
-    last_scan_time = 0
-    is_github_ci   = os.getenv("GITHUB_ACTIONS", "").lower() == "true"
-    max_run_secs   = 21000 if is_github_ci else 999999999
-
-    while time.time() - start_run < max_run_secs:
-        try:
-            check_telegram_commands()
-            if time.time() - last_scan_time >= 10:
-                scan_markets()
-                last_scan_time = time.time()
-            time.sleep(0.3)
-        except KeyboardInterrupt:
-            print("Stopped manually.")
-            break
-        except Exception as e:
-            print(f"Loop Error: {e}")
-            time.sleep(2)
+                    trade["trailed_to_cost"]
