@@ -100,8 +100,9 @@ FOREX_PAIRS = {
         "max_sl_dist": 12.15,
         "min_lot": 0.01,
         "max_lot_cap": 0.05,
-        "heatmap_bin_size": 1.50,
-        "heatmap_min_wall_gap": 6.0,
+        "heatmap_bin_size": 3.00,
+        "heatmap_min_wall_gap": 12.0,
+        "heatmap_min_dist_from_spot": 8.0,
         "is_crypto": False
     },
     "BTC/USD": {
@@ -123,8 +124,9 @@ FOREX_PAIRS = {
         "max_sl_dist": 1200.0,
         "min_lot": 0.01,
         "max_lot_cap": 0.05,
-        "heatmap_bin_size": 50.0,
-        "heatmap_min_wall_gap": 280.0,
+        "heatmap_bin_size": 100.0,
+        "heatmap_min_wall_gap": 500.0,
+        "heatmap_min_dist_from_spot": 300.0,
         "is_crypto": True
     }
 }
@@ -473,7 +475,7 @@ def append_to_trading_journal(trade_record, result_r_val, net_pnl_usd, result_la
     threading.Thread(target=_write_csv, daemon=True).start()
 
 # =====================================================================
-# 5. HIGH-SPEED PARALLEL DATA (MT5-EXACT SYNC) & ORDERFLOW / HEATMAP ENGINE
+# 5. HIGH-SPEED PARALLEL DATA (MT5-EXACT SYNC) & DEEP ORDERBOOK HEATMAP
 # =====================================================================
 def send_telegram_chat_action(action="upload_photo", target_chat_id=CHAT_ID):
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
@@ -506,6 +508,13 @@ def format_price(price, decimals):
 
 def format_tv_comma_price(price, decimals):
     return f"{price:,.{decimals}f}"
+
+def format_usd_compact(usd_val):
+    if usd_val >= 1_000_000:
+        return f"${usd_val / 1_000_000:.1f}M"
+    if usd_val >= 1_000:
+        return f"${usd_val / 1_000:.0f}K"
+    return f"${usd_val:.0f}"
 
 def fetch_tradingview_live_candle_and_spot(tv_tickers, screener="cfd"):
     if isinstance(tv_tickers, str):
@@ -602,13 +611,18 @@ def fetch_binance_vision_ohlc(binance_symbol, interval_str="5m", limit=220):
             pass
     return None
 
-def fetch_live_orderbook_heatmap(binance_symbol, live_spot, bin_size, min_wall_gap, decimals):
+def fetch_live_orderbook_heatmap(binance_symbol, live_spot, bin_size, min_wall_gap, min_dist_from_spot, decimals):
+    """
+    Fetches DEEP live orderbook (limit=5000) from Binance and identifies ONLY genuine major
+    Ask/Bid Liquidity Walls located at least `min_dist_from_spot` away from live price
+    with >= 2.0x median bin notional volume. Never guesses or fabricates walls.
+    """
     if not binance_symbol or live_spot is None or live_spot <= 0:
         return {"ask_walls": [], "bid_walls": [], "book_imbalance_pct": 0.0, "ok": False}
 
     for base_url in ["https://data-api.binance.vision/api/v3/depth", "https://api.binance.com/api/v3/depth"]:
         try:
-            res = HTTP_SESSION.get(base_url, params={"symbol": binance_symbol, "limit": 500}, timeout=2.5)
+            res = HTTP_SESSION.get(base_url, params={"symbol": binance_symbol, "limit": 5000}, timeout=4.5)
             if res.status_code != 200:
                 continue
             data = res.json()
@@ -643,23 +657,33 @@ def fetch_live_orderbook_heatmap(binance_symbol, live_spot, bin_size, min_wall_g
                 b_key = round(round(p / bin_size) * bin_size, decimals)
                 bid_bins[b_key] = bid_bins.get(b_key, 0.0) + notional
 
-            def _select_top_walls(bins_dict, is_ask=True):
-                if not bins_dict:
+            def _select_genuine_major_walls(bins_dict, is_ask=True):
+                # Keep only bins genuinely outside the micro-noise zone (>= min_dist_from_spot)
+                valid_bins = {
+                    p: v for p, v in bins_dict.items()
+                    if (is_ask and (p - live_spot) >= min_dist_from_spot) or
+                       ((not is_ask) and (live_spot - p) >= min_dist_from_spot)
+                }
+                if not valid_bins:
                     return []
-                max_notional = max(bins_dict.values())
+
+                vals = list(valid_bins.values())
+                median_notional = float(np.median(vals))
+                max_notional    = float(max(vals))
                 if max_notional <= 0:
                     return []
-                sorted_bins = sorted(bins_dict.items(), key=lambda kv: kv[1], reverse=True)
+
+                # Require genuine heavy concentration (>= 2.0x median bin size)
+                min_genuine_usd = median_notional * 2.0
+                sorted_bins = sorted(valid_bins.items(), key=lambda kv: kv[1], reverse=True)
                 chosen = []
                 for price_lvl, usd_val in sorted_bins:
-                    if is_ask and price_lvl <= live_spot:
-                        continue
-                    if (not is_ask) and price_lvl >= live_spot:
+                    if usd_val < min_genuine_usd:
                         continue
                     if any(abs(price_lvl - w["price"]) < min_wall_gap for w in chosen):
                         continue
                     strength = round(min(1.0, usd_val / max_notional), 2)
-                    if strength < 0.35 and len(chosen) >= 1:
+                    if strength < 0.40 and len(chosen) >= 1:
                         continue
                     chosen.append({
                         "price": round(price_lvl, decimals),
@@ -671,8 +695,8 @@ def fetch_live_orderbook_heatmap(binance_symbol, live_spot, bin_size, min_wall_g
                         break
                 return chosen
 
-            ask_walls = _select_top_walls(ask_bins, is_ask=True)
-            bid_walls = _select_top_walls(bid_bins, is_ask=False)
+            ask_walls = _select_genuine_major_walls(ask_bins, is_ask=True)
+            bid_walls = _select_genuine_major_walls(bid_bins, is_ask=False)
             denom = max(total_bid_usd + total_ask_usd, 1e-9)
             imb_pct = round(((total_bid_usd - total_ask_usd) / denom) * 100.0, 1)
 
@@ -770,15 +794,17 @@ def fetch_live_orderflow_delta(binance_symbol):
 def get_orderflow_and_heatmap_snapshot(pair_name, info, live_spot):
     now_ts = time.time()
     cached = orderflow_heatmap_cache.get(pair_name)
-    if cached and (now_ts - cached["ts"]) <= 15.0:
+    if cached and (now_ts - cached["ts"]) <= 20.0:
         return cached["data"]
 
-    sym = info.get("binance_symbol")
-    dec = info["decimals"]
-    bin_sz = info.get("heatmap_bin_size", 50.0 if info.get("is_crypto", False) else 1.50)
-    min_gap = info.get("heatmap_min_wall_gap", 280.0 if info.get("is_crypto", False) else 6.0)
+    sym      = info.get("binance_symbol")
+    dec      = info["decimals"]
+    is_btc   = info.get("is_crypto", False)
+    bin_sz   = info.get("heatmap_bin_size", 100.0 if is_btc else 3.00)
+    min_gap  = info.get("heatmap_min_wall_gap", 500.0 if is_btc else 12.0)
+    min_dist = info.get("heatmap_min_dist_from_spot", 300.0 if is_btc else 8.0)
 
-    f_book = DATA_EXECUTOR.submit(fetch_live_orderbook_heatmap, sym, live_spot, bin_sz, min_gap, dec)
+    f_book = DATA_EXECUTOR.submit(fetch_live_orderbook_heatmap, sym, live_spot, bin_sz, min_gap, min_dist, dec)
     f_flow = DATA_EXECUTOR.submit(fetch_live_orderflow_delta, sym)
 
     book_res = f_book.result()
@@ -797,7 +823,7 @@ def get_orderflow_and_heatmap_snapshot(pair_name, info, live_spot):
         "bullish_absorption": flow_res["bullish_absorption"],
         "bearish_absorption": flow_res["bearish_absorption"],
         "flow_label": flow_res["flow_label"],
-        "source_note": "Direct Orderbook/Delta" if info.get("is_crypto", False) else "Gold Proxy (PAXG) Orderbook/Delta"
+        "source_note": "Deep 5000-Lvl Book" if is_btc else "PAXG 5000-Lvl Proxy"
     }
     orderflow_heatmap_cache[pair_name] = {"ts": now_ts, "data": snap}
     return snap
@@ -1217,13 +1243,13 @@ def validate_orderflow_and_heatmap_confirmation(direction, entry_spot, sl_dist, 
 
         if book_ok and ask_walls:
             for aw in ask_walls:
-                if aw["strength"] >= 0.80 and entry_spot < aw["price"] <= (entry_spot + sl_dist * 0.40):
+                if aw["strength"] >= 0.85 and entry_spot < aw["price"] <= (entry_spot + sl_dist * 0.40):
                     return False, 0, "", "HEATMAP_ASK_WALL_BLOCK"
             if book_imb >= 5.0:
                 bonus += 2
 
-        nearest_bid = f"Bid Wall <code>{format_price(bid_walls[0]['price'], decimals)}</code>" if bid_walls else "Book Clear"
-        nearest_ask = f"Ask Pool <code>{format_price(ask_walls[0]['price'], decimals)}</code>" if ask_walls else "Open Upside"
+        nearest_bid = f"Bid Wall <code>{format_price(bid_walls[0]['price'], decimals)}</code> ({format_usd_compact(bid_walls[0]['usd_val'])})" if bid_walls else "Book Clear"
+        nearest_ask = f"Ask Pool <code>{format_price(ask_walls[0]['price'], decimals)}</code> ({format_usd_compact(ask_walls[0]['usd_val'])})" if ask_walls else "Open Upside"
         line = (
             f"4️⃣ <b>Orderflow & Heatmap:</b> <b>{of_heat['flow_label']}</b> (5-bar CVD: {cvd_5_pct:+.1f}%) | "
             f"🔥 {nearest_bid} · Target {nearest_ask}."
@@ -1240,13 +1266,13 @@ def validate_orderflow_and_heatmap_confirmation(direction, entry_spot, sl_dist, 
 
         if book_ok and bid_walls:
             for bw in bid_walls:
-                if bw["strength"] >= 0.80 and (entry_spot - sl_dist * 0.40) <= bw["price"] < entry_spot:
+                if bw["strength"] >= 0.85 and (entry_spot - sl_dist * 0.40) <= bw["price"] < entry_spot:
                     return False, 0, "", "HEATMAP_BID_WALL_BLOCK"
             if book_imb <= -5.0:
                 bonus += 2
 
-        nearest_ask = f"Ask Wall <code>{format_price(ask_walls[0]['price'], decimals)}</code>" if ask_walls else "Book Clear"
-        nearest_bid = f"Bid Pool <code>{format_price(bid_walls[0]['price'], decimals)}</code>" if bid_walls else "Open Downside"
+        nearest_ask = f"Ask Wall <code>{format_price(ask_walls[0]['price'], decimals)}</code> ({format_usd_compact(ask_walls[0]['usd_val'])})" if ask_walls else "Book Clear"
+        nearest_bid = f"Bid Pool <code>{format_price(bid_walls[0]['price'], decimals)}</code> ({format_usd_compact(bid_walls[0]['usd_val'])})" if bid_walls else "Open Downside"
         line = (
             f"4️⃣ <b>Orderflow & Heatmap:</b> <b>{of_heat['flow_label']}</b> (5-bar CVD: {cvd_5_pct:+.1f}%) | "
             f"🔥 {nearest_ask} · Target {nearest_bid}."
@@ -2098,8 +2124,8 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
                                                 right_edge_idx - int(n_bars * 0.45), heat_band_h * 2.0,
                                                 facecolor=h_col, alpha=h_alpha, edgecolor="none", zorder=2))
                 ax.plot([int(n_bars * 0.45), right_edge_idx], [wp, wp], color=h_col, linewidth=1.0, linestyle="-.", alpha=0.85, zorder=3)
-                ax.text(right_edge_idx - 1.0, wp, f"HEAT {'ASK' if is_ask_w else 'BID'} ({format_price(wp, dec)})",
-                        fontsize=6.6, fontweight="bold", color=h_txt_col, ha="right", va="center",
+                ax.text(right_edge_idx - 1.0, wp, f"HEAT {'ASK' if is_ask_w else 'BID'} {format_price(wp, dec)} ({format_usd_compact(wall['usd_val'])})",
+                        fontsize=6.5, fontweight="bold", color=h_txt_col, ha="right", va="center",
                         bbox=dict(boxstyle="round,pad=0.12", facecolor="#fffbeb" if is_ask_w else "#ecfeff", edgecolor=h_col, alpha=0.90, linewidth=0.55),
                         clip_on=True, zorder=6)
 
@@ -2202,7 +2228,7 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
         hdr_title = (
             f"{hdr_nam} ({mt5_sym}) · {active_trade.get('model_name', 'SMC + ICT')} Execution (5m)"
             if is_trade_view else
-            f"{hdr_nam} ({mt5_sym}) · MT5-Synced 1H HTF + Heatmap & Orderflow"
+            f"{hdr_nam} ({mt5_sym}) · MT5-Synced 1H HTF + Deep Heatmap & Orderflow"
         )
         top_ax.text(0.0, 0.72, hdr_title, fontsize=9.5, fontweight="bold", color="#131722", va="center", ha="left")
         top_ax.text(0.0, 0.22,
@@ -2221,9 +2247,9 @@ def generate_roadmap_chart(df_1h, df_15m, df_5m, info, live_spot, active_trade=N
 
         gap_label = "650+ Pts" if is_btc else "$10+ Pts"
         footer_txt = (
-            "Telegram Bot · MT5-Synced · SMC + ICT Dual Engine (ICT 2022 + BOS/OTE) · Orderflow & Heatmap"
+            "Telegram Bot · MT5-Synced · SMC + ICT Dual Engine (ICT 2022 + BOS/OTE) · Deep Heatmap"
             if is_trade_view else
-            f"Telegram Bot · MT5-Synced · {mt5_sym} 1H HTF ({gap_label}) · SMC/ICT + Heatmap Active"
+            f"Telegram Bot · MT5-Synced · {mt5_sym} 1H HTF ({gap_label}) · Deep 5000-Lvl Heatmap Active"
         )
         fig.text(0.015, 0.018, footer_txt, fontsize=8.8, fontweight="bold", color="#131722")
 
@@ -2293,8 +2319,14 @@ def send_instant_preview_chart(pair_key=None):
     _, _, sess_status_txt, sessions_str = get_active_sessions_info(is_btc)
     _, spread_status_txt                = check_low_spread_window(info)
 
-    ask_txt = format_price(of_heat["ask_walls"][0]["price"], dec) if of_heat["ask_walls"] else "N/A"
-    bid_txt = format_price(of_heat["bid_walls"][0]["price"], dec) if of_heat["bid_walls"] else "N/A"
+    ask_txt = (
+        f"<code>{format_price(of_heat['ask_walls'][0]['price'], dec)}</code> ({format_usd_compact(of_heat['ask_walls'][0]['usd_val'])})"
+        if of_heat["ask_walls"] else "<code>Clear</code>"
+    )
+    bid_txt = (
+        f"<code>{format_price(of_heat['bid_walls'][0]['price'], dec)}</code> ({format_usd_compact(of_heat['bid_walls'][0]['usd_val'])})"
+        if of_heat["bid_walls"] else "<code>Clear</code>"
+    )
 
     caption = (
         f"📊 <b>{info['mt5_name']} • LIVE MARKET CHART (1H HTF)</b>\n"
@@ -2306,8 +2338,9 @@ def send_instant_preview_chart(pair_key=None):
         f"• <b>PDH / PDL:</b> <code>{format_price(roadmap['pdh'], dec)}</code> / <code>{format_price(roadmap['pdl'], dec)}</code>\n"
         f"• <b>4H Swing H / L:</b> <code>{format_price(roadmap['htf_4h_high'], dec)}</code> / <code>{format_price(roadmap['htf_4h_low'], dec)}</code>\n"
         f"• <b>Weekly H / L:</b> <code>{format_price(roadmap['wk_high'], dec)}</code> / <code>{format_price(roadmap['wk_low'], dec)}</code>\n\n"
-        f"🔥 <b>Liquidity Heatmap ({of_heat['source_note']}):</b>\n"
-        f"• <b>Ask Wall / Bid Wall:</b> <code>{ask_txt}</code> / <code>{bid_txt}</code> (Imb: {of_heat['book_imbalance_pct']:+.1f}%)\n"
+        f"🔥 <b>Major Liquidity Heatmap ({of_heat['source_note']}):</b>\n"
+        f"• <b>Ask Wall:</b> {ask_txt} | <b>Bid Wall:</b> {bid_txt}\n"
+        f"• <b>Book Imbalance:</b> {of_heat['book_imbalance_pct']:+.1f}%\n"
         f"⚡ <b>Orderflow (5M):</b> {of_heat['flow_label']} | 5-Bar CVD: <b>{of_heat['cvd_5_pct']:+.1f}%</b>\n\n"
         f"🤖 <b>Auto-Trade Engine:</b> SMC + ICT Dual Model (ICT 2022 FVG + BOS/OTE)."
     )
@@ -2687,7 +2720,7 @@ def scan_markets():
             f"🔔 <b>SESSION PRE-BRIEF ({today_name})</b> 🔔\n\n"
             f"🕒 <b>Active Windows:</b> {sessions_str}\n"
             f"🧠 <b>Models:</b> ICT 2022 (Sweep + MSS + FVG) + SMC BOS/OTE\n"
-            f"🔥 <b>Confirmation:</b> Orderflow Delta + Liquidity Heatmap Active\n"
+            f"🔥 <b>Confirmation:</b> Deep 5000-Lvl Heatmap + Orderflow Delta\n"
             f"📋 <b>Risk:</b> <b>$12.50 (0.25%)</b> | Max <b>2 trades</b>/day\n"
             f"• Sending charts for <b>XAUUSD</b> and <b>BTCUSD</b>..."
         )
@@ -2748,7 +2781,7 @@ def scan_markets():
             print(f"Error scanning {name}: {e}", flush=True)
 
 if __name__ == "__main__":
-    print("Starting SMC + ICT Dual Engine Bot...", flush=True)
+    print("Starting SMC + ICT Dual Engine Bot (Deep 5000-Lvl Heatmap)...", flush=True)
     flush_old_telegram_updates()
     threading.Thread(target=fetch_live_economic_calendar, daemon=True).start()
 
@@ -2756,7 +2789,7 @@ if __name__ == "__main__":
         f"⚡ <b>$5,000 Two-Step Funded Bot Active (SMC + ICT Dual Engine)</b>\n"
         f"• <b>Model A:</b> ICT 2022 (15M Sweep + 5M MSS + FVG Pullback)\n"
         f"• <b>Model B:</b> SMC BOS + OTE (50–79% Fib + Order Block)\n"
-        f"• <b>Filter:</b> Orderflow Delta + Liquidity Heatmap + Low Spread\n"
+        f"• <b>Filter:</b> Deep 5000-Lvl Heatmap (BTC 600+ Pts / Gold $16+ Gap) + Orderflow Delta\n"
         f"• <b>Sessions:</b> London + New York Active (BTC/USD 24/7)\n"
         f"• <b>Commands:</b> <code>/gold</code>, <code>/btc</code>, <code>/backtest</code>, <code>/status</code>, <code>/reset</code>"
     )
